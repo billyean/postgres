@@ -197,19 +197,29 @@ typedef struct WindowStatePerAggData
 
 	/* DISTINCT support */
 	DistinctStrategy distinctStrategy;	/* DISTINCT dedup strategy */
-	Oid			inputtypeOid;	/* OID of the single DISTINCT argument type */
-	Oid			sortOperator;	/* btree < operator for sorting */
-	Oid			sortCollation;	/* collation for sort/equality */
-	bool		sortNullsFirst; /* NULLS FIRST? */
-	FmgrInfo	equalfn;		/* equality comparison function */
+	int			numDistinctCols;	/* number of DISTINCT key columns */
+	Oid			inputtypeOid;	/* OID of single DISTINCT arg (1-arg only) */
+	Oid			sortOperator;	/* btree < operator (single-arg sort path) */
+	Oid			sortCollation;	/* collation for sort/equality (single-arg) */
+	bool		sortNullsFirst; /* NULLS FIRST? (single-arg sort path) */
+	FmgrInfo	equalfn;		/* equality comparison (single-arg sort path) */
+
+	/* Multi-arg DISTINCT sort path state */
+	Oid		   *sortOperators;	/* per-column sort operators, or NULL */
+	Oid		   *sortCollations;	/* per-column collations, or NULL */
+	bool	   *sortNullsFirst_multi; /* per-column NULLS FIRST, or NULL */
+	AttrNumber *sortColIdx;		/* column indices for sort (1..numDistinctCols) */
+	ExprState  *equalfnMulti;	/* multi-column equality expr, or NULL */
+	TupleTableSlot *uniqSlot;	/* previous-tuple slot for sort dedup, or NULL */
 
 	/* Hash-based DISTINCT state (DISTINCT_HASH and DISTINCT_SLIDING) */
 	TupleHashTable distinctTable;	/* hash table of seen values, or NULL */
 	MemoryContext distinctContext;	/* BumpContext for hash table tuples */
-	TupleDesc	distinctTupleDesc;	/* single-column tuple descriptor */
+	TupleDesc	distinctTupleDesc;	/* tuple descriptor for DISTINCT keys */
 	TupleTableSlot *distinctSlot;	/* slot for hash table lookups */
-	Oid		   *hashEqFuncOids;		/* equality function OID for hash (palloc'd) */
+	Oid		   *hashEqFuncOids;		/* equality function OIDs for hash (palloc'd) */
 	FmgrInfo   *hashFunctions;		/* hash function info (palloc'd) */
+	Oid		   *hashCollations;		/* per-column collations for hash (palloc'd) */
 } WindowStatePerAggData;
 
 static void initialize_windowaggregate(WindowAggState *winstate,
@@ -251,6 +261,9 @@ static bool is_grow_only_frame(WindowAggState *winstate);
 static void eval_windowaggregate_distinct(WindowAggState *winstate,
 										  WindowStatePerFunc perfuncstate,
 										  WindowStatePerAgg peraggstate);
+static void eval_windowaggregate_distinct_multi(WindowAggState *winstate,
+												WindowStatePerFunc perfuncstate,
+												WindowStatePerAgg peraggstate);
 static void advance_windowaggregate_distinct(WindowAggState *winstate,
 											 WindowStatePerFunc perfuncstate,
 											 WindowStatePerAgg peraggstate);
@@ -349,11 +362,15 @@ initialize_windowaggregate(WindowAggState *winstate,
 	if (peraggstate->distinctStrategy == DISTINCT_HASH ||
 		peraggstate->distinctStrategy == DISTINCT_SLIDING)
 	{
-		Oid			collations[1];
-		AttrNumber	keyColIdx[1] = {1};
+		int			ncols = peraggstate->numDistinctCols;
+		AttrNumber *keyColIdx;
 		Size		addlsize;
+		int			j;
 
-		collations[0] = peraggstate->sortCollation;
+		keyColIdx = (AttrNumber *) palloc(ncols * sizeof(AttrNumber));
+		for (j = 0; j < ncols; j++)
+			keyColIdx[j] = j + 1;
+
 		addlsize = (peraggstate->distinctStrategy == DISTINCT_SLIDING)
 			? sizeof(int32) : 0;
 
@@ -374,17 +391,19 @@ initialize_windowaggregate(WindowAggState *winstate,
 			BuildTupleHashTable(&winstate->ss.ps,
 								peraggstate->distinctTupleDesc,
 								&TTSOpsVirtual,
-								1,		/* numCols */
+								ncols,
 								keyColIdx,
 								peraggstate->hashEqFuncOids,
 								peraggstate->hashFunctions,
-								collations,
+								peraggstate->hashCollations,
 								256,	/* initial estimate */
 								addlsize,
 								peraggstate->aggcontext,
 								peraggstate->distinctContext,
 								winstate->tmpcontext->ecxt_per_tuple_memory,
 								false);
+
+		pfree(keyColIdx);
 	}
 }
 
@@ -1115,12 +1134,261 @@ remember_value:
 }
 
 /*
+ * eval_windowaggregate_distinct_multi
+ *
+ * Multi-argument variant of eval_windowaggregate_distinct.  Uses tuple-based
+ * sorting instead of datum-based, and multi-column comparison for dedup.
+ * Follows the pattern of process_ordered_aggregate_multi() in nodeAgg.c.
+ */
+static void
+eval_windowaggregate_distinct_multi(WindowAggState *winstate,
+									WindowStatePerFunc perfuncstate,
+									WindowStatePerAgg peraggstate)
+{
+	WindowObject agg_winobj = winstate->agg_winobj;
+	TupleTableSlot *temp_slot = winstate->temp_slot_1;
+	ExprContext *econtext = winstate->tmpcontext;
+	WindowFuncExprState *wfuncstate = perfuncstate->wfuncstate;
+	ExprState  *filter = wfuncstate->aggfilter;
+	int			numArguments = perfuncstate->numArguments;
+	LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
+	Tuplesortstate *sortstate;
+	TupleTableSlot *slot1 = peraggstate->distinctSlot;
+	TupleTableSlot *slot2 = peraggstate->uniqSlot;
+	TupleTableSlot *inputSlot;
+	TupleDesc	sortdesc = peraggstate->distinctTupleDesc;
+	bool		haveOldValue = false;
+	Datum		newAbbrevVal = (Datum) 0;
+	Datum		oldAbbrevVal = (Datum) 0;
+	MemoryContext oldContext;
+	int64		total_rows;
+	int64		row;
+	int			i;
+	ListCell   *arg;
+
+	/* Ensure all partition rows are spooled */
+	spool_tuples(winstate, -1);
+	total_rows = winstate->spooled_rows;
+
+	/* Create a tuplesort for the multi-column DISTINCT key */
+	sortstate = tuplesort_begin_heap(sortdesc,
+									  peraggstate->numDistinctCols,
+									  peraggstate->sortColIdx,
+									  peraggstate->sortOperators,
+									  peraggstate->sortCollations,
+									  peraggstate->sortNullsFirst_multi,
+									  work_mem, NULL, TUPLESORT_NONE);
+
+	/* Virtual slot for building input tuples to feed into sort */
+	inputSlot = MakeSingleTupleTableSlot(sortdesc, &TTSOpsVirtual);
+
+	/*
+	 * Loop over all rows in the partition, evaluate FILTER and all arguments,
+	 * and feed tuples into the sort.
+	 */
+	for (row = 0; row < total_rows; row++)
+	{
+		if (!window_gettupleslot(agg_winobj, row, temp_slot))
+			break;
+
+		econtext->ecxt_outertuple = temp_slot;
+
+		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+		/* Skip anything FILTERed out */
+		if (filter)
+		{
+			bool		isnull;
+			Datum		res = ExecEvalExpr(filter, econtext, &isnull);
+
+			if (isnull || !DatumGetBool(res))
+			{
+				MemoryContextSwitchTo(oldContext);
+				ResetExprContext(econtext);
+				ExecClearTuple(temp_slot);
+				continue;
+			}
+		}
+
+		/* Evaluate all DISTINCT arguments into inputSlot */
+		ExecClearTuple(inputSlot);
+		i = 0;
+		foreach(arg, wfuncstate->args)
+		{
+			ExprState  *argstate = (ExprState *) lfirst(arg);
+
+			inputSlot->tts_values[i] = ExecEvalExpr(argstate, econtext,
+												 &inputSlot->tts_isnull[i]);
+			i++;
+		}
+		ExecStoreVirtualTuple(inputSlot);
+
+		MemoryContextSwitchTo(oldContext);
+
+		/* Feed tuple into sort */
+		tuplesort_puttupleslot(sortstate, inputSlot);
+
+		ResetExprContext(econtext);
+		ExecClearTuple(temp_slot);
+	}
+
+	/* Sort */
+	tuplesort_performsort(sortstate);
+
+	/* Done with input slot */
+	ExecDropSingleTupleTableSlot(inputSlot);
+
+	ExecClearTuple(slot1);
+	if (slot2)
+		ExecClearTuple(slot2);
+
+	/*
+	 * Read back sorted tuples, skip duplicates, and feed distinct tuples
+	 * into the transition function.
+	 */
+	while (tuplesort_gettupleslot(sortstate, true, true, slot1, &newAbbrevVal))
+	{
+		ResetExprContext(econtext);
+		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+		/*
+		 * Compare with prior tuple for dedup.  Use the multi-column equality
+		 * expression (same pattern as process_ordered_aggregate_multi).
+		 */
+		econtext->ecxt_outertuple = slot1;
+		econtext->ecxt_innertuple = slot2;
+
+		if (haveOldValue &&
+			newAbbrevVal == oldAbbrevVal &&
+			ExecQual(peraggstate->equalfnMulti, econtext))
+		{
+			/* Duplicate: skip */
+			MemoryContextSwitchTo(oldContext);
+			ExecClearTuple(slot1);
+			continue;
+		}
+
+		/*
+		 * New distinct tuple: feed all arguments into the transition function.
+		 * This replicates the strict-handling logic from
+		 * advance_windowaggregate(), adapted for multi-arg.
+		 */
+		slot_getsomeattrs(slot1, numArguments);
+
+		if (peraggstate->transfn.fn_strict)
+		{
+			bool	has_null = false;
+
+			for (i = 0; i < numArguments; i++)
+			{
+				if (slot1->tts_isnull[i])
+				{
+					has_null = true;
+					break;
+				}
+			}
+
+			if (has_null)
+			{
+				MemoryContextSwitchTo(oldContext);
+				goto remember_multi;
+			}
+
+			/*
+			 * The "adopt first input as initial state" shortcut used in the
+			 * single-arg path is not valid here because multi-arg aggregates
+			 * generally have a transtype incompatible with any individual
+			 * argument.  The dangerous strict + NULL-initval case is rejected
+			 * at init time (see initialize_peragg), so transValueIsNull here
+			 * means a prior transfn returned NULL.  Skip this tuple.
+			 */
+			if (peraggstate->transValueIsNull)
+			{
+				MemoryContextSwitchTo(oldContext);
+				goto remember_multi;
+			}
+		}
+
+		/* OK to call the transition function */
+		InitFunctionCallInfoData(*fcinfo, &(peraggstate->transfn),
+								 numArguments + 1,
+								 perfuncstate->winCollation,
+								 (Node *) winstate, NULL);
+		fcinfo->args[0].value = peraggstate->transValue;
+		fcinfo->args[0].isnull = peraggstate->transValueIsNull;
+		for (i = 0; i < numArguments; i++)
+		{
+			fcinfo->args[i + 1].value = slot1->tts_values[i];
+			fcinfo->args[i + 1].isnull = slot1->tts_isnull[i];
+		}
+		winstate->curaggcontext = peraggstate->aggcontext;
+
+		{
+			Datum		result;
+
+			result = FunctionCallInvoke(fcinfo);
+			winstate->curaggcontext = NULL;
+
+			peraggstate->transValueCount++;
+
+			if (!peraggstate->transtypeByVal &&
+				DatumGetPointer(result) != DatumGetPointer(peraggstate->transValue))
+			{
+				if (!fcinfo->isnull)
+				{
+					MemoryContextSwitchTo(peraggstate->aggcontext);
+					if (DatumIsReadWriteExpandedObject(result,
+													   false,
+													   peraggstate->transtypeLen) &&
+						MemoryContextGetParent(DatumGetEOHP(result)->eoh_context) == CurrentMemoryContext)
+						 /* do nothing */ ;
+					else
+						result = datumCopy(result,
+										   peraggstate->transtypeByVal,
+										   peraggstate->transtypeLen);
+				}
+				if (!peraggstate->transValueIsNull)
+				{
+					if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+													   false,
+													   peraggstate->transtypeLen))
+						DeleteExpandedObject(peraggstate->transValue);
+					else
+						pfree(DatumGetPointer(peraggstate->transValue));
+				}
+			}
+
+			MemoryContextSwitchTo(oldContext);
+			peraggstate->transValue = result;
+			peraggstate->transValueIsNull = fcinfo->isnull;
+		}
+
+remember_multi:
+		/* Swap slots to retain the current tuple for dedup comparison */
+		{
+			TupleTableSlot *tmpslot = slot2;
+
+			slot2 = slot1;
+			slot1 = tmpslot;
+			oldAbbrevVal = newAbbrevVal;
+			haveOldValue = true;
+		}
+	}
+
+	if (slot1)
+		ExecClearTuple(slot1);
+	if (slot2)
+		ExecClearTuple(slot2);
+
+	tuplesort_end(sortstate);
+}
+
+/*
  * advance_windowaggregate_distinct
  *
  * Per-row handler for hash-based DISTINCT window aggregates with grow-only
- * frames.  Evaluates the single argument, checks the hash table for
- * duplicates, and only advances the transition function for new distinct
- * values.
+ * frames.  Evaluates all arguments, checks the hash table for duplicates,
+ * and only advances the transition function for new distinct tuples.
  */
 static void
 advance_windowaggregate_distinct(WindowAggState *winstate,
@@ -1133,16 +1401,17 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 	ExprContext *econtext = winstate->tmpcontext;
 	ExprState  *filter = wfuncstate->aggfilter;
 	TupleTableSlot *slot = peraggstate->distinctSlot;
-	Datum		newVal;
-	bool		isnull;
 	bool		isnew;
 	MemoryContext oldContext;
+	int			i;
+	ListCell   *arg;
 
 	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
 	/* Skip anything FILTERed out */
 	if (filter)
 	{
+		bool		isnull;
 		Datum		res = ExecEvalExpr(filter, econtext, &isnull);
 
 		if (isnull || !DatumGetBool(res))
@@ -1152,17 +1421,17 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 		}
 	}
 
-	/* Evaluate the single argument */
-	{
-		ExprState  *argstate = (ExprState *) linitial(wfuncstate->args);
-
-		newVal = ExecEvalExpr(argstate, econtext, &isnull);
-	}
-
-	/* Store in slot for hash lookup */
+	/* Evaluate all arguments into the DISTINCT key slot */
 	ExecClearTuple(slot);
-	slot->tts_values[0] = newVal;
-	slot->tts_isnull[0] = isnull;
+	i = 0;
+	foreach(arg, wfuncstate->args)
+	{
+		ExprState  *argstate = (ExprState *) lfirst(arg);
+
+		slot->tts_values[i] = ExecEvalExpr(argstate, econtext,
+										   &slot->tts_isnull[i]);
+		i++;
+	}
 	ExecStoreVirtualTuple(slot);
 
 	/* Check if already seen */
@@ -1181,21 +1450,34 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 	 */
 	if (peraggstate->transfn.fn_strict)
 	{
-		/* For strict transfn, skip NULL inputs */
-		if (isnull)
+		int i;
+
+		for (i = 0; i < numArguments; i++)
 		{
-			MemoryContextSwitchTo(oldContext);
-			return;
+			if (slot->tts_isnull[i])
+			{
+				MemoryContextSwitchTo(oldContext);
+				return;
+			}
 		}
 
 		/*
-		 * For strict transition functions with initial value NULL, use the
-		 * first non-NULL input as the initial state.
+		 * For strict transfn with initial value NULL: for single-argument
+		 * aggregates, adopt the first non-NULL input as the initial
+		 * transition state.  This is safe because initialize_peragg()
+		 * verified IsBinaryCoercible(inputType, transtype) for this case.
+		 *
+		 * For multi-argument aggregates, this shortcut is invalid because
+		 * the transtype is generally incompatible with any individual
+		 * argument.  Multi-arg DISTINCT with strict transfn and NULL
+		 * initval is rejected at initialization time (see the
+		 * FEATURE_NOT_SUPPORTED check in initialize_peragg).
 		 */
-		if (peraggstate->transValueCount == 0 && peraggstate->transValueIsNull)
+		if (numArguments == 1 &&
+			peraggstate->transValueCount == 0 && peraggstate->transValueIsNull)
 		{
 			MemoryContextSwitchTo(peraggstate->aggcontext);
-			peraggstate->transValue = datumCopy(newVal,
+			peraggstate->transValue = datumCopy(slot->tts_values[0],
 												peraggstate->transtypeByVal,
 												peraggstate->transtypeLen);
 			peraggstate->transValueIsNull = false;
@@ -1204,18 +1486,17 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 			return;
 		}
 
+		/*
+		 * If transValue is still NULL here, don't call the strict function.
+		 * For single-arg, this means a prior transfn call returned NULL
+		 * (the NULL-initval case was handled above).  For multi-arg, the
+		 * dangerous strict + NULL-initval case is rejected at init time
+		 * (see initialize_peragg), so reaching here with transValueIsNull
+		 * means a prior transfn returned NULL.  Either way, propagate NULL.
+		 */
 		if (peraggstate->transValueIsNull)
 		{
-			/*
-			 * Don't call a strict function with NULL inputs.  Note it is
-			 * possible to get here despite the above tests, if the transfn
-			 * is strict *and* returned a NULL on a prior cycle.  If that
-			 * happens we will propagate the NULL all the way to the end.
-			 * Hash-based DISTINCT never uses moving-aggregate code, so
-			 * invtransfn_oid should always be invalid here.
-			 */
 			MemoryContextSwitchTo(oldContext);
-			Assert(!OidIsValid(peraggstate->invtransfn_oid));
 			return;
 		}
 	}
@@ -1227,8 +1508,11 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 							 (Node *) winstate, NULL);
 	fcinfo->args[0].value = peraggstate->transValue;
 	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
-	fcinfo->args[1].value = newVal;
-	fcinfo->args[1].isnull = isnull;
+	for (i = 0; i < numArguments; i++)
+	{
+		fcinfo->args[i + 1].value = slot->tts_values[i];
+		fcinfo->args[i + 1].isnull = slot->tts_isnull[i];
+	}
 	winstate->curaggcontext = peraggstate->aggcontext;
 
 	{
@@ -1275,9 +1559,9 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 /*
  * advance_windowaggregate_distinct_sliding
  *
- * Process a row entering the frame for a sliding-ROWS DISTINCT aggregate.
+ * Process a row entering the frame for a sliding DISTINCT aggregate.
  * Maintains a refcounted hash table: calls the transition function only when
- * a value's refcount goes from 0 to 1 (first occurrence in frame).
+ * a tuple's refcount goes from 0 to 1 (first occurrence in frame).
  * Otherwise just increments the refcount.
  */
 static void
@@ -1291,17 +1575,18 @@ advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 	ExprContext *econtext = winstate->tmpcontext;
 	ExprState  *filter = wfuncstate->aggfilter;
 	TupleTableSlot *slot = peraggstate->distinctSlot;
-	Datum		newVal;
-	bool		isnull;
 	bool		isnew;
 	int32	   *refcount;
 	MemoryContext oldContext;
+	int			i;
+	ListCell   *arg;
 
 	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
 	/* Skip anything FILTERed out */
 	if (filter)
 	{
+		bool		isnull;
 		Datum		res = ExecEvalExpr(filter, econtext, &isnull);
 
 		if (isnull || !DatumGetBool(res))
@@ -1311,17 +1596,17 @@ advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 		}
 	}
 
-	/* Evaluate the single argument */
-	{
-		ExprState  *argstate = (ExprState *) linitial(wfuncstate->args);
-
-		newVal = ExecEvalExpr(argstate, econtext, &isnull);
-	}
-
-	/* Store in slot for hash lookup */
+	/* Evaluate all arguments into the DISTINCT key slot */
 	ExecClearTuple(slot);
-	slot->tts_values[0] = newVal;
-	slot->tts_isnull[0] = isnull;
+	i = 0;
+	foreach(arg, wfuncstate->args)
+	{
+		ExprState  *argstate = (ExprState *) lfirst(arg);
+
+		slot->tts_values[i] = ExecEvalExpr(argstate, econtext,
+										   &slot->tts_isnull[i]);
+		i++;
+	}
 	ExecStoreVirtualTuple(slot);
 
 	/* Look up or insert into refcounted hash table */
@@ -1361,21 +1646,29 @@ advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 	 */
 	if (peraggstate->transfn.fn_strict)
 	{
-		/* For strict transfn, skip NULL inputs */
-		if (isnull)
+		/* For strict transfn, skip if any input is NULL */
+		for (i = 0; i < numArguments; i++)
 		{
-			MemoryContextSwitchTo(oldContext);
-			return;
+			if (slot->tts_isnull[i])
+			{
+				MemoryContextSwitchTo(oldContext);
+				return;
+			}
 		}
 
 		/*
-		 * For strict transition functions with initial value NULL, use the
-		 * first non-NULL input as the initial state.
+		 * For strict transfn with initial value NULL: for single-argument
+		 * aggregates, adopt the first non-NULL input as the initial
+		 * transition state (same logic as advance_windowaggregate_distinct).
+		 *
+		 * Multi-arg DISTINCT with strict transfn and NULL initval is
+		 * rejected at initialization time (see initialize_peragg).
 		 */
-		if (peraggstate->transValueCount == 0 && peraggstate->transValueIsNull)
+		if (numArguments == 1 &&
+			peraggstate->transValueCount == 0 && peraggstate->transValueIsNull)
 		{
 			MemoryContextSwitchTo(peraggstate->aggcontext);
-			peraggstate->transValue = datumCopy(newVal,
+			peraggstate->transValue = datumCopy(slot->tts_values[0],
 												peraggstate->transtypeByVal,
 												peraggstate->transtypeLen);
 			peraggstate->transValueIsNull = false;
@@ -1384,15 +1677,13 @@ advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 			return;
 		}
 
+		/*
+		 * If transValue is still NULL here, don't call the strict function.
+		 * The dangerous multi-arg strict + NULL-initval case is rejected at
+		 * init time, so this only fires when a prior transfn returned NULL.
+		 */
 		if (peraggstate->transValueIsNull)
 		{
-			/*
-			 * Don't call a strict function with NULL inputs.  Note it is
-			 * possible to get here despite the above tests, if the transfn
-			 * is strict *and* returned a NULL on a prior cycle.  If that
-			 * happens we will propagate the NULL all the way to the end.
-			 * Unlike the grow-only path, the sliding path may use invtransfn.
-			 */
 			MemoryContextSwitchTo(oldContext);
 			return;
 		}
@@ -1405,8 +1696,11 @@ advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 							 (Node *) winstate, NULL);
 	fcinfo->args[0].value = peraggstate->transValue;
 	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
-	fcinfo->args[1].value = newVal;
-	fcinfo->args[1].isnull = isnull;
+	for (i = 0; i < numArguments; i++)
+	{
+		fcinfo->args[i + 1].value = slot->tts_values[i];
+		fcinfo->args[i + 1].isnull = slot->tts_isnull[i];
+	}
 	winstate->curaggcontext = peraggstate->aggcontext;
 
 	{
@@ -1462,11 +1756,11 @@ advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 /*
  * retreat_windowaggregate_distinct_sliding
  *
- * Process a row leaving the frame for a sliding-ROWS DISTINCT aggregate.
- * Decrements the refcount for the departing row's value.  If the refcount
- * drops to 0, calls the inverse transition function to remove that distinct
- * value from the aggregate state.  Returns true on success, false if the
- * aggregate must be restarted (no invtransfn, or invtransfn returned NULL).
+ * Process a row leaving the frame for a sliding DISTINCT aggregate.
+ * Decrements the refcount for the departing row's DISTINCT key.  If the
+ * refcount drops to 0, calls the inverse transition function to remove that
+ * distinct tuple from the aggregate state.  Returns true on success, false if
+ * the aggregate must be restarted (no invtransfn, or invtransfn returned NULL).
  *
  * The caller must have set tmpcontext->ecxt_outertuple to the departing row.
  */
@@ -1482,16 +1776,18 @@ retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
 	ExprState  *filter = wfuncstate->aggfilter;
 	TupleTableSlot *slot = peraggstate->distinctSlot;
 	TupleHashEntry entry;
-	Datum		oldVal;
-	bool		isnull;
 	int32	   *refcount;
 	MemoryContext oldContext;
+	int			i;
+	ListCell   *arg;
+	bool		has_null;
 
 	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
 	/* Skip anything FILTERed out -- it was never added to refcount table */
 	if (filter)
 	{
+		bool		isnull;
 		Datum		res = ExecEvalExpr(filter, econtext, &isnull);
 
 		if (isnull || !DatumGetBool(res))
@@ -1501,17 +1797,17 @@ retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
 		}
 	}
 
-	/* Evaluate the single argument from the departing row */
-	{
-		ExprState  *argstate = (ExprState *) linitial(wfuncstate->args);
-
-		oldVal = ExecEvalExpr(argstate, econtext, &isnull);
-	}
-
-	/* Store in slot for hash lookup */
+	/* Evaluate all arguments from the departing row */
 	ExecClearTuple(slot);
-	slot->tts_values[0] = oldVal;
-	slot->tts_isnull[0] = isnull;
+	i = 0;
+	foreach(arg, wfuncstate->args)
+	{
+		ExprState  *argstate = (ExprState *) lfirst(arg);
+
+		slot->tts_values[i] = ExecEvalExpr(argstate, econtext,
+										   &slot->tts_isnull[i]);
+		i++;
+	}
 	ExecStoreVirtualTuple(slot);
 
 	/*
@@ -1578,14 +1874,26 @@ retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
 	}
 
 	/*
-	 * For a strict inverse transition function, if the departing value is
-	 * NULL, it was never actually fed into the transition function (strict
+	 * For a strict inverse transition function, if any departing argument is
+	 * NULL, the tuple was never fed into the transition function (strict
 	 * functions skip NULL inputs), so there's nothing to remove.
 	 */
-	if (peraggstate->invtransfn.fn_strict && isnull)
+	if (peraggstate->invtransfn.fn_strict)
 	{
-		MemoryContextSwitchTo(oldContext);
-		return true;
+		has_null = false;
+		for (i = 0; i < numArguments; i++)
+		{
+			if (slot->tts_isnull[i])
+			{
+				has_null = true;
+				break;
+			}
+		}
+		if (has_null)
+		{
+			MemoryContextSwitchTo(oldContext);
+			return true;
+		}
 	}
 
 	/* There should still be an added but not yet removed value */
@@ -1649,8 +1957,11 @@ retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
 							 (Node *) winstate, NULL);
 	fcinfo->args[0].value = peraggstate->transValue;
 	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
-	fcinfo->args[1].value = oldVal;
-	fcinfo->args[1].isnull = isnull;
+	for (i = 0; i < numArguments; i++)
+	{
+		fcinfo->args[i + 1].value = slot->tts_values[i];
+		fcinfo->args[i + 1].isnull = slot->tts_isnull[i];
+	}
 	winstate->curaggcontext = peraggstate->aggcontext;
 
 	{
@@ -1987,9 +2298,14 @@ eval_windowaggregates(WindowAggState *winstate)
 		if (peraggstate->distinctStrategy != DISTINCT_SORT || !peraggstate->restart)
 			continue;
 		wfuncno = peraggstate->wfuncno;
-		eval_windowaggregate_distinct(winstate,
-									  &winstate->perfunc[wfuncno],
-									  peraggstate);
+		if (peraggstate->numDistinctCols > 1)
+			eval_windowaggregate_distinct_multi(winstate,
+											    &winstate->perfunc[wfuncno],
+											    peraggstate);
+		else
+			eval_windowaggregate_distinct(winstate,
+										  &winstate->perfunc[wfuncno],
+										  peraggstate);
 	}
 
 	/*
@@ -4032,10 +4348,11 @@ ExecReScanWindowAgg(WindowAggState *node)
 /*
  * initialize_peragg
  *
- * Almost same as in nodeAgg.c, except we only support single-argument
- * DISTINCT.  EXCLUDE clauses are supported via restart/recompute: the
- * DISTINCT hash table is rebuilt from scratch each row, containing only
- * non-excluded frame rows.
+ * Almost same as in nodeAgg.c.  Supports single-argument and multi-argument
+ * DISTINCT (multi-argument is rejected for aggregates with no initial
+ * transition value).  EXCLUDE clauses are supported via restart/recompute:
+ * the DISTINCT hash table is rebuilt from scratch each row, containing
+ * only non-excluded frame rows.
  */
 static WindowStatePerAggData *
 initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
@@ -4070,13 +4387,14 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * EXCLUDE clauses are supported for sliding frames via restart/recompute:
 	 * the DISTINCT hash table is rebuilt each row from the non-excluded set.
 	 *
-	 * Only single-argument aggregates are supported.
+	 * Both single-argument and multi-argument DISTINCT are supported.
+	 * The DISTINCT key is the tuple of all aggregate arguments.
+	 *
+	 * Exception: multi-argument DISTINCT is rejected for aggregates with
+	 * no initial transition value.  The single-argument "adopt first input
+	 * as initial state" shortcut is not extended to multi-argument
+	 * aggregates.  See the FEATURE_NOT_SUPPORTED check below.
 	 */
-
-	if (wfunc->windistinct && list_length(wfunc->args) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("DISTINCT is not supported for window aggregate functions with more than one argument")));
 
 	numArguments = list_length(wfunc->args);
 
@@ -4284,6 +4602,17 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 					 errmsg("aggregate %u needs to have compatible input type and transition type",
 							wfunc->winfnoid)));
+
+		/*
+		 * For multi-argument DISTINCT, the "adopt first input as initial
+		 * state" shortcut is not safe because the transtype may differ from
+		 * individual argument types.  Reject this combination explicitly
+		 * rather than risk corrupting aggregate state at runtime.
+		 */
+		if (wfunc->windistinct && numArguments > 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("DISTINCT is not supported for multi-argument window aggregates with no initial value")));
 	}
 
 	/*
@@ -4324,36 +4653,52 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 
 	/*
 	 * Set up DISTINCT state if needed.  We need sort and equality operators
-	 * for the single argument type, plus its type length and by-value info
-	 * for datum copying during the dedup loop.
+	 * for all argument types.  For single-arg DISTINCT, we keep the
+	 * datum-specialized sort path.  For multi-arg, we use tuple-based
+	 * sorting and multi-column hash/equality.
 	 */
 	if (wfunc->windistinct)
 	{
-		Oid			ltOpr,
-					eqOpr;
-		Oid			inputType = inputTypes[0];
+		int			nargs = numArguments;
+		Oid		   *eqOps;
+		int			j;
 
-		peraggstate->inputtypeOid = inputType;
+		peraggstate->numDistinctCols = nargs;
 
-		get_sort_group_operators(inputType,
-								 true, true, false,
-								 &ltOpr, &eqOpr, NULL,
-								 NULL);
+		/* Collect per-column sort and equality operators */
+		eqOps = (Oid *) palloc(nargs * sizeof(Oid));
 
-		peraggstate->sortOperator = ltOpr;
-		peraggstate->sortCollation = wfunc->inputcollid;
-		peraggstate->sortNullsFirst = false;
-		fmgr_info(get_opcode(eqOpr), &peraggstate->equalfn);
+		for (j = 0; j < nargs; j++)
+		{
+			Oid			ltOpr,
+						eqOpr;
 
-		get_typlenbyval(inputType,
-						&peraggstate->inputtypeLen,
-						&peraggstate->inputtypeByVal);
+			get_sort_group_operators(inputTypes[j],
+									 true, true, false,
+									 &ltOpr, &eqOpr, NULL,
+									 NULL);
+			eqOps[j] = eqOpr;
+
+			/* For single-arg, keep the fast-path datum sort fields */
+			if (nargs == 1)
+			{
+				peraggstate->inputtypeOid = inputTypes[0];
+				peraggstate->sortOperator = ltOpr;
+				peraggstate->sortCollation = wfunc->inputcollid;
+				peraggstate->sortNullsFirst = false;
+				fmgr_info(get_opcode(eqOpr), &peraggstate->equalfn);
+
+				get_typlenbyval(inputTypes[0],
+								&peraggstate->inputtypeLen,
+								&peraggstate->inputtypeByVal);
+			}
+		}
 
 		/*
 		 * Determine the DISTINCT strategy.  Whole-partition frames use
 		 * sort-based deduplication.  Non-whole-partition frames (grow-only
-		 * and sliding) use hash-based deduplication, requiring the argument
-		 * type to support hashing.
+		 * and sliding) use hash-based deduplication, requiring all argument
+		 * types to support hashing.
 		 *
 		 * The hash table itself is created per-partition in
 		 * initialize_windowaggregate().
@@ -4361,40 +4706,115 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 		if (is_whole_partition_frame(winstate))
 		{
 			peraggstate->distinctStrategy = DISTINCT_SORT;
+
+			/*
+			 * For multi-arg sort path, set up per-column sort metadata
+			 * and multi-column equality comparator.
+			 */
+			if (nargs > 1)
+			{
+				peraggstate->distinctTupleDesc = CreateTemplateTupleDesc(nargs);
+				for (j = 0; j < nargs; j++)
+					TupleDescInitEntry(peraggstate->distinctTupleDesc, j + 1,
+									   NULL, inputTypes[j], -1, 0);
+				TupleDescFinalize(peraggstate->distinctTupleDesc);
+
+				peraggstate->distinctSlot =
+					MakeSingleTupleTableSlot(peraggstate->distinctTupleDesc,
+											 &TTSOpsMinimalTuple);
+				peraggstate->uniqSlot =
+					MakeSingleTupleTableSlot(peraggstate->distinctTupleDesc,
+											 &TTSOpsMinimalTuple);
+
+				peraggstate->sortColIdx = (AttrNumber *) palloc(nargs * sizeof(AttrNumber));
+				peraggstate->sortOperators = (Oid *) palloc(nargs * sizeof(Oid));
+				peraggstate->sortCollations = (Oid *) palloc(nargs * sizeof(Oid));
+				peraggstate->sortNullsFirst_multi = (bool *) palloc(nargs * sizeof(bool));
+
+				{
+					int		k = 0;
+					ListCell *lc;
+
+					foreach(lc, wfunc->args)
+					{
+						Node   *arg = (Node *) lfirst(lc);
+						Oid		ltOpr2;
+
+						get_sort_group_operators(inputTypes[k],
+												 true, false, false,
+												 &ltOpr2, NULL, NULL, NULL);
+						peraggstate->sortColIdx[k] = k + 1;
+						peraggstate->sortOperators[k] = ltOpr2;
+						peraggstate->sortCollations[k] = exprCollation(arg);
+						peraggstate->sortNullsFirst_multi[k] = false;
+						k++;
+					}
+				}
+
+				peraggstate->equalfnMulti =
+					execTuplesMatchPrepare(peraggstate->distinctTupleDesc,
+										   nargs,
+										   peraggstate->sortColIdx,
+										   eqOps,
+										   peraggstate->sortCollations,
+										   &winstate->ss.ps);
+			}
 		}
 		else
 		{
 			Oid			hashfn_oid;
 
-			/* Hash-based paths require a hashable type */
-			if (!get_op_hash_functions(eqOpr, &hashfn_oid, NULL))
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("could not find hash function for window "
-								"DISTINCT aggregate"),
-						 errhint("The argument type must support hashing.")));
+			/* Hash-based paths require all argument types to be hashable */
+			for (j = 0; j < nargs; j++)
+			{
+				if (!get_op_hash_functions(eqOps[j], &hashfn_oid, NULL))
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_FUNCTION),
+							 errmsg("could not find hash function for window "
+									"DISTINCT aggregate"),
+							 errhint("All DISTINCT argument types must support hashing.")));
+			}
 
 			if (is_grow_only_frame(winstate))
 				peraggstate->distinctStrategy = DISTINCT_HASH;
 			else
 				peraggstate->distinctStrategy = DISTINCT_SLIDING;
 
-			/* Create a single-column TupleDesc for the input type */
-			peraggstate->distinctTupleDesc = CreateTemplateTupleDesc(1);
-			TupleDescInitEntry(peraggstate->distinctTupleDesc, 1,
-							   "distinct_val", inputType, -1, 0);
+			/* Create an N-column TupleDesc for all input types */
+			peraggstate->distinctTupleDesc = CreateTemplateTupleDesc(nargs);
+			for (j = 0; j < nargs; j++)
+				TupleDescInitEntry(peraggstate->distinctTupleDesc, j + 1,
+								   NULL, inputTypes[j], -1, 0);
+			TupleDescFinalize(peraggstate->distinctTupleDesc);
 
 			/* Create a dedicated slot for hash table lookups */
 			peraggstate->distinctSlot =
 				MakeSingleTupleTableSlot(peraggstate->distinctTupleDesc,
 										 &TTSOpsVirtual);
 
+			/* Store per-column collations from each argument expression */
+			peraggstate->hashCollations = (Oid *) palloc(nargs * sizeof(Oid));
+			{
+				int			k = 0;
+				ListCell   *lc;
+
+				foreach(lc, wfunc->args)
+				{
+					Node   *arg = (Node *) lfirst(lc);
+
+					peraggstate->hashCollations[k] = exprCollation(arg);
+					k++;
+				}
+			}
+
 			/* Pre-compute hash infrastructure (reused across partitions) */
-			execTuplesHashPrepare(1,
-								  &eqOpr,
+			execTuplesHashPrepare(nargs,
+								  eqOps,
 								  &peraggstate->hashEqFuncOids,
 								  &peraggstate->hashFunctions);
 		}
+
+		pfree(eqOps);
 	}
 
 	ReleaseSysCache(aggTuple);

@@ -2574,6 +2574,67 @@ FROM generate_series(1, 5) g(x); -- error
 SELECT count(DISTINCT x::money) OVER (ORDER BY x ROWS 3 PRECEDING)
 FROM generate_series(1, 5) g(x); -- error
 
--- Error: multi-argument DISTINCT window aggregate (not yet supported)
-SELECT string_agg(DISTINCT four::text, ',') OVER (PARTITION BY ten)
-FROM tenk1; -- error
+-- Multi-argument DISTINCT window aggregates
+
+-- Multi-argument DISTINCT: regr_count (2-arg, returns int8)
+-- Whole-partition frame (sort path)
+SELECT y, x, regr_count(DISTINCT y, x) OVER ()
+FROM (VALUES (1.0,10.0),(1.0,10.0),(1.0,20.0),(2.0,10.0),(2.0,20.0),(2.0,20.0)) v(y, x);
+
+-- Non-shrinking frame (hash path)
+SELECT y, x, regr_count(DISTINCT y, x) OVER (ORDER BY id)
+FROM (VALUES (1,1.0,10.0),(2,1.0,10.0),(3,1.0,20.0),(4,2.0,10.0),(5,2.0,20.0),(6,2.0,20.0)) v(id, y, x);
+
+-- Sliding ROWS (refcounted hash path)
+SELECT id, y, x, regr_count(DISTINCT y, x) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1,1.0,10.0),(2,1.0,10.0),(3,1.0,20.0),(4,2.0,10.0),(5,2.0,20.0),(6,2.0,20.0)) v(id, y, x);
+
+-- Sliding GROUPS
+SELECT y, x, regr_count(DISTINCT y, x) OVER (ORDER BY y GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1.0,10.0),(1.0,10.0),(1.0,20.0),(2.0,10.0),(2.0,20.0),(2.0,20.0)) v(y, x);
+
+-- EXCLUDE + multi-arg DISTINCT
+SELECT id, y, x, regr_count(DISTINCT y, x) OVER (
+    ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM (VALUES (1,1.0,10.0),(2,1.0,10.0),(3,1.0,20.0),(4,2.0,10.0),(5,2.0,20.0),(6,2.0,20.0)) v(id, y, x);
+
+-- Multi-arg DISTINCT with NULLs: (NULL,10) and (NULL,10) are duplicates
+SELECT id, y, x, regr_count(DISTINCT y, x) OVER (ORDER BY id)
+FROM (VALUES (1,1.0,10.0),(2,NULL,10.0),(3,NULL,10.0),(4,1.0,NULL),(5,2.0,10.0)) v(id, y, x);
+
+-- FILTER + multi-arg DISTINCT
+SELECT id, y, x, regr_count(DISTINCT y, x) FILTER (WHERE id > 2) OVER (ORDER BY id)
+FROM (VALUES (1,1.0,10.0),(2,1.0,10.0),(3,1.0,20.0),(4,2.0,10.0),(5,2.0,20.0)) v(id, y, x);
+
+-- Mixed single-arg and multi-arg DISTINCT in one query
+SELECT id, y, x,
+       count(DISTINCT y) OVER w,
+       regr_count(DISTINCT y, x) OVER w
+FROM (VALUES (1,1.0,10.0),(2,1.0,10.0),(3,1.0,20.0),(4,2.0,10.0),(5,2.0,20.0)) v(id, y, x)
+WINDOW w AS (ORDER BY id);
+
+-- Mixed DISTINCT and non-DISTINCT multi-arg aggregates
+SELECT id, y, x,
+       regr_count(DISTINCT y, x) OVER (ORDER BY id),
+       regr_count(y, x) OVER (ORDER BY id)
+FROM (VALUES (1,1.0,10.0),(2,1.0,10.0),(3,1.0,20.0),(4,2.0,10.0),(5,2.0,20.0)) v(id, y, x);
+
+-- Error: multi-argument DISTINCT with no initial transition value.
+-- The aggregate's transtype (float8) is binary-compatible with the first
+-- argument, so the aggregate definition succeeds, but the DISTINCT window
+-- path rejects the combination at executor init time.
+CREATE FUNCTION twoarg_accum_strict(state float8, a float8, b float8)
+RETURNS float8 LANGUAGE sql STRICT IMMUTABLE AS
+  'SELECT state + a + b';
+CREATE AGGREGATE twoarg_sum_noinit(float8, float8) (
+    sfunc = twoarg_accum_strict,
+    stype = float8
+    -- no initcond: strict + NULL initval
+);
+
+SELECT twoarg_sum_noinit(DISTINCT y, x) OVER ()
+FROM (VALUES (1.0,10.0),(2.0,20.0)) v(y, x); -- error
+
+DROP AGGREGATE twoarg_sum_noinit(float8, float8);
+DROP FUNCTION twoarg_accum_strict(float8, float8, float8);
