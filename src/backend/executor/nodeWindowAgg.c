@@ -4032,9 +4032,8 @@ ExecReScanWindowAgg(WindowAggState *node)
 /*
  * initialize_peragg
  *
- * Almost same as in nodeAgg.c, except we only support DISTINCT for
- * non-shrinking frames (UNBOUNDED PRECEDING, no EXCLUDE) and
- * single-argument aggregates.
+ * Almost same as in nodeAgg.c, except we only support single-argument
+ * DISTINCT and do not support DISTINCT with EXCLUDE clauses.
  */
 static WindowStatePerAggData *
 initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
@@ -4064,9 +4063,8 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * Validate DISTINCT usage.  We support DISTINCT for:
 	 *   - whole-partition frames (sort-based deduplication)
 	 *   - grow-only frames (hash-based dedup; UNBOUNDED PRECEDING, no EXCLUDE)
-	 *   - sliding ROWS frames (refcounted hash dedup; no EXCLUDE)
+	 *   - sliding ROW/RANGE/GROUPS frames (refcounted hash dedup; no EXCLUDE)
 	 *
-	 * Sliding RANGE and GROUPS frames are not yet supported.
 	 * EXCLUDE clauses are not yet supported with DISTINCT.
 	 * Only single-argument aggregates are supported.
 	 */
@@ -4079,14 +4077,6 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("DISTINCT is not supported for window functions "
 							"with an EXCLUDE clause")));
-
-		if (!(frameOptions & FRAMEOPTION_ROWS))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("DISTINCT is not supported for window functions "
-							"with sliding RANGE or GROUPS frames"),
-					 errhint("Use ROWS mode, or use a frame starting at "
-							 "UNBOUNDED PRECEDING without an EXCLUDE clause.")));
 	}
 
 	if (wfunc->windistinct && list_length(wfunc->args) != 1)
@@ -4368,8 +4358,8 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 		/*
 		 * Determine the DISTINCT strategy.  Whole-partition frames use
 		 * sort-based deduplication.  Non-whole-partition frames (grow-only
-		 * and sliding ROWS) use hash-based deduplication, requiring the
-		 * argument type to support hashing.
+		 * and sliding) use hash-based deduplication, requiring the argument
+		 * type to support hashing.
 		 *
 		 * The hash table itself is created per-partition in
 		 * initialize_windowaggregate().

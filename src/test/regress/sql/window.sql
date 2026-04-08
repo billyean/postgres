@@ -2406,14 +2406,103 @@ SELECT count(DISTINCT x) OVER (
     EXCLUDE CURRENT ROW)
 FROM generate_series(1, 10) g(x); -- error
 
--- Error: sliding RANGE frame
-SELECT count(DISTINCT x) OVER (
+-- Sliding RANGE: basic PRECEDING to CURRENT ROW
+SELECT x, count(DISTINCT x % 3) OVER (
     ORDER BY x RANGE BETWEEN 3 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding RANGE: both PRECEDING and FOLLOWING
+SELECT x, count(DISTINCT x % 3) OVER (
+    ORDER BY x RANGE BETWEEN 3 PRECEDING AND 2 FOLLOWING)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding RANGE: forward-only
+SELECT x, count(DISTINCT x % 3) OVER (
+    ORDER BY x RANGE BETWEEN CURRENT ROW AND 3 FOLLOWING)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding RANGE: sum with value-based offset
+SELECT x, sum(DISTINCT x % 4) OVER (
+    ORDER BY x RANGE BETWEEN 2 PRECEDING AND 1 FOLLOWING)
+FROM generate_series(1, 8) g(x);
+
+-- Sliding GROUPS: basic PRECEDING to CURRENT ROW
+-- Data: groups are {1},{2,2},{3,3,3},{4}
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- Sliding GROUPS: symmetric window
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- Sliding GROUPS: forward-only
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN CURRENT ROW AND 2 FOLLOWING)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- Sliding RANGE: duplicate-heavy peer group data
+-- Multiple rows with same ORDER BY value in RANGE frame
+SELECT t, x, count(DISTINCT x) OVER (
+    ORDER BY t RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1,10),(1,10),(2,20),(2,10),(3,10),(3,30)) v(t, x);
+
+-- Sliding GROUPS: peer group with duplicates in DISTINCT argument
+SELECT x, v, count(DISTINCT v) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1,'a'),(1,'a'),(2,'b'),(2,'a'),(3,'a'),(3,'c')) v(x, v);
+
+-- Sliding RANGE: NULL handling
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY rn RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM (VALUES (1,1),(NULL,2),(2,3),(NULL,4),(1,5)) v(x, rn);
+
+-- Sliding GROUPS: NULL handling
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY rn GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM (VALUES (1,1),(NULL,2),(2,3),(NULL,4),(1,5)) v(x, rn);
+
+-- Sliding RANGE: FILTER clause
+SELECT x, count(DISTINCT x % 3) FILTER (WHERE x > 3) OVER (
+    ORDER BY x RANGE BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding GROUPS: mixed DISTINCT and non-DISTINCT
+SELECT x,
+       count(DISTINCT x) OVER w,
+       sum(x) OVER w
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x)
+WINDOW w AS (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW);
+
+-- Sliding RANGE: multiple DISTINCT aggregates
+SELECT x,
+       count(DISTINCT x % 2) OVER w,
+       count(DISTINCT x % 3) OVER w
+FROM generate_series(1, 10) g(x)
+WINDOW w AS (ORDER BY x RANGE BETWEEN 2 PRECEDING AND CURRENT ROW);
+
+-- Sliding GROUPS: aggregate without invtransfn (restart fallback)
+-- max() has no aggminvtransfn, so restart is forced on frame-head movement.
+SELECT x, max(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- Sliding RANGE: aggregate without invtransfn (restart fallback)
+SELECT x, max(DISTINCT x % 4) OVER (
+    ORDER BY x RANGE BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 8) g(x);
+
+-- Error: EXCLUDE clause with sliding RANGE
+SELECT count(DISTINCT x) OVER (
+    ORDER BY x RANGE BETWEEN 3 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
 FROM generate_series(1, 10) g(x); -- error
 
--- Error: sliding GROUPS frame
+-- Error: EXCLUDE clause with sliding GROUPS
 SELECT count(DISTINCT x) OVER (
-    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+    EXCLUDE TIES)
 FROM generate_series(1, 10) g(x); -- error
 
 -- Error: non-hashable type with non-whole-partition frame (money has btree but no hash).
