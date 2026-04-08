@@ -4033,7 +4033,9 @@ ExecReScanWindowAgg(WindowAggState *node)
  * initialize_peragg
  *
  * Almost same as in nodeAgg.c, except we only support single-argument
- * DISTINCT and do not support DISTINCT with EXCLUDE clauses.
+ * DISTINCT.  EXCLUDE clauses are supported via restart/recompute: the
+ * DISTINCT hash table is rebuilt from scratch each row, containing only
+ * non-excluded frame rows.
  */
 static WindowStatePerAggData *
 initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
@@ -4063,21 +4065,13 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * Validate DISTINCT usage.  We support DISTINCT for:
 	 *   - whole-partition frames (sort-based deduplication)
 	 *   - grow-only frames (hash-based dedup; UNBOUNDED PRECEDING, no EXCLUDE)
-	 *   - sliding ROW/RANGE/GROUPS frames (refcounted hash dedup; no EXCLUDE)
+	 *   - sliding ROWS/RANGE/GROUPS frames (refcounted hash dedup)
 	 *
-	 * EXCLUDE clauses are not yet supported with DISTINCT.
+	 * EXCLUDE clauses are supported for sliding frames via restart/recompute:
+	 * the DISTINCT hash table is rebuilt each row from the non-excluded set.
+	 *
 	 * Only single-argument aggregates are supported.
 	 */
-	if (wfunc->windistinct && !is_grow_only_frame(winstate))
-	{
-		int		frameOptions = winstate->frameOptions;
-
-		if (frameOptions & FRAMEOPTION_EXCLUSION)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("DISTINCT is not supported for window functions "
-							"with an EXCLUDE clause")));
-	}
 
 	if (wfunc->windistinct && list_length(wfunc->args) != 1)
 		ereport(ERROR,

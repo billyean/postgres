@@ -2390,21 +2390,21 @@ FROM (VALUES (1,1),(2,1),(2,1),(3,1),(1,2),(1,2),(2,2)) v(x, p);
 SELECT x, max(DISTINCT x % 4) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
 FROM generate_series(1, 8) g(x);
 
--- Error: EXCLUDE clause with ORDER BY
-SELECT count(DISTINCT x) OVER (
+-- EXCLUDE clause with ROWS UNBOUNDED PRECEDING (restart/recompute path)
+SELECT x, count(DISTINCT x) OVER (
     ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     EXCLUDE CURRENT ROW)
-FROM generate_series(1, 10) g(x); -- error
+FROM generate_series(1, 10) g(x);
 
--- Error: EXCLUDE clause with UNBOUNDED frame
-SELECT count(DISTINCT x) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)
-FROM generate_series(1, 10) g(x); -- error
+-- EXCLUDE clause with UNBOUNDED frame
+SELECT x, count(DISTINCT x) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)
+FROM generate_series(1, 10) g(x);
 
--- Error: EXCLUDE clause with sliding ROWS frame
-SELECT count(DISTINCT x) OVER (
+-- EXCLUDE CURRENT ROW with sliding ROWS frame
+SELECT x, count(DISTINCT x) OVER (
     ORDER BY x ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
     EXCLUDE CURRENT ROW)
-FROM generate_series(1, 10) g(x); -- error
+FROM generate_series(1, 10) g(x);
 
 -- Sliding RANGE: basic PRECEDING to CURRENT ROW
 SELECT x, count(DISTINCT x % 3) OVER (
@@ -2493,17 +2493,76 @@ SELECT x, max(DISTINCT x % 4) OVER (
     ORDER BY x RANGE BETWEEN 2 PRECEDING AND CURRENT ROW)
 FROM generate_series(1, 8) g(x);
 
--- Error: EXCLUDE clause with sliding RANGE
-SELECT count(DISTINCT x) OVER (
+-- EXCLUDE CURRENT ROW with sliding RANGE
+SELECT x, count(DISTINCT x) OVER (
     ORDER BY x RANGE BETWEEN 3 PRECEDING AND CURRENT ROW
     EXCLUDE CURRENT ROW)
-FROM generate_series(1, 10) g(x); -- error
+FROM generate_series(1, 10) g(x);
 
--- Error: EXCLUDE clause with sliding GROUPS
-SELECT count(DISTINCT x) OVER (
+-- EXCLUDE TIES with sliding GROUPS (no actual ties in this data)
+SELECT x, count(DISTINCT x) OVER (
     ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
     EXCLUDE TIES)
-FROM generate_series(1, 10) g(x); -- error
+FROM generate_series(1, 10) g(x);
+
+-- EXCLUDE CURRENT ROW + GROUPS: peer-group-heavy data
+-- Data: groups are {1},{2,2},{3,3,3},{4}
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- EXCLUDE GROUP with GROUPS: exclude entire current peer group
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+    EXCLUDE GROUP)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- EXCLUDE TIES with GROUPS: exclude peers but keep current row
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+    EXCLUDE TIES)
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x);
+
+-- EXCLUDE + duplicate-heavy data with RANGE
+SELECT t, x, count(DISTINCT x) OVER (
+    ORDER BY t RANGE BETWEEN 1 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM (VALUES (1,10),(1,10),(2,20),(2,10),(3,10),(3,30)) v(t, x);
+
+-- EXCLUDE + NULL handling
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY rn ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM (VALUES (1,1),(NULL,2),(2,3),(NULL,4),(1,5)) v(x, rn);
+
+-- EXCLUDE + FILTER clause
+SELECT x, count(DISTINCT x % 3) FILTER (WHERE x > 3) OVER (
+    ORDER BY x ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM generate_series(1, 8) g(x);
+
+-- EXCLUDE + mixed DISTINCT and non-DISTINCT aggregates
+SELECT x,
+       count(DISTINCT x) OVER w,
+       sum(x) OVER w
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x)
+WINDOW w AS (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+             EXCLUDE CURRENT ROW);
+
+-- EXCLUDE + multiple DISTINCT aggregates
+SELECT x,
+       count(DISTINCT x) OVER w,
+       sum(DISTINCT x) OVER w
+FROM (VALUES (1),(2),(2),(3),(3),(3),(4)) v(x)
+WINDOW w AS (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+             EXCLUDE TIES);
+
+-- EXCLUDE + sum(DISTINCT) and max(DISTINCT)
+SELECT x, sum(DISTINCT x) OVER (
+    ORDER BY rn ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM (VALUES (1,1),(2,2),(2,3),(3,4),(3,5),(1,6)) v(x, rn);
 
 -- Error: non-hashable type with non-whole-partition frame (money has btree but no hash).
 -- Whole-partition DISTINCT uses sort-based dedup so money works there,
