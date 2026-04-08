@@ -2310,13 +2310,85 @@ SELECT x,
        )
 FROM generate_series(1, 10) g(x);
 
--- Error: sliding frame (start is not UNBOUNDED PRECEDING)
-SELECT count(DISTINCT x) OVER (ROWS 3 PRECEDING)
-FROM generate_series(1, 10) g(x); -- error
+-- Sliding ROWS: basic PRECEDING to CURRENT ROW
+SELECT x, count(DISTINCT x % 3) OVER (
+    ORDER BY x ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) g(x);
 
--- Error: sliding frame with explicit bounds
-SELECT count(DISTINCT x) OVER (ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
-FROM generate_series(1, 10) g(x); -- error
+-- Sliding ROWS: shorthand form (ROWS N PRECEDING)
+SELECT x, count(DISTINCT x) OVER (ROWS 3 PRECEDING)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding ROWS: symmetric window (PRECEDING and FOLLOWING)
+SELECT x, count(DISTINCT x % 3) OVER (
+    ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding ROWS: forward-only window
+SELECT x, count(DISTINCT x % 3) OVER (
+    ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding ROWS: asymmetric window
+SELECT x, sum(DISTINCT x % 3) OVER (
+    ORDER BY x ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding ROWS: single-row window
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x ROWS BETWEEN CURRENT ROW AND CURRENT ROW)
+FROM generate_series(1, 5) g(x);
+
+-- Sliding ROWS: window larger than partition
+SELECT x, count(DISTINCT x) OVER (
+    ORDER BY x ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING)
+FROM generate_series(1, 5) g(x);
+
+-- Sliding ROWS: duplicate-heavy data verifying refcount correctness
+SELECT x, count(DISTINCT x) OVER (ORDER BY rn ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1,1),(1,2),(2,3),(1,4),(2,5),(2,6),(3,7)) v(x, rn);
+
+-- Sliding ROWS: all-same-value data
+SELECT x, count(DISTINCT x) OVER (ORDER BY rn ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM (VALUES (1,1),(1,2),(1,3),(1,4),(1,5)) v(x, rn);
+
+-- Sliding ROWS: NULL handling
+SELECT x, count(DISTINCT x) OVER (ORDER BY rn ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM (VALUES (1,1),(NULL,2),(2,3),(NULL,4),(1,5)) v(x, rn);
+
+-- Sliding ROWS: sum with NULLs
+SELECT x, sum(DISTINCT x) OVER (ORDER BY rn ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1,1),(NULL,2),(2,3),(NULL,4),(1,5)) v(x, rn);
+
+-- Sliding ROWS: FILTER clause
+SELECT x, count(DISTINCT x % 3) FILTER (WHERE x > 3) OVER (
+    ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) g(x);
+
+-- Sliding ROWS: mixed DISTINCT and non-DISTINCT in same window
+SELECT x,
+       count(DISTINCT x % 3) OVER w,
+       sum(x) OVER w
+FROM generate_series(1, 9) g(x)
+WINDOW w AS (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW);
+
+-- Sliding ROWS: multiple DISTINCT aggregates
+SELECT x,
+       count(DISTINCT x % 2) OVER w,
+       count(DISTINCT x % 3) OVER w
+FROM generate_series(1, 10) g(x)
+WINDOW w AS (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW);
+
+-- Sliding ROWS: with PARTITION BY
+SELECT x, p,
+       count(DISTINCT x) OVER (PARTITION BY p ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1,1),(2,1),(2,1),(3,1),(1,2),(1,2),(2,2)) v(x, p);
+
+-- Sliding ROWS: aggregate without inverse transition function (restart fallback).
+-- max() has no aggminvtransfn, so the executor must restart the aggregate on
+-- every frame-head movement rather than using incremental removal.
+SELECT x, max(DISTINCT x % 4) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 8) g(x);
 
 -- Error: EXCLUDE clause with ORDER BY
 SELECT count(DISTINCT x) OVER (
@@ -2328,10 +2400,30 @@ FROM generate_series(1, 10) g(x); -- error
 SELECT count(DISTINCT x) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)
 FROM generate_series(1, 10) g(x); -- error
 
--- Error: non-hashable type with non-shrinking frame (money has btree but no hash).
+-- Error: EXCLUDE clause with sliding ROWS frame
+SELECT count(DISTINCT x) OVER (
+    ORDER BY x ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+    EXCLUDE CURRENT ROW)
+FROM generate_series(1, 10) g(x); -- error
+
+-- Error: sliding RANGE frame
+SELECT count(DISTINCT x) OVER (
+    ORDER BY x RANGE BETWEEN 3 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) g(x); -- error
+
+-- Error: sliding GROUPS frame
+SELECT count(DISTINCT x) OVER (
+    ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) g(x); -- error
+
+-- Error: non-hashable type with non-whole-partition frame (money has btree but no hash).
 -- Whole-partition DISTINCT uses sort-based dedup so money works there,
--- but the incremental non-shrinking path requires hash support.
+-- but the incremental and sliding paths require hash support.
 SELECT count(DISTINCT x::money) OVER (ORDER BY x)
+FROM generate_series(1, 5) g(x); -- error
+
+-- Error: non-hashable type with sliding ROWS frame
+SELECT count(DISTINCT x::money) OVER (ORDER BY x ROWS 3 PRECEDING)
 FROM generate_series(1, 5) g(x); -- error
 
 -- Error: multi-argument DISTINCT window aggregate (not yet supported)

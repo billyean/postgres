@@ -61,6 +61,26 @@
 #include "windowapi.h"
 
 /*
+ * Strategy for DISTINCT handling in window aggregate functions.
+ */
+typedef enum DistinctStrategy
+{
+	DISTINCT_NONE,				/* not a DISTINCT aggregate */
+	DISTINCT_SORT,				/* whole-partition: sort-based dedup */
+	DISTINCT_HASH,				/* grow-only frame: insert-only hash seen-set */
+	DISTINCT_SLIDING			/* sliding ROWS: refcounted hash with
+								 * entry/exit.  Hash entries whose
+								 * refcount drops to 0 are intentionally
+								 * left in the table ("zombie entries")
+								 * rather than removed: this avoids the
+								 * cost of deletion and the complexity of
+								 * hash-table compaction, at the expense
+								 * of some memory.  A zombie is revived
+								 * when the same value re-enters the
+								 * frame. */
+} DistinctStrategy;
+
+/*
  * All the window function APIs are called with this object, which is passed
  * to window functions as fcinfo->context.
  */
@@ -176,15 +196,14 @@ typedef struct WindowStatePerAggData
 	bool		restart;		/* need to restart this agg in this cycle? */
 
 	/* DISTINCT support */
-	bool		windistinct;	/* DISTINCT specified on this aggregate */
+	DistinctStrategy distinctStrategy;	/* DISTINCT dedup strategy */
 	Oid			inputtypeOid;	/* OID of the single DISTINCT argument type */
 	Oid			sortOperator;	/* btree < operator for sorting */
 	Oid			sortCollation;	/* collation for sort/equality */
 	bool		sortNullsFirst; /* NULLS FIRST? */
 	FmgrInfo	equalfn;		/* equality comparison function */
 
-	/* Grow-only frame DISTINCT: hash-based seen-set */
-	bool		distinctIsHash;		/* using hash-based incremental DISTINCT? */
+	/* Hash-based DISTINCT state (DISTINCT_HASH and DISTINCT_SLIDING) */
 	TupleHashTable distinctTable;	/* hash table of seen values, or NULL */
 	MemoryContext distinctContext;	/* BumpContext for hash table tuples */
 	TupleDesc	distinctTupleDesc;	/* single-column tuple descriptor */
@@ -235,6 +254,12 @@ static void eval_windowaggregate_distinct(WindowAggState *winstate,
 static void advance_windowaggregate_distinct(WindowAggState *winstate,
 											 WindowStatePerFunc perfuncstate,
 											 WindowStatePerAgg peraggstate);
+static void advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
+													 WindowStatePerFunc perfuncstate,
+													 WindowStatePerAgg peraggstate);
+static bool retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
+													 WindowStatePerFunc perfuncstate,
+													 WindowStatePerAgg peraggstate);
 
 static bool are_peers(WindowAggState *winstate, TupleTableSlot *slot1,
 					  TupleTableSlot *slot2);
@@ -309,19 +334,28 @@ initialize_windowaggregate(WindowAggState *winstate,
 	peraggstate->resultValueIsNull = true;
 
 	/*
-	 * For hash-based DISTINCT (grow-only frames), create a fresh hash table
-	 * each time the aggregate is restarted (i.e., at the start of each new
-	 * partition).  The previous distinctContext (if any) was a child of
+	 * For hash-based DISTINCT (grow-only frames and sliding ROWS frames),
+	 * create a fresh hash table each time the aggregate is restarted (i.e.,
+	 * at the start of each new partition, or after a failed inverse
+	 * transition).  The previous distinctContext (if any) was a child of
 	 * aggcontext and was already destroyed by the MemoryContextReset above
 	 * (for private aggcontexts) or by the caller's reset of the shared
 	 * aggcontext.
+	 *
+	 * For DISTINCT_SLIDING, we request additionalsize = sizeof(int32) so
+	 * that each hash entry carries a refcount alongside the stored tuple.
+	 * The refcount tracks how many in-frame rows have that distinct value.
 	 */
-	if (peraggstate->distinctIsHash)
+	if (peraggstate->distinctStrategy == DISTINCT_HASH ||
+		peraggstate->distinctStrategy == DISTINCT_SLIDING)
 	{
 		Oid			collations[1];
 		AttrNumber	keyColIdx[1] = {1};
+		Size		addlsize;
 
 		collations[0] = peraggstate->sortCollation;
+		addlsize = (peraggstate->distinctStrategy == DISTINCT_SLIDING)
+			? sizeof(int32) : 0;
 
 		peraggstate->distinctContext =
 			BumpContextCreate(peraggstate->aggcontext,
@@ -346,7 +380,7 @@ initialize_windowaggregate(WindowAggState *winstate,
 								peraggstate->hashFunctions,
 								collations,
 								256,	/* initial estimate */
-								0,		/* additionalsize */
+								addlsize,
 								peraggstate->aggcontext,
 								peraggstate->distinctContext,
 								winstate->tmpcontext->ecxt_per_tuple_memory,
@@ -1239,6 +1273,449 @@ advance_windowaggregate_distinct(WindowAggState *winstate,
 }
 
 /*
+ * advance_windowaggregate_distinct_sliding
+ *
+ * Process a row entering the frame for a sliding-ROWS DISTINCT aggregate.
+ * Maintains a refcounted hash table: calls the transition function only when
+ * a value's refcount goes from 0 to 1 (first occurrence in frame).
+ * Otherwise just increments the refcount.
+ */
+static void
+advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
+										 WindowStatePerFunc perfuncstate,
+										 WindowStatePerAgg peraggstate)
+{
+	LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
+	WindowFuncExprState *wfuncstate = perfuncstate->wfuncstate;
+	int			numArguments = perfuncstate->numArguments;
+	ExprContext *econtext = winstate->tmpcontext;
+	ExprState  *filter = wfuncstate->aggfilter;
+	TupleTableSlot *slot = peraggstate->distinctSlot;
+	Datum		newVal;
+	bool		isnull;
+	bool		isnew;
+	int32	   *refcount;
+	MemoryContext oldContext;
+
+	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+	/* Skip anything FILTERed out */
+	if (filter)
+	{
+		Datum		res = ExecEvalExpr(filter, econtext, &isnull);
+
+		if (isnull || !DatumGetBool(res))
+		{
+			MemoryContextSwitchTo(oldContext);
+			return;
+		}
+	}
+
+	/* Evaluate the single argument */
+	{
+		ExprState  *argstate = (ExprState *) linitial(wfuncstate->args);
+
+		newVal = ExecEvalExpr(argstate, econtext, &isnull);
+	}
+
+	/* Store in slot for hash lookup */
+	ExecClearTuple(slot);
+	slot->tts_values[0] = newVal;
+	slot->tts_isnull[0] = isnull;
+	ExecStoreVirtualTuple(slot);
+
+	/* Look up or insert into refcounted hash table */
+	{
+		TupleHashEntry entry;
+
+		entry = LookupTupleHashEntry(peraggstate->distinctTable, slot,
+									 &isnew, NULL);
+		Assert(entry != NULL);
+		refcount = (int32 *) TupleHashEntryGetAdditional(
+			peraggstate->distinctTable, entry);
+	}
+
+	Assert(refcount != NULL);
+
+	if (!isnew && *refcount > 0)
+	{
+		/* Value already in frame with live refcount; just bump it */
+		(*refcount)++;
+		MemoryContextSwitchTo(oldContext);
+		return;
+	}
+
+	/*
+	 * Either a brand-new hash entry (isnew == true, refcount == 0 from
+	 * zeroed additional space), or a zombie entry left behind when the
+	 * value's refcount previously dropped to 0.  In both cases, this is
+	 * the first current occurrence in the frame: set refcount to 1 and
+	 * feed the value into the transition function.
+	 */
+	*refcount = 1;
+
+	/*
+	 * New distinct value: advance the transition function.
+	 * This replicates the strict-handling + transfn logic from
+	 * advance_windowaggregate_distinct().
+	 */
+	if (peraggstate->transfn.fn_strict)
+	{
+		/* For strict transfn, skip NULL inputs */
+		if (isnull)
+		{
+			MemoryContextSwitchTo(oldContext);
+			return;
+		}
+
+		/*
+		 * For strict transition functions with initial value NULL, use the
+		 * first non-NULL input as the initial state.
+		 */
+		if (peraggstate->transValueCount == 0 && peraggstate->transValueIsNull)
+		{
+			MemoryContextSwitchTo(peraggstate->aggcontext);
+			peraggstate->transValue = datumCopy(newVal,
+												peraggstate->transtypeByVal,
+												peraggstate->transtypeLen);
+			peraggstate->transValueIsNull = false;
+			peraggstate->transValueCount = 1;
+			MemoryContextSwitchTo(oldContext);
+			return;
+		}
+
+		if (peraggstate->transValueIsNull)
+		{
+			/*
+			 * Don't call a strict function with NULL inputs.  Note it is
+			 * possible to get here despite the above tests, if the transfn
+			 * is strict *and* returned a NULL on a prior cycle.  If that
+			 * happens we will propagate the NULL all the way to the end.
+			 * Unlike the grow-only path, the sliding path may use invtransfn.
+			 */
+			MemoryContextSwitchTo(oldContext);
+			return;
+		}
+	}
+
+	/* OK to call the transition function */
+	InitFunctionCallInfoData(*fcinfo, &(peraggstate->transfn),
+							 numArguments + 1,
+							 perfuncstate->winCollation,
+							 (Node *) winstate, NULL);
+	fcinfo->args[0].value = peraggstate->transValue;
+	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
+	fcinfo->args[1].value = newVal;
+	fcinfo->args[1].isnull = isnull;
+	winstate->curaggcontext = peraggstate->aggcontext;
+
+	{
+		Datum		result;
+
+		result = FunctionCallInvoke(fcinfo);
+		winstate->curaggcontext = NULL;
+
+		/*
+		 * Moving-aggregate transition functions must not return null, see
+		 * advance_windowaggregate().
+		 */
+		if (fcinfo->isnull && OidIsValid(peraggstate->invtransfn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("moving-aggregate transition function must not return null")));
+
+		peraggstate->transValueCount++;
+
+		if (!peraggstate->transtypeByVal &&
+			DatumGetPointer(result) != DatumGetPointer(peraggstate->transValue))
+		{
+			if (!fcinfo->isnull)
+			{
+				MemoryContextSwitchTo(peraggstate->aggcontext);
+				if (DatumIsReadWriteExpandedObject(result,
+												   false,
+												   peraggstate->transtypeLen) &&
+					MemoryContextGetParent(DatumGetEOHP(result)->eoh_context) == CurrentMemoryContext)
+					 /* do nothing */ ;
+				else
+					result = datumCopy(result,
+									   peraggstate->transtypeByVal,
+									   peraggstate->transtypeLen);
+			}
+			if (!peraggstate->transValueIsNull)
+			{
+				if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+												   false,
+												   peraggstate->transtypeLen))
+					DeleteExpandedObject(peraggstate->transValue);
+				else
+					pfree(DatumGetPointer(peraggstate->transValue));
+			}
+		}
+
+		MemoryContextSwitchTo(oldContext);
+		peraggstate->transValue = result;
+		peraggstate->transValueIsNull = fcinfo->isnull;
+	}
+}
+
+/*
+ * retreat_windowaggregate_distinct_sliding
+ *
+ * Process a row leaving the frame for a sliding-ROWS DISTINCT aggregate.
+ * Decrements the refcount for the departing row's value.  If the refcount
+ * drops to 0, calls the inverse transition function to remove that distinct
+ * value from the aggregate state.  Returns true on success, false if the
+ * aggregate must be restarted (no invtransfn, or invtransfn returned NULL).
+ *
+ * The caller must have set tmpcontext->ecxt_outertuple to the departing row.
+ */
+static bool
+retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
+										 WindowStatePerFunc perfuncstate,
+										 WindowStatePerAgg peraggstate)
+{
+	LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
+	WindowFuncExprState *wfuncstate = perfuncstate->wfuncstate;
+	int			numArguments = perfuncstate->numArguments;
+	ExprContext *econtext = winstate->tmpcontext;
+	ExprState  *filter = wfuncstate->aggfilter;
+	TupleTableSlot *slot = peraggstate->distinctSlot;
+	TupleHashEntry entry;
+	Datum		oldVal;
+	bool		isnull;
+	int32	   *refcount;
+	MemoryContext oldContext;
+
+	oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+	/* Skip anything FILTERed out -- it was never added to refcount table */
+	if (filter)
+	{
+		Datum		res = ExecEvalExpr(filter, econtext, &isnull);
+
+		if (isnull || !DatumGetBool(res))
+		{
+			MemoryContextSwitchTo(oldContext);
+			return true;
+		}
+	}
+
+	/* Evaluate the single argument from the departing row */
+	{
+		ExprState  *argstate = (ExprState *) linitial(wfuncstate->args);
+
+		oldVal = ExecEvalExpr(argstate, econtext, &isnull);
+	}
+
+	/* Store in slot for hash lookup */
+	ExecClearTuple(slot);
+	slot->tts_values[0] = oldVal;
+	slot->tts_isnull[0] = isnull;
+	ExecStoreVirtualTuple(slot);
+
+	/*
+	 * Look up value in hash table.  We pass &isnew to use the insert-or-find
+	 * path, which guarantees a non-NULL return.  The entry must already exist
+	 * (isnew should be false) since this value entered the frame earlier.
+	 *
+	 * If the entry is unexpectedly new, or has a zero/negative refcount,
+	 * the DISTINCT sliding state is inconsistent.  Force a restart to
+	 * rebuild correct state rather than continuing with wrong results.
+	 */
+	{
+		bool	isnew_lookup;
+
+		entry = LookupTupleHashEntry(peraggstate->distinctTable, slot,
+									 &isnew_lookup, NULL);
+		Assert(entry != NULL);
+
+		if (isnew_lookup)
+		{
+			/* State inconsistency: value not in table.  Force restart. */
+			int32  *rc = (int32 *) TupleHashEntryGetAdditional(
+				peraggstate->distinctTable, entry);
+			if (rc)
+				*rc = 0;
+			MemoryContextSwitchTo(oldContext);
+			return false;
+		}
+	}
+
+	refcount = (int32 *) TupleHashEntryGetAdditional(
+		peraggstate->distinctTable, entry);
+	Assert(refcount != NULL);
+
+	/*
+	 * If refcount is already <= 0, the DISTINCT sliding state is
+	 * inconsistent.  Force a restart to rebuild correct state.
+	 */
+	if (*refcount <= 0)
+	{
+		MemoryContextSwitchTo(oldContext);
+		return false;
+	}
+
+	(*refcount)--;
+
+	if (*refcount > 0)
+	{
+		/* Value still represented in frame, no aggregate state change */
+		MemoryContextSwitchTo(oldContext);
+		return true;
+	}
+
+	/*
+	 * Refcount dropped to 0: this distinct value is no longer in the frame.
+	 * We need to remove its contribution from the aggregate state.
+	 */
+
+	/* If no inverse transition function, we must restart */
+	if (!OidIsValid(peraggstate->invtransfn_oid))
+	{
+		MemoryContextSwitchTo(oldContext);
+		return false;
+	}
+
+	/*
+	 * For a strict inverse transition function, if the departing value is
+	 * NULL, it was never actually fed into the transition function (strict
+	 * functions skip NULL inputs), so there's nothing to remove.
+	 */
+	if (peraggstate->invtransfn.fn_strict && isnull)
+	{
+		MemoryContextSwitchTo(oldContext);
+		return true;
+	}
+
+	/* There should still be an added but not yet removed value */
+	Assert(peraggstate->transValueCount > 0);
+
+	/*
+	 * In moving-aggregate mode, the state must never be NULL at this point.
+	 */
+	if (peraggstate->transValueIsNull)
+		elog(ERROR, "aggregate transition value is NULL before inverse transition");
+
+	/*
+	 * We mustn't use the inverse transition function to remove the last
+	 * input.  Doing so would yield a non-NULL state, whereas we should be in
+	 * the initial state afterwards which may very well be NULL.
+	 *
+	 * Unlike advance_windowaggregate_base(), we cannot call
+	 * initialize_windowaggregate() here because that would destroy and
+	 * rebuild the refcounted hash table, losing refcount data for other
+	 * values still in the frame (e.g. NULLs that were skipped by a strict
+	 * transfn but still have valid refcounts).  Instead we manually reset
+	 * just the transition value.
+	 */
+	if (peraggstate->transValueCount == 1)
+	{
+		/* Free old transition value if needed */
+		if (!peraggstate->transValueIsNull && !peraggstate->transtypeByVal)
+		{
+			MemoryContextSwitchTo(peraggstate->aggcontext);
+			if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+											   false,
+											   peraggstate->transtypeLen))
+				DeleteExpandedObject(peraggstate->transValue);
+			else
+				pfree(DatumGetPointer(peraggstate->transValue));
+		}
+
+		/* Reset to initial value */
+		if (peraggstate->initValueIsNull)
+			peraggstate->transValue = peraggstate->initValue;
+		else
+		{
+			MemoryContextSwitchTo(peraggstate->aggcontext);
+			peraggstate->transValue = datumCopy(peraggstate->initValue,
+												peraggstate->transtypeByVal,
+												peraggstate->transtypeLen);
+		}
+		peraggstate->transValueIsNull = peraggstate->initValueIsNull;
+		peraggstate->transValueCount = 0;
+
+		MemoryContextSwitchTo(oldContext);
+		return true;
+	}
+
+	/*
+	 * OK to call the inverse transition function.
+	 */
+	InitFunctionCallInfoData(*fcinfo, &(peraggstate->invtransfn),
+							 numArguments + 1,
+							 perfuncstate->winCollation,
+							 (Node *) winstate, NULL);
+	fcinfo->args[0].value = peraggstate->transValue;
+	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
+	fcinfo->args[1].value = oldVal;
+	fcinfo->args[1].isnull = isnull;
+	winstate->curaggcontext = peraggstate->aggcontext;
+
+	{
+		Datum		newVal;
+
+		newVal = FunctionCallInvoke(fcinfo);
+		winstate->curaggcontext = NULL;
+
+		/*
+		 * If the inverse function returns NULL, report failure, forcing a
+		 * restart.
+		 */
+		if (fcinfo->isnull)
+		{
+			MemoryContextSwitchTo(oldContext);
+			return false;
+		}
+
+		/* Update number of distinct values in transition state */
+		peraggstate->transValueCount--;
+
+		/*
+		 * If pass-by-ref datatype, must copy the new value into aggcontext
+		 * and free the prior transValue.  But if invtransfn returned a
+		 * pointer to its first input, we don't need to do anything.  Also,
+		 * if invtransfn returned a pointer to a R/W expanded object that is
+		 * already a child of the aggcontext, assume we can adopt that value
+		 * without copying it.
+		 */
+		if (!peraggstate->transtypeByVal &&
+			DatumGetPointer(newVal) != DatumGetPointer(peraggstate->transValue))
+		{
+			if (!fcinfo->isnull)
+			{
+				MemoryContextSwitchTo(peraggstate->aggcontext);
+				if (DatumIsReadWriteExpandedObject(newVal,
+												   false,
+												   peraggstate->transtypeLen) &&
+					MemoryContextGetParent(DatumGetEOHP(newVal)->eoh_context) == CurrentMemoryContext)
+					 /* do nothing */ ;
+				else
+					newVal = datumCopy(newVal,
+									   peraggstate->transtypeByVal,
+									   peraggstate->transtypeLen);
+			}
+			if (!peraggstate->transValueIsNull)
+			{
+				if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+												   false,
+												   peraggstate->transtypeLen))
+					DeleteExpandedObject(peraggstate->transValue);
+				else
+					pfree(DatumGetPointer(peraggstate->transValue));
+			}
+		}
+
+		MemoryContextSwitchTo(oldContext);
+		peraggstate->transValue = newVal;
+		peraggstate->transValueIsNull = fcinfo->isnull;
+	}
+
+	return true;
+}
+
+/*
  * eval_windowaggregates
  * evaluate plain aggregates being used as window functions
  *
@@ -1421,9 +1898,16 @@ eval_windowaggregates(WindowAggState *winstate)
 				continue;
 
 			wfuncno = peraggstate->wfuncno;
-			ok = advance_windowaggregate_base(winstate,
-											  &winstate->perfunc[wfuncno],
-											  peraggstate);
+
+			/* Sliding DISTINCT uses its own refcounted exit path */
+			if (peraggstate->distinctStrategy == DISTINCT_SLIDING)
+				ok = retreat_windowaggregate_distinct_sliding(winstate,
+															 &winstate->perfunc[wfuncno],
+															 peraggstate);
+			else
+				ok = advance_windowaggregate_base(winstate,
+												  &winstate->perfunc[wfuncno],
+												  peraggstate);
 			if (!ok)
 			{
 				/* Inverse transition function has failed, must restart */
@@ -1494,16 +1978,14 @@ eval_windowaggregates(WindowAggState *winstate)
 	/*
 	 * Compute DISTINCT aggregates for the whole partition.  These are handled
 	 * separately via sort-based deduplication rather than the main
-	 * accumulation loop below.  Hash-based DISTINCT (grow-only frames) is
-	 * handled incrementally in the main loop instead.
+	 * accumulation loop below.  Hash-based DISTINCT (grow-only and sliding
+	 * frames) is handled incrementally in the main loop instead.
 	 */
 	for (i = 0; i < numaggs; i++)
 	{
 		peraggstate = &winstate->peragg[i];
-		if (!peraggstate->windistinct || !peraggstate->restart)
+		if (peraggstate->distinctStrategy != DISTINCT_SORT || !peraggstate->restart)
 			continue;
-		if (peraggstate->distinctIsHash)
-			continue;		/* handled incrementally in main loop */
 		wfuncno = peraggstate->wfuncno;
 		eval_windowaggregate_distinct(winstate,
 									  &winstate->perfunc[wfuncno],
@@ -1567,16 +2049,31 @@ eval_windowaggregates(WindowAggState *winstate)
 			peraggstate = &winstate->peragg[i];
 
 			/* Sort-based DISTINCT aggregates are handled separately */
-			if (peraggstate->windistinct && !peraggstate->distinctIsHash)
+			if (peraggstate->distinctStrategy == DISTINCT_SORT)
 				continue;
 
-			/* Hash-based DISTINCT: advance via per-row dedup */
-			if (peraggstate->windistinct && peraggstate->distinctIsHash)
+			/* Grow-only hash DISTINCT: advance via per-row dedup */
+			if (peraggstate->distinctStrategy == DISTINCT_HASH)
 			{
 				wfuncno = peraggstate->wfuncno;
 				advance_windowaggregate_distinct(winstate,
 												 &winstate->perfunc[wfuncno],
 												 peraggstate);
+				continue;
+			}
+
+			/* Sliding DISTINCT: advance via refcounted entry */
+			if (peraggstate->distinctStrategy == DISTINCT_SLIDING)
+			{
+				/* Non-restarted aggs skip until aggregatedupto_nonrestarted */
+				if (!peraggstate->restart &&
+					winstate->aggregatedupto < aggregatedupto_nonrestarted)
+					continue;
+
+				wfuncno = peraggstate->wfuncno;
+				advance_windowaggregate_distinct_sliding(winstate,
+														&winstate->perfunc[wfuncno],
+														peraggstate);
 				continue;
 			}
 
@@ -1755,19 +2252,19 @@ prepare_tuplestore(WindowAggState *winstate)
 		 * accumulation loop (for non-DISTINCT aggregates in the same
 		 * WindowAgg node) then needs to rewind back to the frame head.
 		 *
-		 * Hash-based DISTINCT (grow-only frames) participates in the normal
-		 * forward main loop and does not need BACKWARD.
+		 * Hash-based DISTINCT (grow-only and sliding ROWS frames)
+		 * participates in the normal forward main loop and does not need
+		 * BACKWARD.
 		 *
-		 * NB: windistinct and distinctIsHash are set during
-		 * initialize_peragg() in ExecInitWindowAgg(), which runs before
-		 * any partition is started, so they are valid here.
+		 * NB: distinctStrategy is set during initialize_peragg() in
+		 * ExecInitWindowAgg(), which runs before any partition is started,
+		 * so it is valid here.
 		 */
 		if (!(readptr_flags & EXEC_FLAG_BACKWARD))
 		{
 			for (int i = 0; i < winstate->numaggs; i++)
 			{
-				if (winstate->peragg[i].windistinct &&
-					!winstate->peragg[i].distinctIsHash)
+				if (winstate->peragg[i].distinctStrategy == DISTINCT_SORT)
 				{
 					readptr_flags |= EXEC_FLAG_BACKWARD;
 					break;
@@ -3564,19 +4061,33 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	ListCell   *lc;
 
 	/*
-	 * Validate DISTINCT usage.  We support DISTINCT for whole-partition frames
-	 * (sort-based deduplication) and grow-only frames (hash-based dedup).
-	 * A grow-only frame starts at UNBOUNDED PRECEDING with no EXCLUSION.
+	 * Validate DISTINCT usage.  We support DISTINCT for:
+	 *   - whole-partition frames (sort-based deduplication)
+	 *   - grow-only frames (hash-based dedup; UNBOUNDED PRECEDING, no EXCLUDE)
+	 *   - sliding ROWS frames (refcounted hash dedup; no EXCLUDE)
+	 *
+	 * Sliding RANGE and GROUPS frames are not yet supported.
+	 * EXCLUDE clauses are not yet supported with DISTINCT.
 	 * Only single-argument aggregates are supported.
 	 */
 	if (wfunc->windistinct && !is_grow_only_frame(winstate))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("DISTINCT is not supported for window functions "
-						"with frames that do not start at UNBOUNDED "
-						"PRECEDING or that use an EXCLUDE clause"),
-				 errhint("The frame must start at UNBOUNDED PRECEDING "
-						 "and must not have an EXCLUDE clause.")));
+	{
+		int		frameOptions = winstate->frameOptions;
+
+		if (frameOptions & FRAMEOPTION_EXCLUSION)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("DISTINCT is not supported for window functions "
+							"with an EXCLUDE clause")));
+
+		if (!(frameOptions & FRAMEOPTION_ROWS))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("DISTINCT is not supported for window functions "
+							"with sliding RANGE or GROUPS frames"),
+					 errhint("Use ROWS mode, or use a frame starting at "
+							 "UNBOUNDED PRECEDING without an EXCLUDE clause.")));
+	}
 
 	if (wfunc->windistinct && list_length(wfunc->args) != 1)
 		ereport(ERROR,
@@ -3838,7 +4349,6 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 					eqOpr;
 		Oid			inputType = inputTypes[0];
 
-		peraggstate->windistinct = true;
 		peraggstate->inputtypeOid = inputType;
 
 		get_sort_group_operators(inputType,
@@ -3856,23 +4366,23 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 						&peraggstate->inputtypeByVal);
 
 		/*
-		 * For non-shrinking but non-whole-partition frames, set up hash-based
-		 * incremental DISTINCT.  Unlike the whole-partition path which uses
-		 * sort-based deduplication (requiring only btree operators), the
-		 * incremental path must track previously seen values across rows
-		 * using a hash table, so the argument type must support hashing.
-		 * If it does not, we reject here rather than silently falling back,
-		 * because a sort-based incremental approach would require re-sorting
-		 * on every row.
+		 * Determine the DISTINCT strategy.  Whole-partition frames use
+		 * sort-based deduplication.  Non-whole-partition frames (grow-only
+		 * and sliding ROWS) use hash-based deduplication, requiring the
+		 * argument type to support hashing.
 		 *
 		 * The hash table itself is created per-partition in
 		 * initialize_windowaggregate().
 		 */
-		if (!is_whole_partition_frame(winstate))
+		if (is_whole_partition_frame(winstate))
+		{
+			peraggstate->distinctStrategy = DISTINCT_SORT;
+		}
+		else
 		{
 			Oid			hashfn_oid;
 
-			/* Grow-only path requires a hashable type */
+			/* Hash-based paths require a hashable type */
 			if (!get_op_hash_functions(eqOpr, &hashfn_oid, NULL))
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_FUNCTION),
@@ -3880,7 +4390,10 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 								"DISTINCT aggregate"),
 						 errhint("The argument type must support hashing.")));
 
-			peraggstate->distinctIsHash = true;
+			if (is_grow_only_frame(winstate))
+				peraggstate->distinctStrategy = DISTINCT_HASH;
+			else
+				peraggstate->distinctStrategy = DISTINCT_SLIDING;
 
 			/* Create a single-column TupleDesc for the input type */
 			peraggstate->distinctTupleDesc = CreateTemplateTupleDesc(1);
