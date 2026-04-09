@@ -2648,10 +2648,7 @@ CREATE VIEW v_8a AS SELECT array_agg(x ORDER BY y) OVER (PARTITION BY g) FROM t_
 SELECT pg_get_viewdef('v_8a'::regclass);
 DROP VIEW v_8a;
 
--- Runtime rejection: aggregate ORDER BY is not yet executed
-SELECT array_agg(x ORDER BY y) OVER (PARTITION BY g) FROM t_8a; -- error
-
--- Runtime rejection: DISTINCT + aggregate ORDER BY also rejected
+-- Runtime rejection: DISTINCT + aggregate ORDER BY is rejected
 SELECT array_agg(DISTINCT x ORDER BY x DESC) OVER () FROM t_8a; -- error
 
 -- Existing WITHIN GROUP rejection remains unchanged (parse-time error)
@@ -2662,3 +2659,126 @@ SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) OVER () FROM t_8a; -- erro
 SELECT nth_value_def(n := 2, val := x) OVER (ORDER BY y), x, y FROM t_8a;
 
 DROP TABLE t_8a;
+
+-- ===================================================================
+-- Aggregate-local ORDER BY for plain aggregate window functions
+-- (Patch 9: ORDER BY without DISTINCT, forced restart/recompute)
+-- ===================================================================
+
+CREATE TEMP TABLE agg_order_t (
+    id   int PRIMARY KEY,
+    grp  int,
+    ord  int,
+    val  text,
+    skey int
+);
+INSERT INTO agg_order_t VALUES
+    (1, 1, 10, 'a', 3),
+    (2, 1, 20, 'b', 1),
+    (3, 1, 30, 'c', 2),
+    (4, 1, 40, 'd', 5),
+    (5, 1, 50, 'e', 4),
+    (6, 2, 10, 'f', 2),
+    (7, 2, 20, 'g', 1),
+    (8, 2, 20, 'h', 3),
+    (9, 2, 30, 'i', 4);
+
+-- 1. Whole-partition ordered array_agg
+SELECT grp,
+       array_agg(val ORDER BY skey) OVER (PARTITION BY grp) AS ordered_vals
+FROM agg_order_t ORDER BY id;
+
+-- 2. Non-shrinking (grow-only) ordered array_agg
+SELECT id, grp,
+       array_agg(val ORDER BY skey) OVER (PARTITION BY grp ORDER BY ord) AS ordered_vals
+FROM agg_order_t ORDER BY id;
+
+-- 3. Sliding ROWS ordered array_agg
+SELECT id,
+       array_agg(val ORDER BY skey) OVER (ORDER BY ord
+           ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS ordered_vals
+FROM agg_order_t WHERE grp = 1 ORDER BY id;
+
+-- 4. Sliding RANGE ordered array_agg
+SELECT id,
+       array_agg(val ORDER BY skey) OVER (PARTITION BY grp ORDER BY ord
+           RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS ordered_vals
+FROM agg_order_t ORDER BY id;
+
+-- 5. Sliding GROUPS ordered array_agg
+SELECT id,
+       array_agg(val ORDER BY skey) OVER (PARTITION BY grp ORDER BY ord
+           GROUPS BETWEEN 0 PRECEDING AND 1 FOLLOWING) AS ordered_vals
+FROM agg_order_t ORDER BY id;
+
+-- 6. EXCLUDE CURRENT ROW + ordered aggregate
+SELECT id,
+       array_agg(val ORDER BY skey) OVER (PARTITION BY grp ORDER BY ord
+           ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+           EXCLUDE CURRENT ROW) AS ordered_vals
+FROM agg_order_t WHERE grp = 1 ORDER BY id;
+
+-- 7. EXCLUDE TIES + ordered aggregate (tests peer-group exclusion)
+SELECT id,
+       array_agg(val ORDER BY skey) OVER (PARTITION BY grp ORDER BY ord
+           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+           EXCLUDE TIES) AS ordered_vals
+FROM agg_order_t WHERE grp = 2 ORDER BY id;
+
+-- 8. FILTER + ordered aggregate
+SELECT id,
+       array_agg(val ORDER BY skey) FILTER (WHERE id % 2 = 1)
+           OVER (PARTITION BY grp) AS filtered_ordered
+FROM agg_order_t ORDER BY id;
+
+-- 9. string_agg with aggregate-local ORDER BY
+SELECT grp,
+       string_agg(val, ',' ORDER BY skey) OVER (PARTITION BY grp) AS ordered_str
+FROM agg_order_t ORDER BY id;
+
+-- 10. jsonb_agg with aggregate-local ORDER BY
+SELECT grp,
+       jsonb_agg(val ORDER BY skey) OVER (PARTITION BY grp) AS ordered_json
+FROM agg_order_t ORDER BY id;
+
+-- 11. ORDER BY different from OVER ORDER BY
+--     aggregate ORDER BY is by skey, OVER ORDER BY is by ord
+SELECT id,
+       array_agg(val ORDER BY skey) OVER (ORDER BY ord) AS by_skey,
+       array_agg(val ORDER BY ord) OVER (ORDER BY ord) AS by_ord
+FROM agg_order_t WHERE grp = 1 ORDER BY id;
+
+-- 12. ORDER BY DESC
+SELECT grp,
+       array_agg(val ORDER BY skey DESC) OVER (PARTITION BY grp) AS desc_vals
+FROM agg_order_t ORDER BY id;
+
+-- 13. ORDER BY NULLS FIRST (add a NULL skey row)
+INSERT INTO agg_order_t VALUES (10, 1, 60, 'z', NULL);
+SELECT id,
+       array_agg(val ORDER BY skey NULLS FIRST) OVER (PARTITION BY grp) AS nf_vals
+FROM agg_order_t WHERE grp = 1 ORDER BY id;
+DELETE FROM agg_order_t WHERE id = 10;
+
+-- 14. Multi-column ORDER BY
+SELECT grp,
+       array_agg(val ORDER BY skey, val DESC) OVER (PARTITION BY grp) AS multi_order
+FROM agg_order_t ORDER BY id;
+
+-- 15. ORDER BY same column as aggregate argument
+SELECT grp,
+       array_agg(val ORDER BY val) OVER (PARTITION BY grp) AS by_val
+FROM agg_order_t ORDER BY id;
+
+-- 16. DISTINCT + ORDER BY rejection (must still error)
+SELECT array_agg(DISTINCT val ORDER BY val) OVER (PARTITION BY grp) FROM agg_order_t; -- error
+
+-- 17. Mixed ordered + non-ordered aggregates in same window
+SELECT id,
+       array_agg(val ORDER BY skey) OVER w AS ordered_vals,
+       sum(skey) OVER w AS sum_skey
+FROM agg_order_t WHERE grp = 1
+WINDOW w AS (ORDER BY ord)
+ORDER BY id;
+
+DROP TABLE agg_order_t;

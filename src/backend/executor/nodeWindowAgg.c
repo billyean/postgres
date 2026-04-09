@@ -220,6 +220,24 @@ typedef struct WindowStatePerAggData
 	Oid		   *hashEqFuncOids;		/* equality function OIDs for hash (palloc'd) */
 	FmgrInfo   *hashFunctions;		/* hash function info (palloc'd) */
 	Oid		   *hashCollations;		/* per-column collations for hash (palloc'd) */
+
+	/* Aggregate-local ORDER BY support */
+	bool		hasAggOrder;	/* aggregate has ORDER BY clause? */
+	int			numOrderCols;	/* number of ORDER BY columns */
+	int			numTransArgs;	/* number of actual transfn arguments */
+	int			numAllExprs;	/* numTransArgs + numOrderCols */
+	AttrNumber *orderSortColIdx;	/* sort key column indices in composite
+									 * tuple (1-based) */
+	Oid		   *orderSortOperators;	/* per-column sort operator OIDs */
+	Oid		   *orderSortCollations;	/* per-column collations */
+	bool	   *orderSortNullsFirst;	/* per-column NULLS FIRST flags */
+	TupleDesc	orderTupleDesc; /* descriptor for composite sort tuple */
+	TupleTableSlot *orderInputSlot; /* slot for building sort input tuples */
+	TupleTableSlot *orderSortedSlot;	/* slot for reading sorted results */
+	List	   *orderExprs;		/* ExprState list for resjunk ORDER BY exprs */
+	int			orderReadPtr;	/* dedicated tuplestore read pointer for
+								 * ordered recompute scanning (-1 if none) */
+	int64		orderSeekPos;	/* seekpos for orderReadPtr */
 } WindowStatePerAggData;
 
 static void initialize_windowaggregate(WindowAggState *winstate,
@@ -273,6 +291,9 @@ static void advance_windowaggregate_distinct_sliding(WindowAggState *winstate,
 static bool retreat_windowaggregate_distinct_sliding(WindowAggState *winstate,
 													 WindowStatePerFunc perfuncstate,
 													 WindowStatePerAgg peraggstate);
+static void eval_windowaggregate_ordered(WindowAggState *winstate,
+										 WindowStatePerFunc perfuncstate,
+										 WindowStatePerAgg peraggstate);
 
 static bool are_peers(WindowAggState *winstate, TupleTableSlot *slot1,
 					  TupleTableSlot *slot2);
@@ -1384,6 +1405,297 @@ remember_multi:
 }
 
 /*
+ * eval_windowaggregate_ordered
+ *
+ * Handle a plain aggregate window function with aggregate-local ORDER BY
+ * (but no DISTINCT).  Collects frame-member rows for the current output row,
+ * sorts them by the aggregate's ORDER BY clause, and feeds the transition
+ * function in sorted order.
+ *
+ * This is a recompute-from-scratch strategy: every output row resets the
+ * aggregate and re-scans its frame.  FILTER and EXCLUDE are applied during
+ * the collection step, before sorting.
+ */
+static void
+eval_windowaggregate_ordered(WindowAggState *winstate,
+							 WindowStatePerFunc perfuncstate,
+							 WindowStatePerAgg peraggstate)
+{
+	WindowObject agg_winobj = winstate->agg_winobj;
+	TupleTableSlot *temp_slot = winstate->temp_slot_1;
+	ExprContext *econtext = winstate->tmpcontext;
+	WindowFuncExprState *wfuncstate = perfuncstate->wfuncstate;
+	ExprState  *filter = wfuncstate->aggfilter;
+	int			numTransArgs = peraggstate->numTransArgs;
+	int			numAllExprs = peraggstate->numAllExprs;
+	LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
+	Tuplesortstate *sortstate;
+	TupleTableSlot *inputSlot = peraggstate->orderInputSlot;
+	TupleTableSlot *sortedSlot = peraggstate->orderSortedSlot;
+	TupleDesc	sortdesc = peraggstate->orderTupleDesc;
+	MemoryContext oldContext;
+	int64		pos;
+	int			i;
+	ListCell   *arg;
+	int			saved_readptr;
+	int64		saved_seekpos;
+
+	/* Validate expression count invariants */
+	Assert(list_length(wfuncstate->args) == numTransArgs);
+	Assert(list_length(peraggstate->orderExprs) == numAllExprs - numTransArgs);
+
+	/*
+	 * Swap in the dedicated read pointer for this ordered aggregate.  We must
+	 * save and restore both readptr (the tuplestore read-pointer index) and
+	 * seekpos (the logical row position that readptr is on), because both are
+	 * used by window_gettupleslot() to navigate the tuplestore.  The ordered
+	 * path iterates over the current frame to collect rows into a tuplesort,
+	 * which repositions the tuplestore read pointer.  Without save/restore,
+	 * the main accumulation loop's position on agg_winobj would be corrupted,
+	 * breaking other (non-ordered) aggregates that share the same window.
+	 */
+	saved_readptr = agg_winobj->readptr;
+	saved_seekpos = agg_winobj->seekpos;
+	agg_winobj->readptr = peraggstate->orderReadPtr;
+	agg_winobj->seekpos = peraggstate->orderSeekPos;
+
+	/* Create a tuplesort for the aggregate's ORDER BY keys */
+	sortstate = tuplesort_begin_heap(sortdesc,
+									 peraggstate->numOrderCols,
+									 peraggstate->orderSortColIdx,
+									 peraggstate->orderSortOperators,
+									 peraggstate->orderSortCollations,
+									 peraggstate->orderSortNullsFirst,
+									 work_mem, NULL, TUPLESORT_NONE);
+
+	/*
+	 * Collect all frame-member rows.  We iterate from frame head to tail,
+	 * using row_is_in_frame() to handle EXCLUDE clauses and frame boundary
+	 * checks.  FILTER is applied here before inserting into the sort.
+	 */
+	for (pos = winstate->frameheadpos; ; pos++)
+	{
+		int		ret;
+
+		if (!window_gettupleslot(agg_winobj, pos, temp_slot))
+			break;			/* end of partition */
+
+		ret = row_is_in_frame(agg_winobj, pos, temp_slot, false);
+		if (ret < 0)
+		{
+			ExecClearTuple(temp_slot);
+			break;			/* past end of frame */
+		}
+		if (ret == 0)
+		{
+			ExecClearTuple(temp_slot);
+			continue;		/* excluded row, but more may follow */
+		}
+
+		/* Row is in frame; set up evaluation context */
+		econtext->ecxt_outertuple = temp_slot;
+		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+		/* Skip anything FILTERed out */
+		if (filter)
+		{
+			bool		isnull;
+			Datum		res = ExecEvalExpr(filter, econtext, &isnull);
+
+			if (isnull || !DatumGetBool(res))
+			{
+				MemoryContextSwitchTo(oldContext);
+				ResetExprContext(econtext);
+				ExecClearTuple(temp_slot);
+				continue;
+			}
+		}
+
+		/*
+		 * Evaluate all expressions into the input slot: first the non-resjunk
+		 * transition function arguments (from wfuncstate->args), then the
+		 * resjunk ORDER BY-only expressions (from peraggstate->orderExprs).
+		 */
+		ExecClearTuple(inputSlot);
+		i = 0;
+		foreach(arg, wfuncstate->args)
+		{
+			ExprState  *argstate = (ExprState *) lfirst(arg);
+
+			inputSlot->tts_values[i] = ExecEvalExpr(argstate, econtext,
+													 &inputSlot->tts_isnull[i]);
+			i++;
+		}
+		foreach(arg, peraggstate->orderExprs)
+		{
+			ExprState  *argstate = (ExprState *) lfirst(arg);
+
+			inputSlot->tts_values[i] = ExecEvalExpr(argstate, econtext,
+													 &inputSlot->tts_isnull[i]);
+			i++;
+		}
+		Assert(i == numAllExprs);
+		ExecStoreVirtualTuple(inputSlot);
+
+		MemoryContextSwitchTo(oldContext);
+
+		/* Feed into sort */
+		tuplesort_puttupleslot(sortstate, inputSlot);
+
+		ResetExprContext(econtext);
+		ExecClearTuple(temp_slot);
+	}
+
+	/* Sort by aggregate-local ORDER BY */
+	tuplesort_performsort(sortstate);
+
+	/*
+	 * Read back sorted tuples and feed the transition function.  Only the
+	 * first numTransArgs columns are passed as arguments; the remaining
+	 * ORDER BY key columns have served their purpose.
+	 */
+	ExecClearTuple(sortedSlot);
+
+	while (tuplesort_gettupleslot(sortstate, true, false, sortedSlot, NULL))
+	{
+		ResetExprContext(econtext);
+		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
+		slot_getsomeattrs(sortedSlot, numTransArgs);
+
+		if (peraggstate->transfn.fn_strict)
+		{
+			bool	has_null = false;
+
+			for (i = 0; i < numTransArgs; i++)
+			{
+				if (sortedSlot->tts_isnull[i])
+				{
+					has_null = true;
+					break;
+				}
+			}
+
+			if (has_null)
+			{
+				MemoryContextSwitchTo(oldContext);
+				ExecClearTuple(sortedSlot);
+				continue;
+			}
+
+			/*
+			 * For a single-arg strict transfn with initial value NULL, use
+			 * the first non-NULL input as the initial state.  This is the
+			 * same shortcut used in advance_windowaggregate().  It is only
+			 * valid for single-argument aggregates where the transtype is
+			 * known to be binary-compatible with the input type (verified
+			 * at init time).
+			 *
+			 * For multi-arg aggregates, this shortcut is not valid because
+			 * the transtype may differ from any individual argument type.
+			 * The dangerous strict + NULL-initval + multi-arg case is
+			 * rejected at init time (see initialize_peragg), so
+			 * transValueIsNull here means a prior transfn returned NULL.
+			 * We skip this tuple.
+			 */
+			if (peraggstate->transValueCount == 0 &&
+				peraggstate->transValueIsNull)
+			{
+				if (numTransArgs == 1)
+				{
+					MemoryContext innerOldContext;
+
+					innerOldContext = MemoryContextSwitchTo(peraggstate->aggcontext);
+					peraggstate->transValue = datumCopy(sortedSlot->tts_values[0],
+														peraggstate->transtypeByVal,
+														peraggstate->transtypeLen);
+					peraggstate->transValueIsNull = false;
+					peraggstate->transValueCount = 1;
+					MemoryContextSwitchTo(innerOldContext);
+				}
+				MemoryContextSwitchTo(oldContext);
+				ExecClearTuple(sortedSlot);
+				continue;
+			}
+
+			/* Don't call a strict function with NULL inputs */
+			if (peraggstate->transValueIsNull)
+			{
+				MemoryContextSwitchTo(oldContext);
+				ExecClearTuple(sortedSlot);
+				continue;
+			}
+		}
+
+		/* OK to call the transition function */
+		InitFunctionCallInfoData(*fcinfo, &(peraggstate->transfn),
+								 numTransArgs + 1,
+								 perfuncstate->winCollation,
+								 (Node *) winstate, NULL);
+		fcinfo->args[0].value = peraggstate->transValue;
+		fcinfo->args[0].isnull = peraggstate->transValueIsNull;
+		for (i = 0; i < numTransArgs; i++)
+		{
+			fcinfo->args[i + 1].value = sortedSlot->tts_values[i];
+			fcinfo->args[i + 1].isnull = sortedSlot->tts_isnull[i];
+		}
+		winstate->curaggcontext = peraggstate->aggcontext;
+
+		{
+			Datum		result;
+
+			result = FunctionCallInvoke(fcinfo);
+			winstate->curaggcontext = NULL;
+
+			peraggstate->transValueCount++;
+
+			if (!peraggstate->transtypeByVal &&
+				DatumGetPointer(result) != DatumGetPointer(peraggstate->transValue))
+			{
+				if (!fcinfo->isnull)
+				{
+					MemoryContextSwitchTo(peraggstate->aggcontext);
+					if (DatumIsReadWriteExpandedObject(result,
+													   false,
+													   peraggstate->transtypeLen) &&
+						MemoryContextGetParent(DatumGetEOHP(result)->eoh_context) == CurrentMemoryContext)
+						 /* do nothing */ ;
+					else
+						result = datumCopy(result,
+										   peraggstate->transtypeByVal,
+										   peraggstate->transtypeLen);
+				}
+				if (!peraggstate->transValueIsNull)
+				{
+					if (DatumIsReadWriteExpandedObject(peraggstate->transValue,
+													   false,
+													   peraggstate->transtypeLen))
+						DeleteExpandedObject(peraggstate->transValue);
+					else
+						pfree(DatumGetPointer(peraggstate->transValue));
+				}
+			}
+
+			MemoryContextSwitchTo(oldContext);
+			peraggstate->transValue = result;
+			peraggstate->transValueIsNull = fcinfo->isnull;
+		}
+
+		ExecClearTuple(sortedSlot);
+	}
+
+	tuplesort_end(sortstate);
+
+	/*
+	 * Save our read pointer position and restore the main loop's read
+	 * pointer so it can continue its incremental scan undisturbed.
+	 */
+	peraggstate->orderSeekPos = agg_winobj->seekpos;
+	agg_winobj->readptr = saved_readptr;
+	agg_winobj->seekpos = saved_seekpos;
+}
+
+/*
  * advance_windowaggregate_distinct
  *
  * Per-row handler for hash-based DISTINCT window aggregates with grow-only
@@ -2148,6 +2460,9 @@ eval_windowaggregates(WindowAggState *winstate)
 	 *
 	 * We restart the aggregation:
 	 *	 - if we're processing the first row in the partition, or
+	 *	 - if the aggregate has an aggregate-local ORDER BY (always
+	 *	   recompute from scratch, since sorted order cannot be
+	 *	   maintained incrementally), or
 	 *	 - if the frame's head moved and we cannot use an inverse
 	 *	   transition function, or
 	 *	 - we have an EXCLUSION clause, or
@@ -2163,6 +2478,7 @@ eval_windowaggregates(WindowAggState *winstate)
 	{
 		peraggstate = &winstate->peragg[i];
 		if (winstate->currentpos == 0 ||
+			peraggstate->hasAggOrder ||
 			(winstate->aggregatedbase != winstate->frameheadpos &&
 			 !OidIsValid(peraggstate->invtransfn_oid)) ||
 			(winstate->frameOptions & FRAMEOPTION_EXCLUSION) ||
@@ -2173,6 +2489,37 @@ eval_windowaggregates(WindowAggState *winstate)
 		}
 		else
 			peraggstate->restart = false;
+	}
+
+	/*
+	 * Enforce shared-aggcontext restart consistency: if any aggregate using
+	 * the shared winstate->aggcontext needs to restart, then ALL aggregates
+	 * sharing that context must also restart.  This is because
+	 * MemoryContextReset(winstate->aggcontext) will be called below when
+	 * numaggs_restart > 0, which destroys every transition value stored in
+	 * the shared context -- including those of aggregates that would otherwise
+	 * not need to restart.
+	 *
+	 * The typical trigger is an ordered aggregate coexisting with a plain
+	 * aggregate in the same window: the ordered aggregate always restarts
+	 * (incrementing numaggs_restart) and uses a *private* aggcontext so its
+	 * own state is unaffected, but the resulting shared-context reset
+	 * invalidates transition values of plain aggregates that share
+	 * winstate->aggcontext.  Propagating restart to those aggregates ensures
+	 * they reinitialize rather than reading destroyed state.
+	 */
+	if (numaggs_restart > 0)
+	{
+		for (i = 0; i < numaggs; i++)
+		{
+			peraggstate = &winstate->peragg[i];
+			if (!peraggstate->restart &&
+				peraggstate->aggcontext == winstate->aggcontext)
+			{
+				peraggstate->restart = true;
+				numaggs_restart++;
+			}
+		}
 	}
 
 	/*
@@ -2297,6 +2644,10 @@ eval_windowaggregates(WindowAggState *winstate)
 		peraggstate = &winstate->peragg[i];
 		if (peraggstate->distinctStrategy != DISTINCT_SORT || !peraggstate->restart)
 			continue;
+
+		/* DISTINCT + ordered must have been rejected at init time */
+		Assert(!peraggstate->hasAggOrder);
+
 		wfuncno = peraggstate->wfuncno;
 		if (peraggstate->numDistinctCols > 1)
 			eval_windowaggregate_distinct_multi(winstate,
@@ -2306,6 +2657,27 @@ eval_windowaggregates(WindowAggState *winstate)
 			eval_windowaggregate_distinct(winstate,
 										  &winstate->perfunc[wfuncno],
 										  peraggstate);
+	}
+
+	/*
+	 * Compute ordered aggregates (aggregate-local ORDER BY without DISTINCT).
+	 * Each such aggregate collects its frame rows, sorts by its ORDER BY
+	 * clause, and feeds the transition function in sorted order.  This is
+	 * done per-output-row via forced restart/recompute.
+	 */
+	for (i = 0; i < numaggs; i++)
+	{
+		peraggstate = &winstate->peragg[i];
+		if (!peraggstate->hasAggOrder || !peraggstate->restart)
+			continue;
+
+		/* Ordered + DISTINCT must have been rejected at init time */
+		Assert(peraggstate->distinctStrategy == DISTINCT_NONE);
+
+		wfuncno = peraggstate->wfuncno;
+		eval_windowaggregate_ordered(winstate,
+									 &winstate->perfunc[wfuncno],
+									 peraggstate);
 	}
 
 	/*
@@ -2366,6 +2738,10 @@ eval_windowaggregates(WindowAggState *winstate)
 
 			/* Sort-based DISTINCT aggregates are handled separately */
 			if (peraggstate->distinctStrategy == DISTINCT_SORT)
+				continue;
+
+			/* Ordered aggregates are handled separately */
+			if (peraggstate->hasAggOrder)
 				continue;
 
 			/* Grow-only hash DISTINCT: advance via per-row dedup */
@@ -2546,6 +2922,7 @@ prepare_tuplestore(WindowAggState *winstate)
 	{
 		WindowObject agg_winobj = winstate->agg_winobj;
 		int			readptr_flags = 0;
+		bool		need_mark = false;
 
 		/*
 		 * If the frame head is potentially movable, or we have an EXCLUSION
@@ -2554,42 +2931,73 @@ prepare_tuplestore(WindowAggState *winstate)
 		if (!(frameOptions & FRAMEOPTION_START_UNBOUNDED_PRECEDING) ||
 			(frameOptions & FRAMEOPTION_EXCLUSION))
 		{
-			/* ... so create a mark pointer to track the frame head */
-			agg_winobj->markptr = tuplestore_alloc_read_pointer(winstate->buffer, 0);
+			need_mark = true;
 			/* and the read pointer will need BACKWARD capability */
 			readptr_flags |= EXEC_FLAG_BACKWARD;
 		}
 
 		/*
-		 * If any aggregate uses sort-based DISTINCT (whole-partition path),
-		 * the read pointer also needs BACKWARD capability.  The DISTINCT
-		 * helper reads through the entire partition to collect values for
-		 * sorting, which advances the read pointer to the end.  The main
-		 * accumulation loop (for non-DISTINCT aggregates in the same
-		 * WindowAgg node) then needs to rewind back to the frame head.
+		 * If any aggregate uses sort-based DISTINCT (whole-partition path)
+		 * or aggregate-local ORDER BY (forced restart/recompute path),
+		 * the read pointer also needs BACKWARD capability.
+		 *
+		 * The DISTINCT helper reads through the entire partition to collect
+		 * values for sorting, which advances the read pointer to the end.
+		 * The main accumulation loop (for non-DISTINCT aggregates in the
+		 * same WindowAgg node) then needs to rewind back to the frame head.
+		 *
+		 * The ordered-aggregate path rescans the frame from frameheadpos on
+		 * each output row.  After moving forward through the frame for one
+		 * row, the next row's frameheadpos may be earlier than the current
+		 * read position, requiring backward movement.  A mark pointer is
+		 * also needed to prevent tuplestore_trim() from discarding tuples
+		 * that the ordered path will rescan on the next output row.
 		 *
 		 * Hash-based DISTINCT (grow-only and sliding ROWS frames)
 		 * participates in the normal forward main loop and does not need
 		 * BACKWARD.
 		 *
-		 * NB: distinctStrategy is set during initialize_peragg() in
-		 * ExecInitWindowAgg(), which runs before any partition is started,
-		 * so it is valid here.
+		 * NB: distinctStrategy and hasAggOrder are set during
+		 * initialize_peragg() in ExecInitWindowAgg(), which runs before
+		 * any partition is started, so they are valid here.
 		 */
 		if (!(readptr_flags & EXEC_FLAG_BACKWARD))
 		{
 			for (int i = 0; i < winstate->numaggs; i++)
 			{
-				if (winstate->peragg[i].distinctStrategy == DISTINCT_SORT)
+				if (winstate->peragg[i].distinctStrategy == DISTINCT_SORT ||
+					winstate->peragg[i].hasAggOrder)
 				{
 					readptr_flags |= EXEC_FLAG_BACKWARD;
+					if (winstate->peragg[i].hasAggOrder)
+						need_mark = true;
 					break;
 				}
 			}
 		}
 
+		if (need_mark)
+			agg_winobj->markptr = tuplestore_alloc_read_pointer(winstate->buffer, 0);
+
 		agg_winobj->readptr = tuplestore_alloc_read_pointer(winstate->buffer,
 															readptr_flags);
+
+		/*
+		 * Allocate dedicated read pointers for ordered aggregates.  Each
+		 * ordered aggregate rescans the frame independently, so it needs
+		 * its own tuplestore read pointer to avoid disturbing the main
+		 * accumulation loop's use of agg_winobj->readptr.
+		 */
+		for (int i = 0; i < winstate->numaggs; i++)
+		{
+			if (winstate->peragg[i].hasAggOrder)
+			{
+				winstate->peragg[i].orderReadPtr =
+					tuplestore_alloc_read_pointer(winstate->buffer,
+												  EXEC_FLAG_BACKWARD);
+				winstate->peragg[i].orderSeekPos = -1;
+			}
+		}
 	}
 
 	/* create mark and read pointers for each real window function */
@@ -2711,6 +3119,13 @@ begin_partition(WindowAggState *winstate)
 		/* reset mark and see positions for aggregate functions */
 		agg_winobj->markpos = -1;
 		agg_winobj->seekpos = -1;
+
+		/* Reset seek positions for ordered aggregate read pointers */
+		for (int i = 0; i < winstate->numaggs; i++)
+		{
+			if (winstate->peragg[i].hasAggOrder)
+				winstate->peragg[i].orderSeekPos = -1;
+		}
 
 		/* Also reset the row counters for aggregates */
 		winstate->aggregatedbase = 0;
@@ -4375,7 +4790,6 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 			   *invtransfnexpr,
 			   *finalfnexpr;
 	Datum		textInitVal;
-	int			i;
 	ListCell   *lc;
 
 	/*
@@ -4413,16 +4827,16 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	}
 
 	/*
-	 * Aggregate-local ORDER BY is accepted by the parser and stored in
-	 * winaggorder for parse/deparse round-trip support, but execution is
-	 * not yet implemented.  Reject at runtime until that work lands.
+	 * Reject DISTINCT + aggregate-local ORDER BY combination.
+	 * Aggregate-local ORDER BY without DISTINCT is supported;
+	 * DISTINCT without ORDER BY is supported; the combination
+	 * is deferred to a future patch.
 	 */
-	if (wfunc->winaggorder != NIL)
+	if (wfunc->winaggorder != NIL && wfunc->winaggdistinct != NIL)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("aggregate ORDER BY is not yet implemented for window functions"),
-				 errhint("Window aggregate inputs are currently processed in frame order, not aggregate-local order.")));
+				 errmsg("aggregate ORDER BY with DISTINCT is not yet implemented for window functions")));
 	}
 
 	aggTuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(wfunc->winfnoid));
@@ -4448,8 +4862,13 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * contain_volatile_functions() doesn't look inside subplans; but there
 	 * are other reasons why a subplan's output might be volatile.  For
 	 * example, syncscan mode can render the results nonrepeatable.
+	 *
+	 * Aggregates with aggregate-local ORDER BY always use the non-moving
+	 * path, since sorted order cannot be maintained incrementally.
 	 */
-	if (!OidIsValid(aggform->aggminvtransfn))
+	if (wfunc->winaggorder != NIL)
+		use_ma_code = false;	/* ordered agg: always recompute */
+	else if (!OidIsValid(aggform->aggminvtransfn))
 		use_ma_code = false;	/* sine qua non */
 	else if (aggform->aggmfinalmodify == AGGMODIFY_READ_ONLY &&
 			 aggform->aggfinalmodify != AGGMODIFY_READ_ONLY)
@@ -4625,15 +5044,27 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 							wfunc->winfnoid)));
 
 		/*
-		 * For multi-argument DISTINCT, the "adopt first input as initial
-		 * state" shortcut is not safe because the transtype may differ from
-		 * individual argument types.  Reject this combination explicitly
-		 * rather than risk corrupting aggregate state at runtime.
+		 * For multi-argument DISTINCT or ORDER BY, the "adopt first input
+		 * as initial state" shortcut is not safe because the transtype may
+		 * differ from individual argument types.  Reject this combination
+		 * explicitly rather than risk corrupting aggregate state at runtime.
 		 */
-		if (wfunc->winaggdistinct != NIL && numArguments > 1)
+		if ((wfunc->winaggdistinct != NIL || wfunc->winaggorder != NIL) &&
+			numArguments > 1)
+		{
+			const char *feature;
+
+			if (wfunc->winaggdistinct != NIL && wfunc->winaggorder != NIL)
+				feature = "DISTINCT and ORDER BY";
+			else if (wfunc->winaggdistinct != NIL)
+				feature = "DISTINCT";
+			else
+				feature = "ORDER BY";
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("DISTINCT is not supported for multi-argument window aggregates with no initial value")));
+					 errmsg("%s is not supported for multi-argument window aggregates with no initial value",
+							feature)));
+		}
 	}
 
 	/*
@@ -4663,8 +5094,13 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * make the memory allocation rules for moving aggregates different than
 	 * they have historically been for plain aggregates, but that seems grotty
 	 * and likely to lead to memory leaks.
+	 *
+	 * Ordered aggregates (aggregate-local ORDER BY) also need their own
+	 * aggcontext, because they always restart on each output row while other
+	 * aggregates sharing the same window may not.  Without a private context,
+	 * the shared context reset would destroy non-restarted aggregates' state.
 	 */
-	if (OidIsValid(invtransfn_oid))
+	if (OidIsValid(invtransfn_oid) || wfunc->winaggorder != NIL)
 		peraggstate->aggcontext =
 			AllocSetContextCreate(CurrentMemoryContext,
 								  "WindowAgg Per Aggregate",
@@ -4841,6 +5277,191 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 		}
 
 		pfree(eqOps);
+	}
+
+	/*
+	 * Set up aggregate-local ORDER BY state if needed.  Build a composite
+	 * tuple descriptor containing all transfn arguments followed by ORDER
+	 * BY-only (resjunk) expressions.  The sort keys index into this tuple.
+	 */
+	if (wfunc->winaggorder != NIL)
+	{
+		int			nTransArgs = numArguments;
+		int			nOrderCols = list_length(wfunc->winaggorder);
+		int			nResjunkExprs = 0;
+		int			nAllExprs;
+		int			col;
+		int			sortKeyIdx;
+		ListCell   *lc2;
+
+		/*
+		 * Count resjunk (ORDER BY-only) expressions in args.  These are
+		 * expressions used only for sorting, not as transition function
+		 * arguments.
+		 */
+		foreach(lc2, wfunc->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+			if (tle->resjunk)
+				nResjunkExprs++;
+		}
+
+		nAllExprs = nTransArgs + nResjunkExprs;
+
+		peraggstate->hasAggOrder = true;
+		peraggstate->orderReadPtr = -1;		/* allocated later in prepare_tuplestore */
+		peraggstate->orderSeekPos = -1;
+		peraggstate->numOrderCols = nOrderCols;
+		peraggstate->numTransArgs = nTransArgs;
+		peraggstate->numAllExprs = nAllExprs;
+
+		/*
+		 * Build the composite TupleDesc: first nTransArgs columns for
+		 * transition function arguments, then nResjunkExprs columns for
+		 * ORDER BY-only expressions.
+		 */
+		peraggstate->orderTupleDesc = CreateTemplateTupleDesc(nAllExprs);
+		col = 1;
+		foreach(lc2, wfunc->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+			if (!tle->resjunk)
+			{
+				TupleDescInitEntry(peraggstate->orderTupleDesc, col, NULL,
+								   exprType((Node *) tle->expr), -1, 0);
+				col++;
+			}
+		}
+		foreach(lc2, wfunc->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+			if (tle->resjunk)
+			{
+				TupleDescInitEntry(peraggstate->orderTupleDesc, col, NULL,
+								   exprType((Node *) tle->expr), -1, 0);
+				col++;
+			}
+		}
+		Assert(col == nAllExprs + 1);
+		TupleDescFinalize(peraggstate->orderTupleDesc);
+
+		/* Create slots for sort input and sorted output */
+		peraggstate->orderInputSlot =
+			MakeSingleTupleTableSlot(peraggstate->orderTupleDesc,
+									 &TTSOpsVirtual);
+		peraggstate->orderSortedSlot =
+			MakeSingleTupleTableSlot(peraggstate->orderTupleDesc,
+									 &TTSOpsMinimalTuple);
+
+		/*
+		 * Set up per-column sort metadata from winaggorder.  Each
+		 * SortGroupClause references a TargetEntry via tleSortGroupRef.
+		 * We need to map each sort key to its column index within the
+		 * composite tuple.
+		 */
+		peraggstate->orderSortColIdx =
+			(AttrNumber *) palloc(nOrderCols * sizeof(AttrNumber));
+		peraggstate->orderSortOperators =
+			(Oid *) palloc(nOrderCols * sizeof(Oid));
+		peraggstate->orderSortCollations =
+			(Oid *) palloc(nOrderCols * sizeof(Oid));
+		peraggstate->orderSortNullsFirst =
+			(bool *) palloc(nOrderCols * sizeof(bool));
+
+		sortKeyIdx = 0;
+		foreach(lc2, wfunc->winaggorder)
+		{
+			SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc2);
+			TargetEntry *tle = get_sortgroupref_tle(sortcl->tleSortGroupRef,
+													wfunc->args);
+
+			/*
+			 * Find the column index of this sort key within the composite
+			 * tuple.  Non-resjunk entries are in positions 1..nTransArgs;
+			 * resjunk entries follow in positions nTransArgs+1..nAllExprs.
+			 */
+			if (!tle->resjunk)
+			{
+				/* Non-resjunk: find its position among non-resjunk entries */
+				int		pos = 0;
+				bool	found = false;
+				ListCell *lc3;
+
+				foreach(lc3, wfunc->args)
+				{
+					TargetEntry *tle2 = (TargetEntry *) lfirst(lc3);
+
+					if (!tle2->resjunk)
+					{
+						pos++;
+						if (tle2->ressortgroupref == tle->ressortgroupref)
+						{
+							found = true;
+							break;
+						}
+					}
+				}
+				Assert(found);
+				Assert(pos >= 1 && pos <= nTransArgs);
+				peraggstate->orderSortColIdx[sortKeyIdx] = pos;
+			}
+			else
+			{
+				/* Resjunk: find its position among resjunk entries */
+				int		pos = nTransArgs;
+				bool	found = false;
+				ListCell *lc3;
+
+				foreach(lc3, wfunc->args)
+				{
+					TargetEntry *tle2 = (TargetEntry *) lfirst(lc3);
+
+					if (tle2->resjunk)
+					{
+						pos++;
+						if (tle2->ressortgroupref == tle->ressortgroupref)
+						{
+							found = true;
+							break;
+						}
+					}
+				}
+				Assert(found);
+				Assert(pos >= nTransArgs + 1 && pos <= nAllExprs);
+				peraggstate->orderSortColIdx[sortKeyIdx] = pos;
+			}
+
+			peraggstate->orderSortOperators[sortKeyIdx] = sortcl->sortop;
+			peraggstate->orderSortCollations[sortKeyIdx] =
+				exprCollation((Node *) tle->expr);
+			peraggstate->orderSortNullsFirst[sortKeyIdx] = sortcl->nulls_first;
+
+			sortKeyIdx++;
+		}
+		Assert(sortKeyIdx == nOrderCols);
+
+		/*
+		 * Compile ExprState nodes for the resjunk ORDER BY-only expressions.
+		 * These are not in wfuncstate->args (which only has non-resjunk
+		 * entries), so we compile them here from the TargetEntry expressions.
+		 */
+		peraggstate->orderExprs = NIL;
+		foreach(lc2, wfunc->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+			if (tle->resjunk)
+			{
+				ExprState  *estate = ExecInitExpr((Expr *) tle->expr,
+												  (PlanState *) winstate);
+
+				peraggstate->orderExprs = lappend(peraggstate->orderExprs,
+												  estate);
+			}
+		}
 	}
 
 	ReleaseSysCache(aggTuple);
