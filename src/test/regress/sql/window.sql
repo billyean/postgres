@@ -2648,8 +2648,8 @@ CREATE VIEW v_8a AS SELECT array_agg(x ORDER BY y) OVER (PARTITION BY g) FROM t_
 SELECT pg_get_viewdef('v_8a'::regclass);
 DROP VIEW v_8a;
 
--- Runtime rejection: DISTINCT + aggregate ORDER BY is rejected
-SELECT array_agg(DISTINCT x ORDER BY x DESC) OVER () FROM t_8a; -- error
+-- DISTINCT + aggregate ORDER BY now works
+SELECT array_agg(DISTINCT x ORDER BY x DESC) OVER () FROM t_8a;
 
 -- Existing WITHIN GROUP rejection remains unchanged (parse-time error)
 SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) OVER () FROM t_8a; -- error
@@ -2770,8 +2770,8 @@ SELECT grp,
        array_agg(val ORDER BY val) OVER (PARTITION BY grp) AS by_val
 FROM agg_order_t ORDER BY id;
 
--- 16. DISTINCT + ORDER BY rejection (must still error)
-SELECT array_agg(DISTINCT val ORDER BY val) OVER (PARTITION BY grp) FROM agg_order_t; -- error
+-- 16. DISTINCT + ORDER BY (now works)
+SELECT array_agg(DISTINCT val ORDER BY val) OVER (PARTITION BY grp) FROM agg_order_t;
 
 -- 17. Mixed ordered + non-ordered aggregates in same window
 SELECT id,
@@ -2782,3 +2782,77 @@ WINDOW w AS (ORDER BY ord)
 ORDER BY id;
 
 DROP TABLE agg_order_t;
+
+-- ===================================================================
+-- DISTINCT + aggregate-local ORDER BY for plain aggregate window functions
+-- (Patch 10: sort + dedup in the ordered execution path)
+-- ===================================================================
+
+-- Use data with intentional duplicates so DISTINCT dedup is exercised.
+CREATE TEMP TABLE agg_dist_order_t (
+    id   int PRIMARY KEY,
+    grp  int,
+    ord  int,
+    val  text
+);
+INSERT INTO agg_dist_order_t VALUES
+    (1, 1, 10, 'a'),
+    (2, 1, 20, 'b'),
+    (3, 1, 30, 'a'),   -- duplicate 'a'
+    (4, 1, 40, 'c'),
+    (5, 1, 50, 'b'),   -- duplicate 'b'
+    (6, 2, 10, 'x'),
+    (7, 2, 20, 'y'),
+    (8, 2, 30, 'x');   -- duplicate 'x'
+
+-- 1. Whole-partition DISTINCT + ORDER BY
+SELECT grp,
+       array_agg(DISTINCT val ORDER BY val) OVER (PARTITION BY grp) AS dvals
+FROM agg_dist_order_t ORDER BY id;
+
+-- 2. Non-shrinking (grow-only) frame
+SELECT id, grp,
+       array_agg(DISTINCT val ORDER BY val) OVER (PARTITION BY grp ORDER BY ord) AS dvals
+FROM agg_dist_order_t ORDER BY id;
+
+-- 3. Sliding ROWS
+SELECT id,
+       array_agg(DISTINCT val ORDER BY val) OVER (ORDER BY ord
+           ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS dvals
+FROM agg_dist_order_t WHERE grp = 1 ORDER BY id;
+
+-- 4. ORDER BY DESC
+SELECT grp,
+       array_agg(DISTINCT val ORDER BY val DESC) OVER (PARTITION BY grp) AS dvals_desc
+FROM agg_dist_order_t ORDER BY id;
+
+-- 5. string_agg with DISTINCT + ORDER BY
+SELECT grp,
+       string_agg(DISTINCT val, ',' ORDER BY val) OVER (PARTITION BY grp) AS dstr
+FROM agg_dist_order_t ORDER BY id;
+
+-- 6. FILTER + DISTINCT + ORDER BY
+SELECT id,
+       array_agg(DISTINCT val ORDER BY val) FILTER (WHERE id % 2 = 1)
+           OVER (PARTITION BY grp) AS filtered_dvals
+FROM agg_dist_order_t ORDER BY id;
+
+-- 7. Mixed: DISTINCT+ORDER BY agg plus a normal agg in same window
+SELECT id,
+       array_agg(DISTINCT val ORDER BY val) OVER w AS dvals,
+       count(*) OVER w AS cnt
+FROM agg_dist_order_t WHERE grp = 1
+WINDOW w AS (ORDER BY ord)
+ORDER BY id;
+
+-- 8. EXCLUDE CURRENT ROW + DISTINCT + ORDER BY
+SELECT id,
+       array_agg(DISTINCT val ORDER BY val) OVER (ORDER BY ord
+           ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+           EXCLUDE CURRENT ROW) AS dvals
+FROM agg_dist_order_t WHERE grp = 1 ORDER BY id;
+
+-- 9. Illegal: ORDER BY expression not in DISTINCT argument list (parse error)
+SELECT array_agg(DISTINCT val ORDER BY ord) OVER () FROM agg_dist_order_t; -- error
+
+DROP TABLE agg_dist_order_t;

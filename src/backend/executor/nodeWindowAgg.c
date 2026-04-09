@@ -1428,10 +1428,12 @@ eval_windowaggregate_ordered(WindowAggState *winstate,
 	ExprState  *filter = wfuncstate->aggfilter;
 	int			numTransArgs = peraggstate->numTransArgs;
 	int			numAllExprs = peraggstate->numAllExprs;
+	bool		hasDistinct = (peraggstate->numDistinctCols > 0);
 	LOCAL_FCINFO(fcinfo, FUNC_MAX_ARGS);
 	Tuplesortstate *sortstate;
 	TupleTableSlot *inputSlot = peraggstate->orderInputSlot;
 	TupleTableSlot *sortedSlot = peraggstate->orderSortedSlot;
+	TupleTableSlot *uniqSlot = peraggstate->uniqSlot;	/* may be NULL */
 	TupleDesc	sortdesc = peraggstate->orderTupleDesc;
 	MemoryContext oldContext;
 	int64		pos;
@@ -1439,6 +1441,9 @@ eval_windowaggregate_ordered(WindowAggState *winstate,
 	ListCell   *arg;
 	int			saved_readptr;
 	int64		saved_seekpos;
+	bool		haveOldValue = false;
+	Datum		newAbbrevVal = (Datum) 0;
+	Datum		oldAbbrevVal = (Datum) 0;
 
 	/* Validate expression count invariants */
 	Assert(list_length(wfuncstate->args) == numTransArgs);
@@ -1553,15 +1558,57 @@ eval_windowaggregate_ordered(WindowAggState *winstate,
 	 * Read back sorted tuples and feed the transition function.  Only the
 	 * first numTransArgs columns are passed as arguments; the remaining
 	 * ORDER BY key columns have served their purpose.
+	 *
+	 * When DISTINCT is present, skip adjacent duplicate tuples by comparing
+	 * on the DISTINCT key columns using equality operators.
 	 */
 	ExecClearTuple(sortedSlot);
+	if (uniqSlot)
+		ExecClearTuple(uniqSlot);
 
-	while (tuplesort_gettupleslot(sortstate, true, false, sortedSlot, NULL))
+	while (tuplesort_gettupleslot(sortstate, true, true, sortedSlot, &newAbbrevVal))
 	{
 		ResetExprContext(econtext);
 		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
 		slot_getsomeattrs(sortedSlot, numTransArgs);
+
+		/*
+		 * DISTINCT dedup: skip this tuple if it matches the prior tuple on
+		 * all DISTINCT key columns.  For single-column DISTINCT, use the
+		 * fast datum equality path.  For multi-column, use the compiled
+		 * equality expression with the two-slot comparison pattern.
+		 */
+		if (hasDistinct && haveOldValue)
+		{
+			bool	is_dup;
+
+			if (peraggstate->numDistinctCols == 1)
+			{
+				/* Single-column fast path: compare datum values */
+				is_dup = (newAbbrevVal == oldAbbrevVal &&
+						  DatumGetBool(FunctionCall2Coll(
+							  &peraggstate->equalfn,
+							  peraggstate->orderSortCollations[0],
+							  sortedSlot->tts_values[peraggstate->orderSortColIdx[0] - 1],
+							  uniqSlot->tts_values[peraggstate->orderSortColIdx[0] - 1])));
+			}
+			else
+			{
+				/* Multi-column: use compiled equality expression */
+				econtext->ecxt_outertuple = sortedSlot;
+				econtext->ecxt_innertuple = uniqSlot;
+				is_dup = (newAbbrevVal == oldAbbrevVal &&
+						  ExecQual(peraggstate->equalfnMulti, econtext));
+			}
+
+			if (is_dup)
+			{
+				MemoryContextSwitchTo(oldContext);
+				ExecClearTuple(sortedSlot);
+				continue;
+			}
+		}
 
 		if (peraggstate->transfn.fn_strict)
 		{
@@ -1681,8 +1728,27 @@ eval_windowaggregate_ordered(WindowAggState *winstate,
 			peraggstate->transValueIsNull = fcinfo->isnull;
 		}
 
-		ExecClearTuple(sortedSlot);
+		/*
+		 * For DISTINCT dedup, retain the current tuple for comparison with
+		 * the next tuple by swapping the sorted and uniq slots.
+		 */
+		if (hasDistinct)
+		{
+			TupleTableSlot *tmpslot = uniqSlot;
+
+			uniqSlot = sortedSlot;
+			sortedSlot = tmpslot;
+			oldAbbrevVal = newAbbrevVal;
+			haveOldValue = true;
+		}
+		else
+			ExecClearTuple(sortedSlot);
 	}
+
+	if (sortedSlot)
+		ExecClearTuple(sortedSlot);
+	if (uniqSlot)
+		ExecClearTuple(uniqSlot);
 
 	tuplesort_end(sortstate);
 
@@ -2645,7 +2711,7 @@ eval_windowaggregates(WindowAggState *winstate)
 		if (peraggstate->distinctStrategy != DISTINCT_SORT || !peraggstate->restart)
 			continue;
 
-		/* DISTINCT + ordered must have been rejected at init time */
+		/* DISTINCT without ORDER BY goes through DISTINCT_SORT, not here */
 		Assert(!peraggstate->hasAggOrder);
 
 		wfuncno = peraggstate->wfuncno;
@@ -2671,7 +2737,7 @@ eval_windowaggregates(WindowAggState *winstate)
 		if (!peraggstate->hasAggOrder || !peraggstate->restart)
 			continue;
 
-		/* Ordered + DISTINCT must have been rejected at init time */
+		/* DISTINCT+ORDER BY is handled here; DISTINCT-only is not */
 		Assert(peraggstate->distinctStrategy == DISTINCT_NONE);
 
 		wfuncno = peraggstate->wfuncno;
@@ -4827,17 +4893,11 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	}
 
 	/*
-	 * Reject DISTINCT + aggregate-local ORDER BY combination.
-	 * Aggregate-local ORDER BY without DISTINCT is supported;
-	 * DISTINCT without ORDER BY is supported; the combination
-	 * is deferred to a future patch.
+	 * DISTINCT + aggregate-local ORDER BY combination is handled by the
+	 * ordered execution path (eval_windowaggregate_ordered) with post-sort
+	 * deduplication.  Skip the DISTINCT-only strategy setup when ORDER BY
+	 * is also present; the ordered-path setup below will handle everything.
 	 */
-	if (wfunc->winaggorder != NIL && wfunc->winaggdistinct != NIL)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("aggregate ORDER BY with DISTINCT is not yet implemented for window functions")));
-	}
 
 	aggTuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(wfunc->winfnoid));
 	if (!HeapTupleIsValid(aggTuple))
@@ -5114,7 +5174,7 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * datum-specialized sort path.  For multi-arg, we use tuple-based
 	 * sorting and multi-column hash/equality.
 	 */
-	if (wfunc->winaggdistinct != NIL)
+	if (wfunc->winaggdistinct != NIL && wfunc->winaggorder == NIL)
 	{
 		int			nargs = numArguments;
 		Oid		   *eqOps;
@@ -5283,11 +5343,19 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * Set up aggregate-local ORDER BY state if needed.  Build a composite
 	 * tuple descriptor containing all transfn arguments followed by ORDER
 	 * BY-only (resjunk) expressions.  The sort keys index into this tuple.
+	 *
+	 * When DISTINCT is also present (DISTINCT + ORDER BY), the sort key set
+	 * is winaggdistinct (not winaggorder), with sort direction overrides
+	 * from winaggorder for shared columns.  The parser guarantees that all
+	 * ORDER BY expressions appear in the argument list (no resjunk entries).
+	 * Post-sort deduplication uses equality operators from winaggdistinct.
 	 */
 	if (wfunc->winaggorder != NIL)
 	{
+		bool		hasDistinct = (wfunc->winaggdistinct != NIL);
+		List	   *sortClauseList;
 		int			nTransArgs = numArguments;
-		int			nOrderCols = list_length(wfunc->winaggorder);
+		int			nSortCols;
 		int			nResjunkExprs = 0;
 		int			nAllExprs;
 		int			col;
@@ -5295,9 +5363,16 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 		ListCell   *lc2;
 
 		/*
-		 * Count resjunk (ORDER BY-only) expressions in args.  These are
-		 * expressions used only for sorting, not as transition function
-		 * arguments.
+		 * When DISTINCT is present, the sort key set is winaggdistinct.
+		 * Otherwise it is winaggorder.
+		 */
+		sortClauseList = hasDistinct ? wfunc->winaggdistinct : wfunc->winaggorder;
+		nSortCols = list_length(sortClauseList);
+
+		/*
+		 * Count resjunk (ORDER BY-only) expressions in args.  When DISTINCT
+		 * is present, the parser guarantees there are none (ORDER BY
+		 * expressions must appear in the argument list).
 		 */
 		foreach(lc2, wfunc->args)
 		{
@@ -5312,7 +5387,7 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 		peraggstate->hasAggOrder = true;
 		peraggstate->orderReadPtr = -1;		/* allocated later in prepare_tuplestore */
 		peraggstate->orderSeekPos = -1;
-		peraggstate->numOrderCols = nOrderCols;
+		peraggstate->numOrderCols = nSortCols;
 		peraggstate->numTransArgs = nTransArgs;
 		peraggstate->numAllExprs = nAllExprs;
 
@@ -5357,30 +5432,55 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 									 &TTSOpsMinimalTuple);
 
 		/*
-		 * Set up per-column sort metadata from winaggorder.  Each
-		 * SortGroupClause references a TargetEntry via tleSortGroupRef.
-		 * We need to map each sort key to its column index within the
-		 * composite tuple.
+		 * Set up per-column sort metadata.  The sort key set comes from
+		 * sortClauseList (winaggdistinct when DISTINCT is present, else
+		 * winaggorder).  For DISTINCT+ORDER BY, we override the sort
+		 * direction with winaggorder's sortop/nulls_first for columns
+		 * that also appear in winaggorder.
 		 */
 		peraggstate->orderSortColIdx =
-			(AttrNumber *) palloc(nOrderCols * sizeof(AttrNumber));
+			(AttrNumber *) palloc(nSortCols * sizeof(AttrNumber));
 		peraggstate->orderSortOperators =
-			(Oid *) palloc(nOrderCols * sizeof(Oid));
+			(Oid *) palloc(nSortCols * sizeof(Oid));
 		peraggstate->orderSortCollations =
-			(Oid *) palloc(nOrderCols * sizeof(Oid));
+			(Oid *) palloc(nSortCols * sizeof(Oid));
 		peraggstate->orderSortNullsFirst =
-			(bool *) palloc(nOrderCols * sizeof(bool));
+			(bool *) palloc(nSortCols * sizeof(bool));
 
 		sortKeyIdx = 0;
-		foreach(lc2, wfunc->winaggorder)
+		foreach(lc2, sortClauseList)
 		{
 			SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc2);
 			TargetEntry *tle = get_sortgroupref_tle(sortcl->tleSortGroupRef,
 													wfunc->args);
+			Oid			sortop = sortcl->sortop;
+			bool		nulls_first = sortcl->nulls_first;
 
 			/*
-			 * Find the column index of this sort key within the composite
-			 * tuple.  Non-resjunk entries are in positions 1..nTransArgs;
+			 * For DISTINCT+ORDER BY, check if this DISTINCT column also
+			 * appears in winaggorder.  If so, use winaggorder's sort
+			 * direction instead of winaggdistinct's default.
+			 */
+			if (hasDistinct)
+			{
+				ListCell   *olc;
+
+				foreach(olc, wfunc->winaggorder)
+				{
+					SortGroupClause *ocl = (SortGroupClause *) lfirst(olc);
+
+					if (ocl->tleSortGroupRef == sortcl->tleSortGroupRef)
+					{
+						sortop = ocl->sortop;
+						nulls_first = ocl->nulls_first;
+						break;
+					}
+				}
+			}
+
+			/*
+			 * Find the column index within the composite tuple.
+			 * Non-resjunk entries are in positions 1..nTransArgs;
 			 * resjunk entries follow in positions nTransArgs+1..nAllExprs.
 			 */
 			if (!tle->resjunk)
@@ -5434,19 +5534,71 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 				peraggstate->orderSortColIdx[sortKeyIdx] = pos;
 			}
 
-			peraggstate->orderSortOperators[sortKeyIdx] = sortcl->sortop;
+			peraggstate->orderSortOperators[sortKeyIdx] = sortop;
 			peraggstate->orderSortCollations[sortKeyIdx] =
 				exprCollation((Node *) tle->expr);
-			peraggstate->orderSortNullsFirst[sortKeyIdx] = sortcl->nulls_first;
+			peraggstate->orderSortNullsFirst[sortKeyIdx] = nulls_first;
 
 			sortKeyIdx++;
 		}
-		Assert(sortKeyIdx == nOrderCols);
+		Assert(sortKeyIdx == nSortCols);
+
+		/*
+		 * For DISTINCT + ORDER BY, set up equality comparison metadata
+		 * for post-sort deduplication.  The equality operators come from
+		 * the winaggdistinct SortGroupClauses.
+		 */
+		if (hasDistinct)
+		{
+			peraggstate->numDistinctCols = nSortCols;
+
+			if (nSortCols == 1)
+			{
+				/* Single-column dedup: fast datum equality path */
+				SortGroupClause *dcl = (SortGroupClause *) linitial(wfunc->winaggdistinct);
+
+				fmgr_info(get_opcode(dcl->eqop), &peraggstate->equalfn);
+
+				/* Need a uniqSlot to retain previous tuple for comparison */
+				peraggstate->uniqSlot =
+					MakeSingleTupleTableSlot(peraggstate->orderTupleDesc,
+											 &TTSOpsMinimalTuple);
+			}
+			else
+			{
+				/* Multi-column dedup: compiled expression equality */
+				Oid		   *eqOps;
+				int			j;
+
+				eqOps = (Oid *) palloc(nSortCols * sizeof(Oid));
+				j = 0;
+				foreach(lc2, wfunc->winaggdistinct)
+				{
+					SortGroupClause *dcl = (SortGroupClause *) lfirst(lc2);
+
+					eqOps[j++] = dcl->eqop;
+				}
+
+				peraggstate->uniqSlot =
+					MakeSingleTupleTableSlot(peraggstate->orderTupleDesc,
+											 &TTSOpsMinimalTuple);
+
+				peraggstate->equalfnMulti =
+					execTuplesMatchPrepare(peraggstate->orderTupleDesc,
+										   nSortCols,
+										   peraggstate->orderSortColIdx,
+										   eqOps,
+										   peraggstate->orderSortCollations,
+										   &winstate->ss.ps);
+				pfree(eqOps);
+			}
+		}
 
 		/*
 		 * Compile ExprState nodes for the resjunk ORDER BY-only expressions.
 		 * These are not in wfuncstate->args (which only has non-resjunk
 		 * entries), so we compile them here from the TargetEntry expressions.
+		 * (When DISTINCT is present, there are no resjunk entries.)
 		 */
 		peraggstate->orderExprs = NIL;
 		foreach(lc2, wfunc->args)
