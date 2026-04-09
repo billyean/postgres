@@ -1915,6 +1915,46 @@ get_call_expr_argtype(Node *expr, int argnum)
 	else
 		return InvalidOid;
 
+	/*
+	 * WindowFunc args are TargetEntry-wrapped.  For plain aggregate window
+	 * functions (winagg), the list may contain resjunk ORDER BY entries that
+	 * must be skipped.  For non-aggregate window functions, all entries are
+	 * real arguments — use simple positional access after unwrapping.
+	 */
+	if (IsA(expr, WindowFunc))
+	{
+		WindowFunc *wf = (WindowFunc *) expr;
+
+		if (wf->winagg)
+		{
+			/* Aggregate: skip resjunk, count only real args */
+			int			pos = 0;
+			ListCell   *lc;
+
+			foreach(lc, args)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+				if (tle->resjunk)
+					continue;
+				if (pos == argnum)
+					return exprType((Node *) tle->expr);
+				pos++;
+			}
+			return InvalidOid;
+		}
+		else
+		{
+			/* Non-aggregate: no resjunk, simple positional unwrap */
+			TargetEntry *tle;
+
+			if (argnum < 0 || argnum >= list_length(args))
+				return InvalidOid;
+			tle = (TargetEntry *) list_nth(args, argnum);
+			return exprType((Node *) tle->expr);
+		}
+	}
+
 	if (argnum < 0 || argnum >= list_length(args))
 		return InvalidOid;
 
@@ -1980,10 +2020,52 @@ get_call_expr_arg_stable(Node *expr, int argnum)
 	else
 		return false;
 
+	/*
+	 * WindowFunc args are TargetEntry-wrapped.  For aggregate window
+	 * functions, skip resjunk.  For non-aggregate, simple positional unwrap.
+	 */
+	if (IsA(expr, WindowFunc))
+	{
+		WindowFunc *wf = (WindowFunc *) expr;
+
+		if (wf->winagg)
+		{
+			int			pos = 0;
+			ListCell   *lc;
+
+			foreach(lc, args)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+				if (tle->resjunk)
+					continue;
+				if (pos == argnum)
+				{
+					arg = (Node *) tle->expr;
+					goto check_stable;
+				}
+				pos++;
+			}
+			return false;
+		}
+		else
+		{
+			TargetEntry *tle;
+
+			if (argnum < 0 || argnum >= list_length(args))
+				return false;
+			tle = (TargetEntry *) list_nth(args, argnum);
+			arg = (Node *) tle->expr;
+			goto check_stable;
+		}
+	}
+
 	if (argnum < 0 || argnum >= list_length(args))
 		return false;
 
 	arg = (Node *) list_nth(args, argnum);
+
+check_stable:
 
 	/*
 	 * Either a true Const or an external Param will have a value that doesn't

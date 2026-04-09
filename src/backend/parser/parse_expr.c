@@ -3969,11 +3969,25 @@ transformJsonAggConstructor(ParseState *pstate, JsonAggConstructor *agg_ctor,
 	{
 		/* window function */
 		WindowFunc *wfunc = makeNode(WindowFunc);
+		List	   *tlist = NIL;
+		ListCell   *lc;
+		int			attno = 1;
 
 		wfunc->winfnoid = aggfnoid;
 		wfunc->wintype = aggtype;
 		/* wincollid and inputcollid will be set by parse_collate.c */
-		wfunc->args = args;
+
+		/* Wrap plain args in TargetEntry to match WindowFunc convention */
+		foreach(lc, args)
+		{
+			Expr	   *arg = (Expr *) lfirst(lc);
+
+			tlist = lappend(tlist,
+							makeTargetEntry(arg, attno++, NULL, false));
+		}
+		wfunc->args = tlist;
+		wfunc->winaggorder = NIL;
+		wfunc->winaggdistinct = NIL;
 		wfunc->aggfilter = aggfilter;
 		wfunc->runCondition = NIL;
 		/* winref will be set by transformWindowFuncCall */

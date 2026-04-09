@@ -2777,32 +2777,73 @@ eval_const_expressions_mutator(Node *node,
 				Oid			funcid = expr->winfnoid;
 				List	   *args;
 				Expr	   *aggfilter;
-				HeapTuple	func_tuple;
 				WindowFunc *newexpr;
 
 				/*
-				 * We can't really simplify a WindowFunc node, but we mustn't
-				 * just fall through to the default processing, because we
-				 * have to apply expand_function_arguments to its argument
-				 * list.  That takes care of inserting default arguments and
-				 * expanding named-argument notation.
+				 * For plain aggregate window functions (winagg), args have
+				 * SortGroupClause cross-references (winaggorder/winaggdistinct)
+				 * that would be corrupted by expand_function_arguments.
+				 * Argument expansion is not needed for aggregates anyway
+				 * (they reject named args and don't have defaults).
+				 *
+				 * For non-aggregate window functions (lead, lag, nth_value,
+				 * etc.), we must call expand_function_arguments to handle
+				 * named-argument reordering and default insertion, just as
+				 * the old pre-8a code did.
 				 */
-				func_tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-				if (!HeapTupleIsValid(func_tuple))
-					elog(ERROR, "cache lookup failed for function %u", funcid);
+				if (!expr->winagg)
+				{
+					HeapTuple	func_tuple;
+					List	   *plainargs = NIL;
+					ListCell   *lc2;
+					int			attno = 1;
 
-				args = expand_function_arguments(expr->args,
-												 false, expr->wintype,
-												 func_tuple);
+					/* Extract plain exprs from TargetEntry wrappers */
+					foreach(lc2, expr->args)
+					{
+						TargetEntry *tle = (TargetEntry *) lfirst(lc2);
 
-				ReleaseSysCache(func_tuple);
+						plainargs = lappend(plainargs, tle->expr);
+					}
 
-				/* Now, recursively simplify the args (which are a List) */
-				args = (List *)
-					expression_tree_mutator((Node *) args,
-											eval_const_expressions_mutator,
-											context);
-				/* ... and the filter expression, which isn't */
+					func_tuple = SearchSysCache1(PROCOID,
+												 ObjectIdGetDatum(funcid));
+					if (!HeapTupleIsValid(func_tuple))
+						elog(ERROR, "cache lookup failed for function %u",
+							 funcid);
+
+					plainargs = expand_function_arguments(plainargs,
+														  false,
+														  expr->wintype,
+														  func_tuple);
+					ReleaseSysCache(func_tuple);
+
+					/* Re-wrap in TargetEntry */
+					args = NIL;
+					foreach(lc2, plainargs)
+					{
+						Expr   *arg = (Expr *) lfirst(lc2);
+
+						args = lappend(args,
+									   makeTargetEntry(arg, attno++,
+													   NULL, false));
+					}
+
+					/* Recursively simplify */
+					args = (List *)
+						expression_tree_mutator((Node *) args,
+												eval_const_expressions_mutator,
+												context);
+				}
+				else
+				{
+					/* Aggregate: just recursively simplify, no expansion */
+					args = (List *)
+						expression_tree_mutator((Node *) expr->args,
+												eval_const_expressions_mutator,
+												context);
+				}
+
 				aggfilter = (Expr *)
 					eval_const_expressions_mutator((Node *) expr->aggfilter,
 												   context);
@@ -2819,7 +2860,8 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->winref = expr->winref;
 				newexpr->winstar = expr->winstar;
 				newexpr->winagg = expr->winagg;
-				newexpr->windistinct = expr->windistinct;
+				newexpr->winaggorder = expr->winaggorder;
+				newexpr->winaggdistinct = expr->winaggdistinct;
 				newexpr->ignore_nulls = expr->ignore_nulls;
 				newexpr->location = expr->location;
 

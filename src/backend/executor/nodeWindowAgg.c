@@ -4396,12 +4396,33 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * aggregates.  See the FEATURE_NOT_SUPPORTED check below.
 	 */
 
-	numArguments = list_length(wfunc->args);
-
-	i = 0;
+	/*
+	 * Count non-resjunk arguments and extract their types.  Resjunk entries
+	 * in wfunc->args are ORDER BY-only expressions, not aggregate arguments.
+	 */
+	numArguments = 0;
 	foreach(lc, wfunc->args)
 	{
-		inputTypes[i++] = exprType((Node *) lfirst(lc));
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (!tle->resjunk)
+		{
+			inputTypes[numArguments] = exprType((Node *) tle->expr);
+			numArguments++;
+		}
+	}
+
+	/*
+	 * Aggregate-local ORDER BY is accepted by the parser and stored in
+	 * winaggorder for parse/deparse round-trip support, but execution is
+	 * not yet implemented.  Reject at runtime until that work lands.
+	 */
+	if (wfunc->winaggorder != NIL)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("aggregate ORDER BY is not yet implemented for window functions"),
+				 errhint("Window aggregate inputs are currently processed in frame order, not aggregate-local order.")));
 	}
 
 	aggTuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(wfunc->winfnoid));
@@ -4609,7 +4630,7 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 		 * individual argument types.  Reject this combination explicitly
 		 * rather than risk corrupting aggregate state at runtime.
 		 */
-		if (wfunc->windistinct && numArguments > 1)
+		if (wfunc->winaggdistinct != NIL && numArguments > 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("DISTINCT is not supported for multi-argument window aggregates with no initial value")));
@@ -4657,7 +4678,7 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 	 * datum-specialized sort path.  For multi-arg, we use tuple-based
 	 * sorting and multi-column hash/equality.
 	 */
-	if (wfunc->windistinct)
+	if (wfunc->winaggdistinct != NIL)
 	{
 		int			nargs = numArguments;
 		Oid		   *eqOps;
@@ -4733,19 +4754,22 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 
 				{
 					int		k = 0;
-					ListCell *lc;
+					ListCell *lc2;
 
-					foreach(lc, wfunc->args)
+					foreach(lc2, wfunc->args)
 					{
-						Node   *arg = (Node *) lfirst(lc);
+						TargetEntry *tle = (TargetEntry *) lfirst(lc2);
 						Oid		ltOpr2;
+
+						if (tle->resjunk)
+							continue;
 
 						get_sort_group_operators(inputTypes[k],
 												 true, false, false,
 												 &ltOpr2, NULL, NULL, NULL);
 						peraggstate->sortColIdx[k] = k + 1;
 						peraggstate->sortOperators[k] = ltOpr2;
-						peraggstate->sortCollations[k] = exprCollation(arg);
+						peraggstate->sortCollations[k] = exprCollation((Node *) tle->expr);
 						peraggstate->sortNullsFirst_multi[k] = false;
 						k++;
 					}
@@ -4796,13 +4820,15 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 			peraggstate->hashCollations = (Oid *) palloc(nargs * sizeof(Oid));
 			{
 				int			k = 0;
-				ListCell   *lc;
+				ListCell   *lc2;
 
-				foreach(lc, wfunc->args)
+				foreach(lc2, wfunc->args)
 				{
-					Node   *arg = (Node *) lfirst(lc);
+					TargetEntry *tle = (TargetEntry *) lfirst(lc2);
 
-					peraggstate->hashCollations[k] = exprCollation(arg);
+					if (tle->resjunk)
+						continue;
+					peraggstate->hashCollations[k] = exprCollation((Node *) tle->expr);
 					k++;
 				}
 			}

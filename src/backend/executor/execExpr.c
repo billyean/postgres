@@ -1140,8 +1140,45 @@ ExecInitExprRec(Expr *node, ExprState *state,
 						winstate->numaggs++;
 
 					/* for now initialize agg using old style expressions */
-					wfstate->args = ExecInitExprList(wfunc->args,
-													 state->parent);
+					if (wfunc->winagg)
+					{
+						/*
+						 * Plain aggregate window function: args are
+						 * TargetEntry-wrapped with possible resjunk ORDER BY
+						 * entries.  Extract non-resjunk exprs only.
+						 */
+						List	   *argexprs = NIL;
+						ListCell   *lc2;
+
+						foreach(lc2, wfunc->args)
+						{
+							TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+							if (!tle->resjunk)
+								argexprs = lappend(argexprs, tle->expr);
+						}
+						wfstate->args = ExecInitExprList(argexprs,
+														 state->parent);
+					}
+					else
+					{
+						/*
+						 * Non-aggregate window function (nth_value, lead,
+						 * lag, etc.): args are TargetEntry-wrapped but have
+						 * no resjunk entries.  Extract all exprs directly.
+						 */
+						List	   *argexprs = NIL;
+						ListCell   *lc2;
+
+						foreach(lc2, wfunc->args)
+						{
+							TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+							argexprs = lappend(argexprs, tle->expr);
+						}
+						wfstate->args = ExecInitExprList(argexprs,
+														 state->parent);
+					}
 					wfstate->aggfilter = ExecInitExpr(wfunc->aggfilter,
 													  state->parent);
 

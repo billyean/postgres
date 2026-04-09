@@ -11639,7 +11639,11 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 	argnames = NIL;
 	foreach(l, wfunc->args)
 	{
-		Node	   *arg = (Node *) lfirst(l);
+		TargetEntry *tle = (TargetEntry *) lfirst(l);
+		Node	   *arg = (Node *) tle->expr;
+
+		if (tle->resjunk)
+			continue;
 
 		if (IsA(arg, NamedArgExpr))
 			argnames = lappend(argnames, ((NamedArgExpr *) arg)->name);
@@ -11659,16 +11663,41 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 		appendStringInfoChar(buf, '*');
 	else
 	{
-		if (wfunc->windistinct)
+		if (wfunc->winaggdistinct != NIL)
 			appendStringInfoString(buf, "DISTINCT ");
 		if (is_json_objectagg)
 		{
-			get_rule_expr((Node *) linitial(wfunc->args), context, false);
+			TargetEntry *tle1 = (TargetEntry *) linitial(wfunc->args);
+			TargetEntry *tle2 = (TargetEntry *) lsecond(wfunc->args);
+
+			get_rule_expr((Node *) tle1->expr, context, false);
 			appendStringInfoString(buf, " : ");
-			get_rule_expr((Node *) lsecond(wfunc->args), context, false);
+			get_rule_expr((Node *) tle2->expr, context, false);
 		}
 		else
-			get_rule_expr((Node *) wfunc->args, context, true);
+		{
+			/* Print non-resjunk arguments */
+			bool		first = true;
+
+			foreach(l, wfunc->args)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(l);
+
+				if (tle->resjunk)
+					continue;
+				if (!first)
+					appendStringInfoString(buf, ", ");
+				get_rule_expr((Node *) tle->expr, context, true);
+				first = false;
+			}
+		}
+
+		if (wfunc->winaggorder != NIL)
+		{
+			appendStringInfoString(buf, " ORDER BY ");
+			get_rule_orderby(wfunc->winaggorder, wfunc->args,
+							 false, context);
+		}
 	}
 
 	if (options)

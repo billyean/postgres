@@ -22,6 +22,7 @@
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "parser/parse_agg.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_coerce.h"
@@ -843,6 +844,11 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	{
 		/* window function */
 		WindowFunc *wfunc = makeNode(WindowFunc);
+		List	   *tlist = NIL;
+		List	   *torder = NIL;
+		List	   *tdistinct = NIL;
+		int			attno = 1;
+		ListCell   *lc;
 
 		Assert(over);			/* lack of this was checked above */
 		Assert(!agg_within_group);	/* also checked above */
@@ -850,11 +856,9 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		wfunc->winfnoid = funcid;
 		wfunc->wintype = rettype;
 		/* wincollid and inputcollid will be set by parse_collate.c */
-		wfunc->args = fargs;
 		/* winref will be set by transformWindowFuncCall */
 		wfunc->winstar = agg_star;
 		wfunc->winagg = (fdresult == FUNCDETAIL_AGGREGATE);
-		wfunc->windistinct = agg_distinct;
 		wfunc->aggfilter = agg_filter;
 		wfunc->ignore_nulls = ignore_nulls;
 		wfunc->runCondition = NIL;
@@ -882,13 +886,62 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 parser_errposition(pstate, location)));
 
 		/*
-		 * ordered aggs not allowed in windows yet
+		 * Build a TargetEntry list from the argument expressions, then
+		 * transform ORDER BY and DISTINCT if present.  This follows the
+		 * same pattern as transformAggregateCall() in parse_agg.c.
 		 */
+		foreach(lc, fargs)
+		{
+			Expr	   *arg = (Expr *) lfirst(lc);
+			TargetEntry *tle;
+
+			tle = makeTargetEntry(arg, attno++, NULL, false);
+			tlist = lappend(tlist, tle);
+		}
+
 		if (agg_order != NIL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("aggregate ORDER BY is not implemented for window functions"),
-					 parser_errposition(pstate, location)));
+		{
+			int		save_next_resno = pstate->p_next_resno;
+
+			pstate->p_next_resno = attno;
+
+			torder = transformSortClause(pstate,
+										 agg_order,
+										 &tlist,
+										 EXPR_KIND_ORDER_BY,
+										 true /* force SQL99 rules */);
+
+			pstate->p_next_resno = save_next_resno;
+		}
+
+		if (agg_distinct)
+		{
+			tdistinct = transformDistinctClause(pstate, &tlist, torder, true);
+
+			/*
+			 * All DISTINCT columns must be sortable.
+			 */
+			foreach(lc, tdistinct)
+			{
+				SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+
+				if (!OidIsValid(sortcl->sortop))
+				{
+					Node   *expr = get_sortgroupclause_expr(sortcl, tlist);
+
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_FUNCTION),
+							 errmsg("could not identify an ordering operator for type %s",
+									format_type_be(exprType(expr))),
+							 errdetail("Aggregates with DISTINCT must be able to sort their inputs."),
+							 parser_errposition(pstate, exprLocation(expr))));
+				}
+			}
+		}
+
+		wfunc->args = tlist;
+		wfunc->winaggorder = torder;
+		wfunc->winaggdistinct = tdistinct;
 
 		/*
 		 * FILTER is not yet supported with true window functions

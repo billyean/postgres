@@ -2638,3 +2638,27 @@ FROM (VALUES (1.0,10.0),(2.0,20.0)) v(y, x); -- error
 
 DROP AGGREGATE twoarg_sum_noinit(float8, float8);
 DROP FUNCTION twoarg_accum_strict(float8, float8, float8);
+
+-- Aggregate-local ORDER BY in window aggregates (Patch 8a: representation only)
+
+-- Parse/deparse round-trip: aggregate ORDER BY is accepted and stored
+CREATE TEMP TABLE t_8a (x int, y int, g int);
+INSERT INTO t_8a VALUES (1,3,1),(2,1,1),(3,2,1);
+CREATE VIEW v_8a AS SELECT array_agg(x ORDER BY y) OVER (PARTITION BY g) FROM t_8a;
+SELECT pg_get_viewdef('v_8a'::regclass);
+DROP VIEW v_8a;
+
+-- Runtime rejection: aggregate ORDER BY is not yet executed
+SELECT array_agg(x ORDER BY y) OVER (PARTITION BY g) FROM t_8a; -- error
+
+-- Runtime rejection: DISTINCT + aggregate ORDER BY also rejected
+SELECT array_agg(DISTINCT x ORDER BY x DESC) OVER () FROM t_8a; -- error
+
+-- Existing WITHIN GROUP rejection remains unchanged (parse-time error)
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) OVER () FROM t_8a; -- error
+
+-- Non-aggregate window functions with named/default args still work
+-- (regression test: 8a representation change must not break argument expansion)
+SELECT nth_value_def(n := 2, val := x) OVER (ORDER BY y), x, y FROM t_8a;
+
+DROP TABLE t_8a;

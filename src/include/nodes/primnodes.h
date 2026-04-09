@@ -594,10 +594,14 @@ typedef struct WindowFunc
 	Oid			wincollid pg_node_attr(query_jumble_ignore);
 	/* OID of collation that function should use */
 	Oid			inputcollid pg_node_attr(query_jumble_ignore);
-	/* arguments to the window function */
+	/* arguments to the window function (List of TargetEntry) */
 	List	   *args;
 	/* FILTER expression, if any */
 	Expr	   *aggfilter;
+	/* aggregate-local ORDER BY (List of SortGroupClause), or NIL */
+	List	   *winaggorder;
+	/* aggregate DISTINCT (List of SortGroupClause), or NIL */
+	List	   *winaggdistinct;
 	/* List of WindowFuncRunConditions to help short-circuit execution */
 	List	   *runCondition pg_node_attr(query_jumble_ignore);
 	/* index of associated WindowClause */
@@ -606,8 +610,6 @@ typedef struct WindowFunc
 	bool		winstar pg_node_attr(query_jumble_ignore);
 	/* is function a simple aggregate? */
 	bool		winagg pg_node_attr(query_jumble_ignore);
-	/* true if aggregate arguments were marked DISTINCT */
-	bool		windistinct;
 	/* ignore nulls. One of the Null Treatment options */
 	int			ignore_nulls;
 	/* token location, or -1 if unknown */
