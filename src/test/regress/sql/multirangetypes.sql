@@ -907,3 +907,73 @@ create function mr_inoutparam_fail(inout i anyelement, out r anymultirange)
 --should fail
 create function mr_table_fail(i anyelement) returns table(i anyelement, r anymultirange)
   as $$ select $1, '[1,10]' $$ language sql;
+
+--
+-- test selectivity of multirange join operators
+--
+create table test_mr_join_1 (mr1 int4multirange);
+create table test_mr_join_2 (mr2 int4multirange);
+create table test_mr_join_3 (mr3 int4multirange);
+
+insert into test_mr_join_1 select int4multirange(int4range(g, g+10)) from generate_series(1, 1000) g;
+insert into test_mr_join_1 select int4multirange(int4range(g, g+100)) from generate_series(1, 1000, 10) g;
+insert into test_mr_join_2 select int4multirange(int4range(g, g+10)) from generate_series(1, 500) g;
+insert into test_mr_join_2 select int4multirange(int4range(g, g+100)) from generate_series(1, 500, 10) g;
+insert into test_mr_join_3 select int4multirange(int4range(g, g+10)) from generate_series(501, 1000) g;
+insert into test_mr_join_3 select int4multirange(int4range(g, g+100)) from generate_series(501, 1000, 10) g;
+
+analyze test_mr_join_1;
+analyze test_mr_join_2;
+analyze test_mr_join_3;
+
+-- reorder joins based on computed selectivity
+explain (costs off) select count(*) from test_mr_join_1, test_mr_join_2, test_mr_join_3 where mr1 && mr2 and mr2 && mr3;
+explain (costs off) select count(*) from test_mr_join_1, test_mr_join_2, test_mr_join_3 where mr1 << mr2 and mr2 << mr3;
+explain (costs off) select count(*) from test_mr_join_1, test_mr_join_2, test_mr_join_3 where mr1 >> mr2 and mr2 >> mr3;
+
+drop table test_mr_join_1;
+drop table test_mr_join_2;
+drop table test_mr_join_3;
+
+--
+-- test multirange join selectivity with fully disjoint histograms
+--
+create table test_mr_join_lo (mr int4multirange);
+create table test_mr_join_hi (mr int4multirange);
+
+-- low multiranges: {[1,11)}, {[2,12)}, ... {[500,510)}
+insert into test_mr_join_lo select int4multirange(int4range(g, g+10)) from generate_series(1, 500) g;
+-- high multiranges: {[10001,10011)}, {[10002,10012)}, ... {[10500,10510)}
+insert into test_mr_join_hi select int4multirange(int4range(g, g+10)) from generate_series(10001, 10500) g;
+
+analyze test_mr_join_lo;
+analyze test_mr_join_hi;
+
+-- lo << hi should produce a large selectivity (most pairs match)
+-- lo >> hi should produce a near-zero selectivity
+-- lo && hi should produce a near-zero selectivity (no overlap)
+explain (costs off) select count(*) from test_mr_join_lo a, test_mr_join_hi b where a.mr << b.mr;
+explain (costs off) select count(*) from test_mr_join_lo a, test_mr_join_hi b where a.mr >> b.mr;
+explain (costs off) select count(*) from test_mr_join_lo a, test_mr_join_hi b where a.mr && b.mr;
+
+--
+-- test mixed range/multirange join selectivity
+--
+create table test_mr_join_r (r int4range);
+create table test_mr_join_m (mr int4multirange);
+
+insert into test_mr_join_r select int4range(g, g+10) from generate_series(1, 500) g;
+insert into test_mr_join_m select int4multirange(int4range(g, g+10)) from generate_series(501, 1000) g;
+
+analyze test_mr_join_r;
+analyze test_mr_join_m;
+
+-- range << multirange, range >> multirange, range && multirange
+explain (costs off) select count(*) from test_mr_join_r a, test_mr_join_m b where a.r << b.mr;
+explain (costs off) select count(*) from test_mr_join_r a, test_mr_join_m b where a.r >> b.mr;
+explain (costs off) select count(*) from test_mr_join_r a, test_mr_join_m b where a.r && b.mr;
+
+drop table test_mr_join_r;
+drop table test_mr_join_m;
+drop table test_mr_join_lo;
+drop table test_mr_join_hi;

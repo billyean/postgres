@@ -69,6 +69,9 @@ static double calc_hist_selectivity_contains(TypeCacheEntry *typcache,
 											 int hist_nvalues,
 											 const Datum *length_hist_values,
 											 int length_hist_nvalues);
+static double calc_hist_join_selectivity(TypeCacheEntry *typcache,
+										 const RangeBound *hist1, int nhist1,
+										 const RangeBound *hist2, int nhist2);
 
 /*
  * Returns a default selectivity estimate for given operator, when we don't
@@ -1333,4 +1336,339 @@ calc_hist_selectivity_contains(TypeCacheEntry *typcache,
 	}
 
 	return sum_frac;
+}
+
+/*
+ * Estimate P(X < Y) for two arrays of range bounds using the approach
+ * from Repas et al. 2022 (selectivity estimation of inequality joins):
+ *
+ *   P(X < Y) = 0.5 * sum( (F_X(prev) + F_X(cur)) * (F_Y(cur) - F_Y(prev)) )
+ * by parallel-scanning both histograms.
+ *
+ * The initial fast-forward loops skip histogram entries that fall entirely
+ * before the other histogram's range, so the main loop only processes the
+ * overlapping region.  Bounds checks are required because the histograms may
+ * be completely disjoint (e.g., all of X is below all of Y).
+ */
+static double
+calc_hist_join_selectivity(TypeCacheEntry *typcache,
+						   const RangeBound *hist1, int nhist1,
+						   const RangeBound *hist2, int nhist2)
+{
+	int			i,
+				j;
+	double		selectivity = 0.0;
+	double		prev_sel1 = -1.0;	/* negative sentinel skips first iter */
+	double		prev_sel2 = 0.0;
+
+	Assert(nhist1 > 1);
+	Assert(nhist2 > 1);
+
+	/*
+	 * Fast-forward past hist1 entries that are entirely below hist2[0], and
+	 * vice versa.  Bounds checks prevent out-of-bounds access when the
+	 * histograms are fully disjoint.
+	 */
+	for (i = 0; i < nhist1 &&
+		 range_cmp_bounds(typcache, &hist1[i], &hist2[0]) < 0; i++)
+		;
+	for (j = 0; j < nhist2 &&
+		 range_cmp_bounds(typcache, &hist2[j], &hist1[0]) < 0; j++)
+		;
+
+	/*
+	 * Handle fully-separated histograms.  When all bounds in hist1 are below
+	 * all bounds in hist2, P(X < Y) is ~1.0.  When all of hist2 is below
+	 * hist1, P(X < Y) is ~0.0.  We return immediately rather than falling
+	 * into the overlap walk with invalid indices.
+	 */
+	if (i >= nhist1)
+		return 1.0;
+	if (j >= nhist2)
+		return 0.0;
+
+	/* Walk the overlapping region of both histograms */
+	while (i < nhist1 && j < nhist2)
+	{
+		double		cur_sel1,
+					cur_sel2;
+		RangeBound	cur_sync;
+
+		if (range_cmp_bounds(typcache, &hist1[i], &hist2[j]) < 0)
+			cur_sync = hist1[i++];
+		else if (range_cmp_bounds(typcache, &hist1[i], &hist2[j]) > 0)
+			cur_sync = hist2[j++];
+		else
+		{
+			/* Equal bounds: advance both */
+			cur_sync = hist1[i];
+			i++;
+			j++;
+		}
+		cur_sel1 = calc_hist_selectivity_scalar(typcache, &cur_sync,
+												hist1, nhist1, false);
+		cur_sel2 = calc_hist_selectivity_scalar(typcache, &cur_sync,
+												hist2, nhist2, false);
+
+		/* Skip the first iteration (no previous point yet) */
+		if (prev_sel1 >= 0)
+			selectivity += (prev_sel1 + cur_sel1) * (cur_sel2 - prev_sel2);
+
+		prev_sel1 = cur_sel1;
+		prev_sel2 = cur_sel2;
+	}
+
+	/* P(X < Y) = 0.5 * Sum(...) */
+	selectivity /= 2;
+
+	/* Include remainder of hist2 if hist1 was exhausted first */
+	if (j < nhist2)
+		selectivity += 1 - prev_sel2;
+
+	return selectivity;
+}
+
+/*
+ * multirangejoinsel -- join selectivity for multirange operators
+ *
+ * Supports: <<, >>, && for all multirange/range type combinations:
+ *   multirange × multirange, multirange × range, range × multirange
+ *
+ * These operators map to the same strict bound comparisons as their range
+ * counterparts, estimated via calc_hist_join_selectivity() from bound
+ * histograms.
+ *
+ * Multirange statistics only preserve the outermost bounds (overall lower
+ * and upper) of each multirange value.  This is the same outer-bounds
+ * approximation already used by multirange restriction selectivity.  For the
+ * << and >> operators, outer bounds are sufficient because they depend only
+ * on the overall upper and lower bounds respectively.  For &&, the estimate
+ * treats each multirange as a single contiguous range spanning its outermost
+ * bounds, which may overestimate overlap for sparse multiranges with large
+ * internal gaps.  This is still expected to improve on the previous fixed
+ * default selectivity.
+ */
+Datum
+multirangejoinsel(PG_FUNCTION_ARGS)
+{
+	PlannerInfo *root = (PlannerInfo *) PG_GETARG_POINTER(0);
+	Oid			operator = PG_GETARG_OID(1);
+	List	   *args = (List *) PG_GETARG_POINTER(2);
+	SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) PG_GETARG_POINTER(4);
+	VariableStatData vardata1;
+	VariableStatData vardata2;
+	Selectivity selec;
+	AttStatsSlot hist1;
+	AttStatsSlot hist2;
+	AttStatsSlot sslot;
+	bool		have_hist1 = false;
+	bool		have_hist2 = false;
+	TypeCacheEntry *typcache;
+	TypeCacheEntry *rng_typcache;
+	Form_pg_statistic stats1;
+	Form_pg_statistic stats2;
+	double		empty_frac1;
+	double		empty_frac2;
+	double		null_frac1;
+	double		null_frac2;
+	int			nhist1;
+	int			nhist2;
+	RangeBound *hist1_lower;
+	RangeBound *hist1_upper;
+	RangeBound *hist2_lower;
+	RangeBound *hist2_upper;
+	bool		empty;
+	int			i;
+
+	{
+		bool		join_is_reversed;
+
+		get_join_variables(root, args, sjinfo, &vardata1, &vardata2,
+						   &join_is_reversed);
+	}
+
+	selec = default_multirange_selectivity(operator);
+
+	/*
+	 * Acquire histogram stats for both sides.  Each slot is tracked
+	 * independently so we can release exactly what was acquired on any
+	 * failure path.
+	 */
+	if (!HeapTupleIsValid(vardata1.statsTuple) ||
+		!HeapTupleIsValid(vardata2.statsTuple))
+		goto cleanup;
+
+	/*
+	 * Determine the underlying range type cache.  At least one side is a
+	 * multirange; the other may be a multirange or a plain range.  Both sides
+	 * must share the same underlying range type.
+	 */
+	typcache = lookup_type_cache(vardata1.vartype, TYPECACHE_MULTIRANGE_INFO);
+	if (typcache->rngtype != NULL)
+	{
+		/* vardata1 is a multirange */
+		rng_typcache = typcache->rngtype;
+		if (vardata2.vartype != vardata1.vartype &&
+			vardata2.vartype != rng_typcache->type_id)
+			goto cleanup;
+	}
+	else
+	{
+		/* vardata1 is a range; vardata2 must be a multirange */
+		typcache = lookup_type_cache(vardata2.vartype,
+									 TYPECACHE_MULTIRANGE_INFO);
+		if (typcache->rngtype == NULL)
+			goto cleanup;
+		rng_typcache = typcache->rngtype;
+		if (vardata1.vartype != rng_typcache->type_id)
+			goto cleanup;
+	}
+
+	memset(&hist1, 0, sizeof(hist1));
+	memset(&hist2, 0, sizeof(hist2));
+
+	if (!get_attstatsslot(&hist1, vardata1.statsTuple,
+						  STATISTIC_KIND_BOUNDS_HISTOGRAM, InvalidOid,
+						  ATTSTATSSLOT_VALUES))
+		goto cleanup;
+	have_hist1 = true;
+
+	if (!get_attstatsslot(&hist2, vardata2.statsTuple,
+						  STATISTIC_KIND_BOUNDS_HISTOGRAM, InvalidOid,
+						  ATTSTATSSLOT_VALUES))
+		goto cleanup;
+	have_hist2 = true;
+
+	/* Look up NULL and empty-range fractions */
+	stats1 = (Form_pg_statistic) GETSTRUCT(vardata1.statsTuple);
+	stats2 = (Form_pg_statistic) GETSTRUCT(vardata2.statsTuple);
+
+	null_frac1 = stats1->stanullfrac;
+	null_frac2 = stats2->stanullfrac;
+
+	/* Try to get fraction of empty ranges/multiranges for the first variable */
+	if (get_attstatsslot(&sslot, vardata1.statsTuple,
+						 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM,
+						 InvalidOid, ATTSTATSSLOT_NUMBERS))
+	{
+		if (sslot.nnumbers != 1)
+			elog(ERROR, "invalid empty fraction statistic");
+		empty_frac1 = sslot.numbers[0];
+		free_attstatsslot(&sslot);
+	}
+	else
+	{
+		empty_frac1 = 0.0;
+	}
+
+	/* Try to get fraction of empty ranges/multiranges for the second variable */
+	if (get_attstatsslot(&sslot, vardata2.statsTuple,
+						 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM,
+						 InvalidOid, ATTSTATSSLOT_NUMBERS))
+	{
+		if (sslot.nnumbers != 1)
+			elog(ERROR, "invalid empty fraction statistic");
+		empty_frac2 = sslot.numbers[0];
+		free_attstatsslot(&sslot);
+	}
+	else
+	{
+		empty_frac2 = 0.0;
+	}
+
+	/* Convert range histograms to separate lower/upper bound arrays */
+	nhist1 = hist1.nvalues;
+	hist1_lower = (RangeBound *) palloc(sizeof(RangeBound) * nhist1);
+	hist1_upper = (RangeBound *) palloc(sizeof(RangeBound) * nhist1);
+	for (i = 0; i < nhist1; i++)
+	{
+		range_deserialize(rng_typcache, DatumGetRangeTypeP(hist1.values[i]),
+						  &hist1_lower[i], &hist1_upper[i], &empty);
+		if (empty)
+			elog(ERROR, "bounds histogram contains an empty range");
+	}
+
+	nhist2 = hist2.nvalues;
+	hist2_lower = (RangeBound *) palloc(sizeof(RangeBound) * nhist2);
+	hist2_upper = (RangeBound *) palloc(sizeof(RangeBound) * nhist2);
+	for (i = 0; i < nhist2; i++)
+	{
+		range_deserialize(rng_typcache, DatumGetRangeTypeP(hist2.values[i]),
+						  &hist2_lower[i], &hist2_upper[i], &empty);
+		if (empty)
+			elog(ERROR, "bounds histogram contains an empty range");
+	}
+
+	/* Estimate selectivity based on the operator */
+	switch (operator)
+	{
+		case OID_MULTIRANGE_OVERLAPS_RANGE_OP:
+		case OID_MULTIRANGE_OVERLAPS_MULTIRANGE_OP:
+		case OID_RANGE_OVERLAPS_MULTIRANGE_OP:
+
+			/*
+			 * A && B iff NOT(A << B) AND NOT(A >> B)
+			 * = 1 - P(A.upper < B.lower) - P(B.upper < A.lower)
+			 *
+			 * For multiranges, this uses the outermost bounds only.  Internal
+			 * gaps are not represented in the available statistics, so overlap
+			 * may be overestimated for sparse multiranges.  This is consistent
+			 * with the existing outer-bounds approximation used by multirange
+			 * restriction selectivity.
+			 */
+			selec = 1;
+			selec -= calc_hist_join_selectivity(rng_typcache,
+												hist1_upper, nhist1,
+												hist2_lower, nhist2);
+			selec -= calc_hist_join_selectivity(rng_typcache,
+												hist2_upper, nhist2,
+												hist1_lower, nhist1);
+			break;
+
+		case OID_MULTIRANGE_LEFT_RANGE_OP:
+		case OID_MULTIRANGE_LEFT_MULTIRANGE_OP:
+		case OID_RANGE_LEFT_MULTIRANGE_OP:
+			/* A << B iff upper(A) < lower(B) */
+			selec = calc_hist_join_selectivity(rng_typcache,
+											   hist1_upper, nhist1,
+											   hist2_lower, nhist2);
+			break;
+
+		case OID_MULTIRANGE_RIGHT_RANGE_OP:
+		case OID_MULTIRANGE_RIGHT_MULTIRANGE_OP:
+		case OID_RANGE_RIGHT_MULTIRANGE_OP:
+			/* A >> B iff upper(B) < lower(A) */
+			selec = calc_hist_join_selectivity(rng_typcache,
+											   hist2_upper, nhist2,
+											   hist1_lower, nhist1);
+			break;
+
+		default:
+			/* Unsupported operator; keep the default selectivity */
+			goto cleanup;
+	}
+
+	/* The histogram-based selectivity applies to non-empty ranges only */
+	selec *= (1 - empty_frac1) * (1 - empty_frac2);
+
+	/*
+	 * For the supported operators (<<, >>, &&), empty ranges/multiranges
+	 * always produce false, so no empty-fraction adjustment is needed.
+	 */
+
+	/* All multirange operators are strict */
+	selec *= (1 - null_frac1) * (1 - null_frac2);
+
+cleanup:
+	if (have_hist2)
+		free_attstatsslot(&hist2);
+	if (have_hist1)
+		free_attstatsslot(&hist1);
+
+	ReleaseVariableStats(vardata1);
+	ReleaseVariableStats(vardata2);
+
+	CLAMP_PROBABILITY(selec);
+
+	PG_RETURN_FLOAT8((float8) selec);
 }
