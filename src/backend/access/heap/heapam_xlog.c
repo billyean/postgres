@@ -42,7 +42,8 @@
  * relation was in implicit default-epoch mode at the time).
  */
 static void
-epoch_xlog_redo_block(XLogReaderState *record, uint8 epoch_block_id)
+epoch_xlog_redo_block(XLogReaderState *record, uint8 epoch_block_id,
+					  int expected_nrecords)
 {
 	Buffer		epoch_buf;
 	XLogRedoAction action;
@@ -57,6 +58,7 @@ epoch_xlog_redo_block(XLogReaderState *record, uint8 epoch_block_id)
 		Page		epoch_page = BufferGetPage(epoch_buf);
 		char	   *data;
 		Size		datalen;
+		int			nrecords;
 
 		/* Initialize epoch page if needed (new page during recovery) */
 		if (PageIsNew(epoch_page))
@@ -65,18 +67,45 @@ epoch_xlog_redo_block(XLogReaderState *record, uint8 epoch_block_id)
 		data = XLogRecGetBlockData(record, epoch_block_id, &datalen);
 
 		/*
-		 * Strict validation: the epoch slot payload is a fixed-size struct.
-		 * Any mismatch is a programming error or WAL corruption; do not
-		 * silently accept unexpected sizes.
+		 * Strict structural validation.  The payload must be a non-empty,
+		 * exact multiple of SizeOfEpochSlotUpdate, containing at most 2
+		 * records.  No currently supported operation produces more than 2
+		 * epoch slot updates on a single page in a single WAL record.
+		 *
+		 * Exactly 1 record: insert, delete, or one side of cross-page update.
+		 * Exactly 2 records: same-page update (old xmax + new xmin).
 		 */
-		if (data == NULL || datalen != SizeOfEpochSlotUpdate)
-			elog(ERROR, "epoch slot WAL payload has unexpected size: "
-				 "expected %zu, got %zu (data %s)",
-				 (Size) SizeOfEpochSlotUpdate, datalen,
-				 data == NULL ? "NULL" : "present");
+		if (data == NULL || datalen == 0)
+			elog(ERROR, "epoch block ref present but BufData is empty");
+		if (datalen % SizeOfEpochSlotUpdate != 0)
+			elog(ERROR, "epoch BufData size %zu is not a multiple of %zu",
+				 datalen, (Size) SizeOfEpochSlotUpdate);
 
-		EpochRedoSlotUpdate(epoch_page,
-							(xl_epoch_slot_update *) data);
+		nrecords = datalen / SizeOfEpochSlotUpdate;
+		if (nrecords < 1 || nrecords > 2)
+			elog(ERROR, "epoch block has %d slot update records, expected 1 or 2",
+				 nrecords);
+
+		/*
+		 * Per-operation cardinality enforcement.  The caller passes the
+		 * exact expected count for the supported WAL shape:
+		 *   insert/delete: 1 record per epoch block
+		 *   same-page update: 2 records on the shared epoch block
+		 *   cross-page update: 1 record per epoch block
+		 * A mismatch indicates the WAL record shape does not match the
+		 * expected operation.
+		 */
+		if (expected_nrecords > 0 && nrecords != expected_nrecords)
+			elog(ERROR, "epoch block has %d records but operation expects exactly %d",
+				 nrecords, expected_nrecords);
+
+		for (int i = 0; i < nrecords; i++)
+		{
+			xl_epoch_slot_update *xlrec =
+				(xl_epoch_slot_update *) (data + i * SizeOfEpochSlotUpdate);
+
+			EpochRedoSlotUpdate(epoch_page, xlrec);
+		}
 
 		PageSetLSN(epoch_page, record->EndRecPtr);
 		MarkBufferDirty(epoch_buf);
@@ -422,8 +451,8 @@ heap_xlog_delete(XLogReaderState *record)
 	if (BufferIsValid(buffer))
 		UnlockReleaseBuffer(buffer);
 
-	/* XID64 EPOCH FORK: Replay epoch slot update (block 1) */
-	epoch_xlog_redo_block(record, 1);
+	/* XID64 EPOCH FORK: Replay epoch slot update (block 1, exactly 1 record) */
+	epoch_xlog_redo_block(record, 1, 1);
 }
 
 /*
@@ -551,9 +580,11 @@ heap_xlog_insert(XLogReaderState *record)
 	if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5)
 		XLogRecordPageWithFreeSpace(target_locator, blkno, freespace);
 
-	/* XID64 EPOCH FORK: Replay epoch slot update (block 1) */
-	epoch_xlog_redo_block(record, 1);
-}/*
+	/* XID64 EPOCH FORK: Replay epoch slot update (block 1, exactly 1 record) */
+	epoch_xlog_redo_block(record, 1, 1);
+}
+
+/*
  * Replay XLOG_HEAP2_MULTI_INSERT records.
  */
 static void
@@ -1035,6 +1066,29 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	 */
 	if (newaction == BLK_NEEDS_REDO && !hot_update && freespace < BLCKSZ / 5)
 		XLogRecordPageWithFreeSpace(rlocator, newblk, freespace);
+
+	/*
+	 * XID64 EPOCH FORK: Replay epoch slot updates for update.
+	 * Block 2 = epoch for old heap block.
+	 *   - Same-page update: block 2 has exactly 2 records (old xmax + new xmin)
+	 *   - Cross-page update: block 2 has exactly 1 record (old xmax only)
+	 * Block 3 = epoch for new heap block (only present for cross-page).
+	 *   - When present, has exactly 1 record (new xmin)
+	 *
+	 * Determine same-page vs cross-page from block 3 presence.
+	 */
+	if (XLogRecHasBlockRef(record, 3))
+	{
+		/* Cross-page: block 2 = 1 record (old xmax), block 3 = 1 record (new xmin) */
+		epoch_xlog_redo_block(record, 2, 1);
+		epoch_xlog_redo_block(record, 3, 1);
+	}
+	else if (XLogRecHasBlockRef(record, 2))
+	{
+		/* Same-page: block 2 = 2 records (old xmax + new xmin) */
+		epoch_xlog_redo_block(record, 2, 2);
+	}
+	/* else: no epoch block refs (relation was in implicit mode during update) */
 }
 
 /*

@@ -65,7 +65,8 @@ static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  Buffer newbuf, HeapTuple oldtup,
 								  HeapTuple newtup, HeapTuple old_key_tuple,
 								  bool all_visible_cleared, bool new_all_visible_cleared,
-								  bool walLogical);
+								  bool walLogical,
+								  Buffer epoch_oldbuf, Buffer epoch_newbuf);
 #ifdef USE_ASSERT_CHECKING
 static void check_lock_if_inplace_updateable_rel(Relation relation,
 												 const ItemPointerData *otid,
@@ -3393,6 +3394,8 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 				infomask2_old_tuple,
 				infomask_new_tuple,
 				infomask2_new_tuple;
+	Buffer		epoch_buffer_old = InvalidBuffer;
+	Buffer		epoch_buffer_new = InvalidBuffer;
 
 	Assert(ItemPointerIsValid(otid));
 
@@ -3840,6 +3843,20 @@ l2:
 							  &infomask2_old_tuple);
 
 	/*
+	 * XID64 EPOCH FORK: Unconditional MultiXact guard.  The epoch fork
+	 * cannot represent a MultiXact xmax.  This fires regardless of whether
+	 * the relation is currently implicit or materialized, because allowing
+	 * a MultiXact-shaped update to trigger materialization would create an
+	 * epoch fork with incomplete state from its very first write.
+	 */
+	if (infomask_old_tuple & HEAP_XMAX_IS_MULTI)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("epoch fork v1 does not support MultiXact xmax in heap_update"),
+				 errhint("Concurrent tuple locking produced a MultiXact outcome "
+						 "which is not representable in the epoch fork prototype.")));
+
+	/*
 	 * And also prepare an Xmax value for the new copy of the tuple.  If there
 	 * was no xmax previously, or there was one but all lockers are now gone,
 	 * then use InvalidTransactionId; otherwise, get the xmax from the old
@@ -4096,6 +4113,18 @@ l2:
 	newpage = BufferGetPage(newbuf);
 
 	/*
+	 * XID64 EPOCH FORK: Pin epoch buffer(s) before entering the critical
+	 * section.  This may create the epoch fork (transitioning from implicit
+	 * to materialized mode) and/or extend it.
+	 *
+	 * Pin in semantic old/new order.  Locking (inside the critical section)
+	 * uses ascending block number order to prevent deadlock.
+	 */
+	EpochPinBuffer(relation, BufferGetBlockNumber(buffer), &epoch_buffer_old);
+	if (newbuf != buffer)
+		EpochPinBuffer(relation, BufferGetBlockNumber(newbuf), &epoch_buffer_new);
+
+	/*
 	 * We're about to do the actual update -- check for conflict first, to
 	 * avoid possibly having to roll back work we've just done.
 	 *
@@ -4228,6 +4257,76 @@ l2:
 		MarkBufferDirty(newbuf);
 	MarkBufferDirty(buffer);
 
+	/*
+	 * XID64 EPOCH FORK: Write epoch data for old tuple (xmax) and new
+	 * tuple (xmin).  For cross-page updates with two distinct epoch
+	 * buffers, lock in ascending block number order to prevent deadlock.
+	 * Slot writes happen in semantic order regardless of lock order.
+	 *
+	 * Note on implicit→materialized transition: If this UPDATE is the first
+	 * epoch-aware operation on the relation, the old tuple's slot will only
+	 * receive xmax epoch (additive).  Its xmin epoch remains unset because
+	 * the original inserter did not record epoch metadata (the fork did not
+	 * exist at insert time).  This is correct: EPOCH_FLAG_XMIN_SET absent
+	 * means "xmin epoch unknown, use EPOCH_DEFAULT_VALUE for reconstruction."
+	 */
+	{
+		FullTransactionId fxid = GetCurrentFullTransactionId();
+		OffsetNumber old_offnum = ItemPointerGetOffsetNumber(&oldtup.t_self);
+		OffsetNumber new_offnum = ItemPointerGetOffsetNumber(&heaptup->t_self);
+
+		if (newbuf == buffer || !BufferIsValid(epoch_buffer_new))
+		{
+			/* Same-page: one epoch buffer, two slot writes */
+			Page		epoch_page;
+
+			LockBuffer(epoch_buffer_old, BUFFER_LOCK_EXCLUSIVE);
+			epoch_page = BufferGetPage(epoch_buffer_old);
+			if (PageIsNew(epoch_page))
+				EpochPageInit(epoch_page);
+
+			EpochSlotSetXmax(epoch_page, old_offnum, fxid);
+			EpochSlotInitForInsert(epoch_page, new_offnum, fxid);
+			MarkBufferDirty(epoch_buffer_old);
+		}
+		else
+		{
+			/* Cross-page: two epoch buffers, lock by ascending block number */
+			Buffer		epoch_first,
+						epoch_second;
+			Page		old_epoch_page,
+						new_epoch_page;
+
+			if (BufferGetBlockNumber(epoch_buffer_old) <
+				BufferGetBlockNumber(epoch_buffer_new))
+			{
+				epoch_first = epoch_buffer_old;
+				epoch_second = epoch_buffer_new;
+			}
+			else
+			{
+				epoch_first = epoch_buffer_new;
+				epoch_second = epoch_buffer_old;
+			}
+
+			LockBuffer(epoch_first, BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(epoch_second, BUFFER_LOCK_EXCLUSIVE);
+
+			/* Slot writes in semantic order, independent of lock order */
+			old_epoch_page = BufferGetPage(epoch_buffer_old);
+			if (PageIsNew(old_epoch_page))
+				EpochPageInit(old_epoch_page);
+			EpochSlotSetXmax(old_epoch_page, old_offnum, fxid);
+			MarkBufferDirty(epoch_buffer_old);
+
+			new_epoch_page = BufferGetPage(epoch_buffer_new);
+			if (PageIsNew(new_epoch_page))
+				EpochPageInit(new_epoch_page);
+			EpochSlotInitForInsert(new_epoch_page, new_offnum, fxid);
+			MarkBufferDirty(epoch_buffer_new);
+		}
+	}
+
 	/* XLOG stuff */
 	if (RelationNeedsWAL(relation))
 	{
@@ -4248,12 +4347,20 @@ l2:
 								 old_key_tuple,
 								 all_visible_cleared,
 								 all_visible_cleared_new,
-								 walLogical);
+								 walLogical,
+								 epoch_buffer_old, epoch_buffer_new);
 		if (newbuf != buffer)
 		{
 			PageSetLSN(newpage, recptr);
 		}
 		PageSetLSN(page, recptr);
+
+		/* XID64 EPOCH FORK: Set LSN on epoch page(s) for FPI tracking */
+		if (BufferIsValid(epoch_buffer_old))
+			PageSetLSN(BufferGetPage(epoch_buffer_old), recptr);
+		if (BufferIsValid(epoch_buffer_new) &&
+			epoch_buffer_new != epoch_buffer_old)
+			PageSetLSN(BufferGetPage(epoch_buffer_new), recptr);
 	}
 
 	END_CRIT_SECTION();
@@ -4261,6 +4368,36 @@ l2:
 	if (newbuf != buffer)
 		LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+	/*
+	 * XID64 EPOCH FORK: Unlock epoch buffers in reverse of lock order.
+	 * Lock order was ascending block number; unlock is descending.
+	 */
+	if (BufferIsValid(epoch_buffer_new) && epoch_buffer_new != epoch_buffer_old)
+	{
+		/* Two distinct buffers: unlock higher-numbered block first */
+		Buffer		epoch_unlock_first,
+					epoch_unlock_second;
+
+		if (BufferGetBlockNumber(epoch_buffer_old) <
+			BufferGetBlockNumber(epoch_buffer_new))
+		{
+			epoch_unlock_first = epoch_buffer_new;	/* higher block */
+			epoch_unlock_second = epoch_buffer_old;	/* lower block */
+		}
+		else
+		{
+			epoch_unlock_first = epoch_buffer_old;
+			epoch_unlock_second = epoch_buffer_new;
+		}
+		LockBuffer(epoch_unlock_first, BUFFER_LOCK_UNLOCK);
+		LockBuffer(epoch_unlock_second, BUFFER_LOCK_UNLOCK);
+	}
+	else if (BufferIsValid(epoch_buffer_old))
+	{
+		/* Same-page or no epoch_buffer_new: single unlock */
+		LockBuffer(epoch_buffer_old, BUFFER_LOCK_UNLOCK);
+	}
 
 	/*
 	 * Mark old tuple for invalidation from system caches at next command
@@ -4280,6 +4417,12 @@ l2:
 		ReleaseBuffer(vmbuffer_new);
 	if (BufferIsValid(vmbuffer))
 		ReleaseBuffer(vmbuffer);
+
+	/* XID64 EPOCH FORK: Release epoch buffer pins */
+	if (BufferIsValid(epoch_buffer_new) && epoch_buffer_new != epoch_buffer_old)
+		ReleaseBuffer(epoch_buffer_new);
+	if (BufferIsValid(epoch_buffer_old))
+		ReleaseBuffer(epoch_buffer_old);
 
 	/*
 	 * Release the lmgr tuple lock, if we had it.
@@ -8925,7 +9068,8 @@ log_heap_update(Relation reln, Buffer oldbuf,
 				Buffer newbuf, HeapTuple oldtup, HeapTuple newtup,
 				HeapTuple old_key_tuple,
 				bool all_visible_cleared, bool new_all_visible_cleared,
-				bool walLogical)
+				bool walLogical,
+				Buffer epoch_oldbuf, Buffer epoch_newbuf)
 {
 	xl_heap_update xlrec;
 	xl_heap_header xlhdr;
@@ -9053,6 +9197,62 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	XLogRegisterBuffer(0, newbuf, bufflags);
 	if (oldbuf != newbuf)
 		XLogRegisterBuffer(1, oldbuf, REGBUF_STANDARD);
+
+	/*
+	 * XID64 EPOCH FORK: Register epoch buffer(s) with slot update payloads.
+	 * Block ID 2 = epoch for old heap block (xmax).
+	 * Block ID 3 = epoch for new heap block (xmin), cross-page only.
+	 *
+	 * Same-page: two xl_epoch_slot_update records concatenated on block 2.
+	 * Cross-page: one record on block 2 (old xmax), one on block 3 (new xmin).
+	 */
+	if (BufferIsValid(epoch_oldbuf))
+	{
+		FullTransactionId fxid_wal = GetCurrentFullTransactionId();
+		xl_epoch_slot_update xlrec_old;
+
+		/* Old tuple: additive xmax */
+		xlrec_old.offnum = ItemPointerGetOffsetNumber(&oldtup->t_self);
+		xlrec_old.xmin_epoch = 0;
+		xlrec_old.xmax_epoch = EpochFromFullTransactionId(fxid_wal);
+		xlrec_old.epoch_flags = EPOCH_FLAG_XMAX_SET;
+		xlrec_old.is_whole_entry_reset = false;
+		xlrec_old.padding = 0;
+
+		XLogRegisterBuffer(2, epoch_oldbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(2, (char *) &xlrec_old, SizeOfEpochSlotUpdate);
+
+		if (oldbuf == newbuf || !BufferIsValid(epoch_newbuf))
+		{
+			/* Same-page: new tuple xmin also on block 2 */
+			xl_epoch_slot_update xlrec_new;
+
+			xlrec_new.offnum = ItemPointerGetOffsetNumber(&newtup->t_self);
+			xlrec_new.xmin_epoch = EpochFromFullTransactionId(fxid_wal);
+			xlrec_new.xmax_epoch = 0;
+			xlrec_new.epoch_flags = EPOCH_FLAG_XMIN_SET;
+			xlrec_new.is_whole_entry_reset = true;
+			xlrec_new.padding = 0;
+
+			XLogRegisterBufData(2, (char *) &xlrec_new, SizeOfEpochSlotUpdate);
+		}
+	}
+	if (BufferIsValid(epoch_newbuf) && epoch_newbuf != epoch_oldbuf)
+	{
+		/* Cross-page: new tuple xmin on block 3 */
+		FullTransactionId fxid_wal = GetCurrentFullTransactionId();
+		xl_epoch_slot_update xlrec_new;
+
+		xlrec_new.offnum = ItemPointerGetOffsetNumber(&newtup->t_self);
+		xlrec_new.xmin_epoch = EpochFromFullTransactionId(fxid_wal);
+		xlrec_new.xmax_epoch = 0;
+		xlrec_new.epoch_flags = EPOCH_FLAG_XMIN_SET;
+		xlrec_new.is_whole_entry_reset = true;
+		xlrec_new.padding = 0;
+
+		XLogRegisterBuffer(3, epoch_newbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(3, (char *) &xlrec_new, SizeOfEpochSlotUpdate);
+	}
 
 	XLogRegisterData(&xlrec, SizeOfHeapUpdate);
 

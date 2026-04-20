@@ -146,3 +146,184 @@ FROM epoch_xid_inspect('epoch_reuse_test'::regclass, 0)
 WHERE offnum = 1;
 
 DROP TABLE epoch_reuse_test;
+
+
+-- ======================================================
+-- Test e: Same-page non-HOT update epoch behavior
+-- ======================================================
+
+-- To guarantee a non-HOT update: create an index on the column being updated.
+-- Updating an indexed column prevents HOT optimization.
+-- Use a small tuple so it stays on the same page.
+CREATE TABLE epoch_update_test (id int, val int);
+CREATE INDEX epoch_update_test_val_idx ON epoch_update_test (val);
+INSERT INTO epoch_update_test VALUES (1, 100);
+
+-- Old slot should have XMIN_SET only
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_update_test'::regclass, 0) WHERE offnum = 1;
+
+-- Update the indexed column: forces non-HOT, but tuple is small so stays same-page
+UPDATE epoch_update_test SET val = 200 WHERE id = 1;
+
+-- Old slot (offnum 1) should now have XMIN_SET|XMAX_SET (flags = 3)
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_update_test'::regclass, 0) WHERE offnum = 1;
+
+-- New slot (offnum 2) should have XMIN_SET only (flags = 1), xmax_epoch = 0
+SELECT offnum, xmax_epoch, epoch_flags FROM epoch_xid_inspect('epoch_update_test'::regclass, 0) WHERE offnum = 2;
+
+DROP TABLE epoch_update_test;
+
+
+-- ======================================================
+-- Test f: Cross-page update epoch behavior
+-- ======================================================
+
+-- Strategy: fill page 0 nearly full with fixed-size rows, then update
+-- one row to be much larger so it cannot fit on the same page.
+-- Use non-compressible random-looking data to avoid TOAST compression.
+CREATE TABLE epoch_crosspage_test (id int, val bytea);
+
+-- Insert rows with 200-byte values to fill page 0
+INSERT INTO epoch_crosspage_test
+  SELECT g, decode(repeat(lpad(to_hex(g), 2, '0'), 100), 'hex')
+  FROM generate_series(1, 30) g;
+
+-- Verify materialized
+SELECT epoch_xid_relation_mode('epoch_crosspage_test'::regclass);
+
+-- Record original tuple location before update
+CREATE TEMP TABLE _xpage_before AS
+  SELECT ctid,
+         (ctid::text::point)[0]::int AS orig_page,
+         (ctid::text::point)[1]::int AS orig_offnum
+  FROM epoch_crosspage_test WHERE id = 1;
+
+-- Update row 1 with a large non-compressible value to force cross-page
+UPDATE epoch_crosspage_test
+  SET val = decode(repeat('deadbeef', 500), 'hex')
+  WHERE id = 1;
+
+-- Verify old tuple's epoch slot on its original page has XMIN_SET|XMAX_SET
+SELECT epoch_flags
+FROM epoch_xid_inspect('epoch_crosspage_test'::regclass,
+                       (SELECT orig_page FROM _xpage_before))
+WHERE offnum = (SELECT orig_offnum FROM _xpage_before);
+
+-- Verify new tuple landed on a DIFFERENT page than the original
+SELECT (ctid::text::point)[0]::int != (SELECT orig_page FROM _xpage_before)
+       AS moved_to_different_page
+FROM epoch_crosspage_test WHERE id = 1;
+
+-- Inspect the new tuple's epoch slot on its actual destination page.
+-- The new slot should have XMIN_SET only (flags = 1) with xmax_epoch = 0.
+SELECT epoch_flags, xmax_epoch
+FROM epoch_xid_inspect('epoch_crosspage_test'::regclass,
+                       (SELECT (ctid::text::point)[0]::int
+                        FROM epoch_crosspage_test WHERE id = 1))
+WHERE offnum = (SELECT (ctid::text::point)[1]::int
+                FROM epoch_crosspage_test WHERE id = 1);
+
+DROP TABLE _xpage_before;
+DROP TABLE epoch_crosspage_test;
+
+
+-- ======================================================
+-- Test g: HOT update produces same epoch behavior as non-HOT
+-- ======================================================
+
+CREATE TABLE epoch_hot_test (id int, val text);
+CREATE INDEX ON epoch_hot_test (id);
+INSERT INTO epoch_hot_test VALUES (1, 'original');
+
+-- Update non-indexed column to trigger HOT
+UPDATE epoch_hot_test SET val = 'hot-updated' WHERE id = 1;
+
+-- Old slot (offnum 1): XMIN_SET|XMAX_SET (flags = 3)
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_hot_test'::regclass, 0) WHERE offnum = 1;
+
+-- New slot (offnum 2): XMIN_SET only (flags = 1), xmax_epoch = 0
+SELECT offnum, xmax_epoch, epoch_flags FROM epoch_xid_inspect('epoch_hot_test'::regclass, 0) WHERE offnum = 2;
+
+DROP TABLE epoch_hot_test;
+
+
+-- ======================================================
+-- Test h: Implicit→materialized transition via UPDATE
+-- ======================================================
+
+CREATE TABLE epoch_implicit_update (id int, val text);
+-- Use COPY to insert rows without materializing the epoch fork
+COPY epoch_implicit_update FROM stdin;
+1	original
+2	also original
+\.
+
+-- Confirm implicit mode
+SELECT epoch_xid_relation_mode('epoch_implicit_update'::regclass);
+
+-- UPDATE should materialize the epoch fork
+UPDATE epoch_implicit_update SET val = 'updated' WHERE id = 1;
+
+-- Now materialized
+SELECT epoch_xid_relation_mode('epoch_implicit_update'::regclass);
+
+-- Old slot should have ONLY XMAX_SET (flags = 2), NOT XMIN_SET|XMAX_SET.
+-- This is correct: the old tuple was inserted via COPY before the epoch fork
+-- existed, so its xmin epoch was never recorded.  The update can only add
+-- xmax epoch.  EPOCH_FLAG_XMIN_SET absent means "xmin epoch unknown, use
+-- default epoch for reconstruction."
+-- New slot gets whole-entry-reset with XMIN_SET (flags = 1).
+SELECT offnum, epoch_flags
+FROM epoch_xid_inspect('epoch_implicit_update'::regclass, 0)
+WHERE epoch_flags != 0
+ORDER BY offnum;
+
+DROP TABLE epoch_implicit_update;
+
+
+-- ======================================================
+-- Test i: Update chain (INSERT + 3 UPDATEs)
+-- ======================================================
+
+CREATE TABLE epoch_chain_test (id int, val text);
+INSERT INTO epoch_chain_test VALUES (1, 'v1');
+UPDATE epoch_chain_test SET val = 'v2' WHERE id = 1;
+UPDATE epoch_chain_test SET val = 'v3' WHERE id = 1;
+UPDATE epoch_chain_test SET val = 'v4' WHERE id = 1;
+
+-- Slots 1-3 should have XMIN_SET|XMAX_SET (flags = 3)
+-- Slot 4 should have XMIN_SET only (flags = 1)
+SELECT offnum, epoch_flags
+FROM epoch_xid_inspect('epoch_chain_test'::regclass, 0)
+WHERE offnum <= 4
+ORDER BY offnum;
+
+DROP TABLE epoch_chain_test;
+
+
+-- ======================================================
+-- Test j: LP reuse after update-driven invalidation
+-- ======================================================
+
+CREATE TABLE epoch_update_reuse (id int);
+INSERT INTO epoch_update_reuse VALUES (1);
+UPDATE epoch_update_reuse SET id = 2 WHERE id = 1;
+
+-- Slot 1 now has xmax (flags = 3 from original insert + update)
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_update_reuse'::regclass, 0) WHERE offnum = 1;
+
+VACUUM epoch_update_reuse;
+
+-- Insert into reused slot: should get whole-slot-reset
+INSERT INTO epoch_update_reuse VALUES (3);
+
+-- Slot 1 should now have flags = 1 (XMIN_SET only), xmax_epoch = 0
+SELECT offnum, xmax_epoch, epoch_flags,
+       CASE WHEN epoch_flags = 1 THEN 'CLEAN'
+            WHEN epoch_flags = 3 THEN 'STALE (BUG)'
+            ELSE 'UNEXPECTED'
+       END AS slot_state
+FROM epoch_xid_inspect('epoch_update_reuse'::regclass, 0)
+WHERE offnum = 1;
+
+DROP TABLE epoch_update_reuse;
