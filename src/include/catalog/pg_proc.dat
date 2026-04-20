@@ -12769,4 +12769,21 @@
   proname => 'hashoid8extended', prorettype => 'int8',
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
+
+# XID64 EPOCH FORK: debug/inspection functions (v1 prototype)
+{ oid => '9901',
+  descr => 'inspect epoch fork slot data for a relation page',
+  proname => 'epoch_xid_inspect', prorows => '100', proretset => 't',
+  provolatile => 'v', prorettype => 'record',
+  proargtypes => 'regclass int4',
+  proallargtypes => '{regclass,int4,int4,int8,int8,int4,bool}',
+  proargmodes => '{i,i,o,o,o,o,o}',
+  proargnames => '{rel,blkno,offnum,xmin_epoch,xmax_epoch,epoch_flags,is_materialized}',
+  prosrc => 'epoch_xid_inspect' },
+{ oid => '9904',
+  descr => 'report epoch mode of a relation: materialized or implicit',
+  proname => 'epoch_xid_relation_mode', provolatile => 'v',
+  prorettype => 'text', proargtypes => 'regclass',
+  prosrc => 'epoch_xid_relation_mode' },
+
 ]

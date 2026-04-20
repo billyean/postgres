@@ -622,6 +622,30 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	is_system_catalog = IsSystemRelation(OldHeap);
 
 	/*
+	 * XID64 EPOCH FORK: Refuse to rewrite a relation that has a materialized
+	 * epoch fork.  Rewrite would discard authoritative epoch metadata because
+	 * the rewrite infrastructure creates new storage and copies tuples without
+	 * awareness of the epoch fork.
+	 *
+	 * Coverage: This check blocks rewrite-style operations that route through
+	 * heapam_relation_copy_for_cluster(), which is the heap AM implementation
+	 * of table_relation_copy_for_cluster().  The following core operations
+	 * have been verified to reach this function:
+	 *   - VACUUM FULL (via cluster_rel -> rebuild_relation -> copy_table_data)
+	 *   - CLUSTER (via cluster_rel -> rebuild_relation -> copy_table_data)
+	 *   - ALTER TABLE rewrite (via ATRewriteTable -> copy_table_data)
+	 * External tools that use the same table AM dispatch (e.g., pg_repack)
+	 * are expected to route here as well, but have not been independently
+	 * verified for this prototype.
+	 */
+	if (smgrexists(RelationGetSmgr(OldHeap), EPOCH_FORKNUM))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot rewrite table \"%s\" because it has a materialized epoch fork",
+						RelationGetRelationName(OldHeap)),
+				 errhint("Epoch fork v0 does not support VACUUM FULL, CLUSTER, or ALTER TABLE rewrite.")));
+
+	/*
 	 * Valid smgr_targblock implies something already wrote to the relation.
 	 * This may be harmless, but this function hasn't planned for it.
 	 */

@@ -15,12 +15,76 @@
 #include "postgres.h"
 
 #include "access/bufmask.h"
+#include "access/epoch_xid.h"
 #include "access/heapam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "storage/freespace.h"
 #include "storage/standby.h"
+
+
+/*
+ * XID64 EPOCH FORK: Replay epoch slot updates from WAL.
+ *
+ * Called from heap redo functions after the main heap page replay.
+ * epoch_block_id is the WAL block reference ID for the epoch buffer.
+ *
+ * In the FPI case, the full-page image is applied by XLogReadBufferForRedo
+ * and no further slot-level work is needed (BLK_RESTORED).
+ *
+ * In the non-FPI case (BLK_NEEDS_REDO), the xl_epoch_slot_update payload
+ * is extracted from the WAL record and applied to the epoch page via
+ * EpochRedoSlotUpdate().
+ *
+ * If the block reference does not exist in the WAL record, this is a no-op
+ * (the DML operation was performed without epoch metadata, e.g., the
+ * relation was in implicit default-epoch mode at the time).
+ */
+static void
+epoch_xlog_redo_block(XLogReaderState *record, uint8 epoch_block_id)
+{
+	Buffer		epoch_buf;
+	XLogRedoAction action;
+
+	if (!XLogRecHasBlockRef(record, epoch_block_id))
+		return;
+
+	action = XLogReadBufferForRedo(record, epoch_block_id, &epoch_buf);
+
+	if (action == BLK_NEEDS_REDO)
+	{
+		Page		epoch_page = BufferGetPage(epoch_buf);
+		char	   *data;
+		Size		datalen;
+
+		/* Initialize epoch page if needed (new page during recovery) */
+		if (PageIsNew(epoch_page))
+			EpochPageInit(epoch_page);
+
+		data = XLogRecGetBlockData(record, epoch_block_id, &datalen);
+
+		/*
+		 * Strict validation: the epoch slot payload is a fixed-size struct.
+		 * Any mismatch is a programming error or WAL corruption; do not
+		 * silently accept unexpected sizes.
+		 */
+		if (data == NULL || datalen != SizeOfEpochSlotUpdate)
+			elog(ERROR, "epoch slot WAL payload has unexpected size: "
+				 "expected %zu, got %zu (data %s)",
+				 (Size) SizeOfEpochSlotUpdate, datalen,
+				 data == NULL ? "NULL" : "present");
+
+		EpochRedoSlotUpdate(epoch_page,
+							(xl_epoch_slot_update *) data);
+
+		PageSetLSN(epoch_page, record->EndRecPtr);
+		MarkBufferDirty(epoch_buf);
+	}
+
+	if (BufferIsValid(epoch_buf))
+		UnlockReleaseBuffer(epoch_buf);
+}
 
 
 /*
@@ -357,6 +421,9 @@ heap_xlog_delete(XLogReaderState *record)
 	}
 	if (BufferIsValid(buffer))
 		UnlockReleaseBuffer(buffer);
+
+	/* XID64 EPOCH FORK: Replay epoch slot update (block 1) */
+	epoch_xlog_redo_block(record, 1);
 }
 
 /*
@@ -483,9 +550,10 @@ heap_xlog_insert(XLogReaderState *record)
 	 */
 	if (action == BLK_NEEDS_REDO && freespace < BLCKSZ / 5)
 		XLogRecordPageWithFreeSpace(target_locator, blkno, freespace);
-}
 
-/*
+	/* XID64 EPOCH FORK: Replay epoch slot update (block 1) */
+	epoch_xlog_redo_block(record, 1);
+}/*
  * Replay XLOG_HEAP2_MULTI_INSERT records.
  */
 static void

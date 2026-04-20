@@ -339,6 +339,20 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		}
 	}
 
+	/* Prepare for truncation of the epoch fork too if it exists */
+	if (smgrexists(RelationGetSmgr(rel), EPOCH_FORKNUM))
+	{
+		BlockNumber epoch_nblocks = smgrnblocks(reln, EPOCH_FORKNUM);
+
+		if (epoch_nblocks > nblocks)
+		{
+			forks[nforks] = EPOCH_FORKNUM;
+			old_blocks[nforks] = epoch_nblocks;
+			blocks[nforks] = nblocks;
+			nforks++;
+		}
+	}
+
 	RelationPreTruncate(rel);
 
 	/*
@@ -1067,6 +1081,26 @@ smgr_redo(XLogReaderState *record)
 			{
 				forks[nforks] = VISIBILITYMAP_FORKNUM;
 				old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
+				nforks++;
+			}
+		}
+
+		/*
+		 * XID64 EPOCH FORK: Truncate the epoch fork if it exists and the
+		 * WAL record indicates it should be truncated.  The epoch fork
+		 * uses 1:1 block mapping with the heap, so the truncation target
+		 * is the same block number as the heap truncation target.
+		 */
+		if ((xlrec->flags & SMGR_TRUNCATE_EPOCH) != 0 &&
+			smgrexists(reln, EPOCH_FORKNUM))
+		{
+			BlockNumber epoch_nblocks = smgrnblocks(reln, EPOCH_FORKNUM);
+
+			if (epoch_nblocks > xlrec->blkno)
+			{
+				forks[nforks] = EPOCH_FORKNUM;
+				old_blocks[nforks] = epoch_nblocks;
+				blocks[nforks] = xlrec->blkno;
 				nforks++;
 			}
 		}

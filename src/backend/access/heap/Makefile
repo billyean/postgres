@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	epoch_xid.o \
 	heapam.o \
 	heapam_handler.o \
 	heapam_indexscan.o \

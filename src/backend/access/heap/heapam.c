@@ -31,6 +31,7 @@
  */
 #include "postgres.h"
 
+#include "access/epoch_xid.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/hio.h"
@@ -50,6 +51,7 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
@@ -2009,6 +2011,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	Buffer		buffer;
 	Page		page;
 	Buffer		vmbuffer = InvalidBuffer;
+	Buffer		epoch_buffer = InvalidBuffer;
 	bool		all_visible_cleared = false;
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
@@ -2035,6 +2038,14 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 									   0);
 
 	page = BufferGetPage(buffer);
+
+	/*
+	 * XID64 EPOCH FORK: Pin epoch buffer before critical section.
+	 * This may create the epoch fork (transitioning the relation from
+	 * implicit default-epoch mode to materialized epoch mode) and/or
+	 * extend it to cover this heap block.
+	 */
+	EpochPinBuffer(relation, BufferGetBlockNumber(buffer), &epoch_buffer);
 
 	/*
 	 * We're about to do the actual insert -- but check for conflict first, to
@@ -2085,6 +2096,30 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		PageSetPrunable(page, xid);
 
 	MarkBufferDirty(buffer);
+
+	/*
+	 * XID64 EPOCH FORK: Initialize the epoch slot for this tuple.
+	 * Uses whole-entry write to prevent stale state from a prior
+	 * occupant of this OffsetNumber (LP reuse after prune/vacuum).
+	 * Once the relation is in materialized epoch mode, every insert
+	 * must maintain epoch state; silent fallback is not allowed.
+	 */
+	if (BufferIsValid(epoch_buffer))
+	{
+		FullTransactionId fxid = GetCurrentFullTransactionId();
+		Page		epoch_page;
+
+		LockBuffer(epoch_buffer, BUFFER_LOCK_EXCLUSIVE);
+		epoch_page = BufferGetPage(epoch_buffer);
+
+		if (PageIsNew(epoch_page))
+			EpochPageInit(epoch_page);
+
+		EpochSlotInitForInsert(epoch_page,
+							   ItemPointerGetOffsetNumber(&heaptup->t_self),
+							   fxid);
+		MarkBufferDirty(epoch_buffer);
+	}
 
 	/* XLOG stuff */
 	if (RelationNeedsWAL(relation))
@@ -2156,12 +2191,43 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 							(char *) heaptup->t_data + SizeofHeapTupleHeader,
 							heaptup->t_len - SizeofHeapTupleHeader);
 
+		/*
+		 * XID64 EPOCH FORK: Register epoch buffer with its slot update
+		 * payload.  The FPI mechanism handles the first-modification-after-
+		 * checkpoint case.  For subsequent modifications within the same
+		 * checkpoint cycle (non-FPI case), the xl_epoch_slot_update data
+		 * provides the delta that redo applies to reconstruct the slot.
+		 *
+		 * Without this BufData, redo would get BLK_NEEDS_REDO with NULL
+		 * data, making the epoch change unrecoverable in non-FPI cases.
+		 */
+		if (BufferIsValid(epoch_buffer))
+		{
+			xl_epoch_slot_update epoch_xlrec;
+			FullTransactionId fxid_wal = GetCurrentFullTransactionId();
+
+			epoch_xlrec.offnum = ItemPointerGetOffsetNumber(&heaptup->t_self);
+			epoch_xlrec.xmin_epoch = EpochFromFullTransactionId(fxid_wal);
+			epoch_xlrec.xmax_epoch = 0;
+			epoch_xlrec.epoch_flags = EPOCH_FLAG_XMIN_SET;
+			epoch_xlrec.is_whole_entry_reset = true;
+			epoch_xlrec.padding = 0;
+
+			XLogRegisterBuffer(1, epoch_buffer, REGBUF_STANDARD);
+			XLogRegisterBufData(1, (char *) &epoch_xlrec,
+								SizeOfEpochSlotUpdate);
+		}
+
 		/* filtering by origin on a row level is much more efficient */
 		XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
 		recptr = XLogInsert(RM_HEAP_ID, info);
 
 		PageSetLSN(page, recptr);
+
+		/* XID64 EPOCH FORK: Set LSN on epoch page for FPI tracking */
+		if (BufferIsValid(epoch_buffer))
+			PageSetLSN(BufferGetPage(epoch_buffer), recptr);
 	}
 
 	END_CRIT_SECTION();
@@ -2169,6 +2235,13 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	UnlockReleaseBuffer(buffer);
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
+
+	/* XID64 EPOCH FORK: Release epoch buffer */
+	if (BufferIsValid(epoch_buffer))
+	{
+		LockBuffer(epoch_buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(epoch_buffer);
+	}
 
 	/*
 	 * If tuple is cacheable, mark it for invalidation from the caches in case
@@ -2301,6 +2374,24 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
 
 	AssertHasSnapshotForToast(relation);
+
+	/*
+	 * XID64 EPOCH FORK: If this relation has a materialized epoch fork,
+	 * refuse to proceed.  heap_multi_insert does not yet maintain epoch
+	 * metadata, and silently skipping writes into authoritative state
+	 * would produce tuples with missing epoch data in a relation that
+	 * has already committed to the materialized epoch contract.
+	 *
+	 * This is allowed only because the relation may still be in implicit
+	 * default-epoch mode (no epoch fork exists).  Once epoch
+	 * materialization has occurred, silent fallback is not allowed.
+	 */
+	if (smgrexists(RelationGetSmgr(relation), EPOCH_FORKNUM))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("heap_multi_insert not supported for epoch-materialized relation \"%s\"",
+						RelationGetRelationName(relation)),
+				 errhint("Epoch fork v0 does not support bulk insert (COPY) for relations with materialized epoch metadata.")));
 
 	needwal = RelationNeedsWAL(relation);
 	saveFreeSpace = RelationGetTargetPageFreeSpace(relation,
@@ -2726,6 +2817,7 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	BlockNumber block;
 	Buffer		buffer;
 	Buffer		vmbuffer = InvalidBuffer;
+	Buffer		epoch_buffer_del = InvalidBuffer;
 	TransactionId new_xmax;
 	uint16		new_infomask,
 				new_infomask2;
@@ -2983,6 +3075,13 @@ l1:
 							  xid, LockTupleExclusive, true,
 							  &new_xmax, &new_infomask, &new_infomask2);
 
+	/*
+	 * XID64 EPOCH FORK: Pin epoch buffer before critical section.
+	 * Only if the relation is in materialized epoch mode.
+	 */
+	if (EpochRelationIsMaterialized(relation))
+		EpochPinBuffer(relation, block, &epoch_buffer_del);
+
 	START_CRIT_SECTION();
 
 	/*
@@ -3018,6 +3117,27 @@ l1:
 		HeapTupleHeaderSetMovedPartitions(tp.t_data);
 
 	MarkBufferDirty(buffer);
+
+	/*
+	 * XID64 EPOCH FORK: Set xmax epoch on the deleted tuple's slot.
+	 * This is an additive write (does not clear xmin state).
+	 * Only if the relation is in materialized epoch mode.
+	 */
+	if (BufferIsValid(epoch_buffer_del))
+	{
+		FullTransactionId fxid = GetCurrentFullTransactionId();
+		Page		epoch_page;
+
+		LockBuffer(epoch_buffer_del, BUFFER_LOCK_EXCLUSIVE);
+		epoch_page = BufferGetPage(epoch_buffer_del);
+
+		if (PageIsNew(epoch_page))
+			EpochPageInit(epoch_page);
+
+		EpochSlotSetXmax(epoch_page,
+						 ItemPointerGetOffsetNumber(&tp.t_self), fxid);
+		MarkBufferDirty(epoch_buffer_del);
+	}
 
 	/*
 	 * XLOG stuff
@@ -3071,6 +3191,24 @@ l1:
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
 
+		/* XID64 EPOCH FORK: Register epoch buffer with slot update payload */
+		if (BufferIsValid(epoch_buffer_del))
+		{
+			xl_epoch_slot_update epoch_xlrec;
+			FullTransactionId fxid_wal = GetCurrentFullTransactionId();
+
+			epoch_xlrec.offnum = ItemPointerGetOffsetNumber(&tp.t_self);
+			epoch_xlrec.xmin_epoch = 0;
+			epoch_xlrec.xmax_epoch = EpochFromFullTransactionId(fxid_wal);
+			epoch_xlrec.epoch_flags = EPOCH_FLAG_XMAX_SET;
+			epoch_xlrec.is_whole_entry_reset = false;
+			epoch_xlrec.padding = 0;
+
+			XLogRegisterBuffer(1, epoch_buffer_del, REGBUF_STANDARD);
+			XLogRegisterBufData(1, (char *) &epoch_xlrec,
+								SizeOfEpochSlotUpdate);
+		}
+
 		/*
 		 * Log replica identity of the deleted tuple if there is one
 		 */
@@ -3093,6 +3231,10 @@ l1:
 		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_DELETE);
 
 		PageSetLSN(page, recptr);
+
+		/* XID64 EPOCH FORK: Set LSN on epoch page */
+		if (BufferIsValid(epoch_buffer_del))
+			PageSetLSN(BufferGetPage(epoch_buffer_del), recptr);
 	}
 
 	END_CRIT_SECTION();
@@ -3101,6 +3243,13 @@ l1:
 
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
+
+	/* XID64 EPOCH FORK: Release epoch buffer */
+	if (BufferIsValid(epoch_buffer_del))
+	{
+		LockBuffer(epoch_buffer_del, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(epoch_buffer_del);
+	}
 
 	/*
 	 * If the tuple has toasted out-of-line attributes, we need to delete
