@@ -261,6 +261,75 @@ ok($upd_flags > 0,
 
 $node->safe_psql('postgres', 'DROP TABLE epoch_implicit_upd_rec');
 
+# ============================================================
+# Test 7: Phase 3 — interpretation function stable after recovery
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_interp_recovery (id int, val text);
+INSERT INTO epoch_interp_recovery VALUES (1, 'test');
+});
+
+# Verify interpretation before crash
+my $interp_before = $node->safe_psql('postgres',
+	"SELECT xmin_interp, xmax_interp, relation_mode
+	 FROM epoch_xid_tuple_visibility_info('epoch_interp_recovery'::regclass, '(0,1)'::tid)");
+is($interp_before, 'materialized|invalid_unset|materialized',
+	'Phase 3: interpretation correct before crash');
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->safe_psql('postgres',
+	"DELETE FROM epoch_interp_recovery WHERE id = 1");
+
+# Crash
+$node->stop('immediate');
+$node->start;
+
+# After recovery: interpretation should show materialized xmax
+my $interp_after = $node->safe_psql('postgres',
+	"SELECT xmin_interp, xmax_interp, relation_mode
+	 FROM epoch_xid_tuple_visibility_info('epoch_interp_recovery'::regclass, '(0,1)'::tid)");
+is($interp_after, 'materialized|materialized|materialized',
+	'Phase 3: interpretation stable after crash/recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_interp_recovery');
+
+# ============================================================
+# Test 8: Phase 3 — implicit/materialized distinction after restart
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_mode_recovery_a (id int);
+CREATE TABLE epoch_mode_recovery_b (id int);
+});
+
+# Table A: implicit (COPY only)
+$node->safe_psql('postgres',
+	"COPY epoch_mode_recovery_a FROM stdin;\n1\n\\.\n");
+
+# Table B: materialized (INSERT)
+$node->safe_psql('postgres',
+	"INSERT INTO epoch_mode_recovery_b VALUES (1)");
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+
+# Crash
+$node->stop('immediate');
+$node->start;
+
+# Verify modes survived recovery
+my $mode_a = $node->safe_psql('postgres',
+	"SELECT relation_mode FROM epoch_xid_tuple_visibility_info('epoch_mode_recovery_a'::regclass, '(0,1)'::tid)");
+is($mode_a, 'implicit',
+	'Phase 3: implicit relation stays implicit after recovery');
+
+my $mode_b = $node->safe_psql('postgres',
+	"SELECT relation_mode FROM epoch_xid_tuple_visibility_info('epoch_mode_recovery_b'::regclass, '(0,1)'::tid)");
+is($mode_b, 'materialized',
+	'Phase 3: materialized relation stays materialized after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_mode_recovery_a, epoch_mode_recovery_b');
+
 $node->stop;
 
 done_testing();

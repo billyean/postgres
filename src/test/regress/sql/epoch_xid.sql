@@ -327,3 +327,126 @@ FROM epoch_xid_inspect('epoch_update_reuse'::regclass, 0)
 WHERE offnum = 1;
 
 DROP TABLE epoch_update_reuse;
+
+
+-- ======================================================
+-- Phase 3: Read-side interpretation tests
+-- ======================================================
+
+-- Test k: Materialized tuple → 'materialized' interpretation
+CREATE TABLE epoch_interp_mat (id int, val text);
+INSERT INTO epoch_interp_mat VALUES (1, 'hello');
+
+SELECT full_xmin > 0 AS has_xmin, full_xmax, xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_interp_mat'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_mat;
+
+-- Test l: Materialized tuple after DELETE → 'materialized' xmax
+CREATE TABLE epoch_interp_del (id int);
+INSERT INTO epoch_interp_del VALUES (1);
+DELETE FROM epoch_interp_del WHERE id = 1;
+
+-- Use ctid (0,1) which is the now-dead-but-still-LP_NORMAL tuple
+SELECT xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_interp_del'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_del;
+
+-- Test m: Implicit-mode tuple → 'implicit_default'
+CREATE TABLE epoch_interp_implicit (id int, val text);
+COPY epoch_interp_implicit FROM stdin;
+1	implicit row
+\.
+
+SELECT full_xmin > 0 AS has_xmin, xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_interp_implicit'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_implicit;
+
+-- Test n: Mixed old-slot from implicit→materialized-via-UPDATE
+CREATE TABLE epoch_interp_mixed (id int, val text);
+COPY epoch_interp_mixed FROM stdin;
+1	before materialization
+\.
+
+UPDATE epoch_interp_mixed SET val = 'after materialization' WHERE id = 1;
+
+-- Old slot (0,1): xmin should be implicit_default, xmax materialized
+SELECT xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_interp_mixed'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_mixed;
+
+-- Test o: Frozen tuple → xmin_interp = 'frozen'
+CREATE TABLE epoch_interp_frozen (id int);
+INSERT INTO epoch_interp_frozen VALUES (1);
+VACUUM FREEZE epoch_interp_frozen;
+
+SELECT full_xmin, xmin_interp, xmax_interp
+FROM epoch_xid_tuple_visibility_info('epoch_interp_frozen'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_frozen;
+
+-- Test p: Live tuple unset xmax → 'invalid_unset'
+CREATE TABLE epoch_interp_live (id int);
+INSERT INTO epoch_interp_live VALUES (1);
+
+SELECT full_xmax, xmax_interp
+FROM epoch_xid_tuple_visibility_info('epoch_interp_live'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_live;
+
+-- Test q: Non-LP_NORMAL → ERROR
+CREATE TABLE epoch_interp_lpdead (id int);
+INSERT INTO epoch_interp_lpdead VALUES (1);
+DELETE FROM epoch_interp_lpdead WHERE id = 1;
+VACUUM epoch_interp_lpdead;
+
+-- After VACUUM, slot (0,1) should be LP_UNUSED or LP_DEAD
+-- This should raise ERROR
+SELECT * FROM epoch_xid_tuple_visibility_info('epoch_interp_lpdead'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_interp_lpdead;
+
+-- Test r: Update chain intermediate tuple → both materialized
+CREATE TABLE epoch_interp_chain (id int, val text);
+INSERT INTO epoch_interp_chain VALUES (1, 'v1');
+UPDATE epoch_interp_chain SET val = 'v2' WHERE id = 1;
+UPDATE epoch_interp_chain SET val = 'v3' WHERE id = 1;
+
+-- Slot (0,2) is the intermediate: xmin from first update, xmax from second
+SELECT xmin_interp, xmax_interp
+FROM epoch_xid_tuple_visibility_info('epoch_interp_chain'::regclass, '(0,2)'::tid);
+
+DROP TABLE epoch_interp_chain;
+
+
+-- Test s: Materialized relation with per-slot fallback to implicit_default
+-- This proves the per-slot-absence prototype rule: within a materialized
+-- relation, slots that were never explicitly written fall back to
+-- implicit_default interpretation rather than claiming materialized state.
+CREATE TABLE epoch_interp_fallback (id int, val text);
+
+-- Insert row 1 via COPY (does not write epoch metadata)
+COPY epoch_interp_fallback FROM stdin;
+1	pre-materialization row
+\.
+
+-- Insert row 2 via regular INSERT (materializes the epoch fork)
+INSERT INTO epoch_interp_fallback VALUES (2, 'materializer');
+
+-- Now: relation is materialized, but slot for (0,1) has flags=0
+-- (COPY did not write epoch data, only INSERT into slot 2 did)
+SELECT relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_interp_fallback'::regclass, '(0,1)'::tid);
+
+-- Row 1 should get implicit_default interpretation despite materialized mode
+SELECT xmin_interp, xmax_interp
+FROM epoch_xid_tuple_visibility_info('epoch_interp_fallback'::regclass, '(0,1)'::tid);
+
+-- Row 2 (the materializer) should get materialized interpretation
+SELECT xmin_interp, xmax_interp
+FROM epoch_xid_tuple_visibility_info('epoch_interp_fallback'::regclass, '(0,2)'::tid);
+
+DROP TABLE epoch_interp_fallback;

@@ -213,4 +213,52 @@ typedef struct xl_epoch_slot_update
 extern void EpochRedoSlotUpdate(Page epochPage,
 								xl_epoch_slot_update *xlrec);
 
+/* ---------- Read-side interpretation (Phase 3) ---------- */
+
+/*
+ * Interpretation mode for a single xmin or xmax field.
+ * Indicates the source/method used to produce the full xid value.
+ */
+typedef enum EpochInterpMode
+{
+	EPOCH_INTERP_MATERIALIZED,			/* from explicit epoch slot data */
+	EPOCH_INTERP_IMPLICIT_DEFAULT,		/* from EPOCH_DEFAULT_VALUE (slot absent/unset) */
+	EPOCH_INTERP_FROZEN,				/* HEAP_XMIN_FROZEN; epoch irrelevant */
+	EPOCH_INTERP_INVALID,				/* TransactionId is invalid (0) */
+	EPOCH_INTERP_INVALID_UNSET,			/* xmax: HEAP_XMAX_INVALID is set */
+	EPOCH_INTERP_MULTIXACT_UNSUPPORTED	/* xmax: HEAP_XMAX_IS_MULTI; cannot interpret */
+} EpochInterpMode;
+
+/*
+ * Full interpretation result for one tuple's xmin and xmax.
+ */
+typedef struct EpochTupleInterpResult
+{
+	FullTransactionId full_xmin;
+	FullTransactionId full_xmax;
+	EpochInterpMode xmin_interp;
+	EpochInterpMode xmax_interp;
+} EpochTupleInterpResult;
+
+/*
+ * EpochInterpretTuple -- produce a full xid interpretation for one tuple.
+ *
+ * htup: the heap tuple header (must be from an LP_NORMAL line pointer)
+ * slot: pointer to the epoch slot data, or NULL if:
+ *       - relation is in implicit mode (no epoch fork)
+ *       - epoch page is uninitialized (PageIsNew)
+ *       - offnum exceeds the epoch page's num_slots high-water mark
+ * relation_is_materialized: whether the epoch fork exists for the relation
+ *
+ * This function does NOT raise ERROR for any input state.  It always
+ * produces a result, using IMPLICIT_DEFAULT or MULTIXACT_UNSUPPORTED
+ * labels where authoritative interpretation is not possible.
+ */
+extern EpochTupleInterpResult
+EpochInterpretTuple(HeapTupleHeader htup, EpochSlotData *slot,
+					bool relation_is_materialized);
+
+/* Return the text label for an EpochInterpMode value */
+extern const char *EpochInterpModeString(EpochInterpMode mode);
+
 #endif							/* EPOCH_XID_H */

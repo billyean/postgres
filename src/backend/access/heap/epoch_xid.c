@@ -368,6 +368,104 @@ EpochRedoSlotUpdate(Page epochPage, xl_epoch_slot_update *xlrec)
 
 
 /* ----------------------------------------------------------------
+ *	Read-side interpretation (Phase 3)
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * EpochInterpModeString -- return text label for an interpretation mode.
+ */
+const char *
+EpochInterpModeString(EpochInterpMode mode)
+{
+	switch (mode)
+	{
+		case EPOCH_INTERP_MATERIALIZED:
+			return "materialized";
+		case EPOCH_INTERP_IMPLICIT_DEFAULT:
+			return "implicit_default";
+		case EPOCH_INTERP_FROZEN:
+			return "frozen";
+		case EPOCH_INTERP_INVALID:
+			return "invalid";
+		case EPOCH_INTERP_INVALID_UNSET:
+			return "invalid_unset";
+		case EPOCH_INTERP_MULTIXACT_UNSUPPORTED:
+			return "multixact_unsupported";
+	}
+	return "unknown";
+}
+
+/*
+ * EpochInterpretTuple -- produce full xid interpretation for one tuple.
+ *
+ * See epoch_xid.h for the full contract.  This function never raises ERROR.
+ */
+EpochTupleInterpResult
+EpochInterpretTuple(HeapTupleHeader htup, EpochSlotData *slot,
+					bool relation_is_materialized)
+{
+	EpochTupleInterpResult result;
+	TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
+	TransactionId xmax = HeapTupleHeaderGetRawXmax(htup);
+
+	/* --- xmin interpretation --- */
+
+	if (htup->t_infomask & HEAP_XMIN_FROZEN)
+	{
+		result.full_xmin = FullTransactionIdFromEpochAndXid(0, FrozenTransactionId);
+		result.xmin_interp = EPOCH_INTERP_FROZEN;
+	}
+	else if (!TransactionIdIsValid(xmin))
+	{
+		result.full_xmin = InvalidFullTransactionId;
+		result.xmin_interp = EPOCH_INTERP_INVALID;
+	}
+	else if (slot != NULL && (slot->epoch_flags & EPOCH_FLAG_XMIN_SET))
+	{
+		result.full_xmin = FullTransactionIdFromEpochAndXid(slot->xmin_epoch, xmin);
+		result.xmin_interp = EPOCH_INTERP_MATERIALIZED;
+	}
+	else
+	{
+		result.full_xmin = FullTransactionIdFromEpochAndXid(EPOCH_DEFAULT_VALUE, xmin);
+		result.xmin_interp = EPOCH_INTERP_IMPLICIT_DEFAULT;
+	}
+
+	/* --- xmax interpretation --- */
+
+	if (htup->t_infomask & HEAP_XMAX_INVALID)
+	{
+		result.full_xmax = InvalidFullTransactionId;
+		result.xmax_interp = EPOCH_INTERP_INVALID_UNSET;
+	}
+	else if (htup->t_infomask & HEAP_XMAX_IS_MULTI)
+	{
+		/* Read path: report unsupported, do not ERROR */
+		result.full_xmax = InvalidFullTransactionId;
+		result.xmax_interp = EPOCH_INTERP_MULTIXACT_UNSUPPORTED;
+	}
+	else if (!TransactionIdIsValid(xmax))
+	{
+		result.full_xmax = InvalidFullTransactionId;
+		result.xmax_interp = EPOCH_INTERP_INVALID;
+	}
+	else if (slot != NULL && (slot->epoch_flags & EPOCH_FLAG_XMAX_SET))
+	{
+		result.full_xmax = FullTransactionIdFromEpochAndXid(slot->xmax_epoch, xmax);
+		result.xmax_interp = EPOCH_INTERP_MATERIALIZED;
+	}
+	else
+	{
+		result.full_xmax = FullTransactionIdFromEpochAndXid(EPOCH_DEFAULT_VALUE, xmax);
+		result.xmax_interp = EPOCH_INTERP_IMPLICIT_DEFAULT;
+	}
+
+	return result;
+}
+
+
+/* ----------------------------------------------------------------
  *	SQL-callable debug/inspection functions
  *
  *	These are for development and testing of the epoch fork prototype.
@@ -519,4 +617,134 @@ epoch_xid_relation_mode(PG_FUNCTION_ARGS)
 		PG_RETURN_TEXT_P(cstring_to_text("materialized"));
 	else
 		PG_RETURN_TEXT_P(cstring_to_text("implicit"));
+}
+
+/*
+ * epoch_xid_tuple_visibility_info(regclass, tid) RETURNS TABLE(...)
+ *
+ * Phase 3 read-side inspection function.  Returns a structured
+ * interpretation of one tuple's full xid state with explicit mode labels.
+ *
+ * This is a narrow debug/inspection function.  It does NOT change query
+ * semantics and does NOT integrate with executor-level visibility.
+ *
+ * Raises ERROR if the target TID is not LP_NORMAL.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_tuple_visibility_info);
+
+Datum
+epoch_xid_tuple_visibility_info(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ItemPointer tid = (ItemPointer) PG_GETARG_POINTER(1);
+	Relation	rel;
+	Buffer		heapbuf;
+	Page		heappage;
+	ItemId		lp;
+	HeapTupleHeader htup;
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	bool		is_materialized;
+	EpochSlotData *slot = NULL;
+	Buffer		epochbuf = InvalidBuffer;
+	EpochTupleInterpResult interp;
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
+	HeapTuple	result_tuple;
+
+	blkno = ItemPointerGetBlockNumber(tid);
+	offnum = ItemPointerGetOffsetNumber(tid);
+
+	rel = table_open(relid, AccessShareLock);
+
+	/* Read heap buffer */
+	heapbuf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno,
+								 RBM_NORMAL, NULL);
+	LockBuffer(heapbuf, BUFFER_LOCK_SHARE);
+	heappage = BufferGetPage(heapbuf);
+
+	/* Validate offset is in range */
+	if (offnum < 1 || offnum > PageGetMaxOffsetNumber(heappage))
+	{
+		UnlockReleaseBuffer(heapbuf);
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("offset number %u is out of range for page %u",
+						offnum, blkno)));
+	}
+
+	/* Check line pointer state — must be LP_NORMAL */
+	lp = PageGetItemId(heappage, offnum);
+	if (!ItemIdIsNormal(lp))
+	{
+		const char *lp_state;
+
+		if (ItemIdIsDead(lp))
+			lp_state = "LP_DEAD";
+		else if (ItemIdIsRedirected(lp))
+			lp_state = "LP_REDIRECT";
+		else
+			lp_state = "LP_UNUSED";
+
+		UnlockReleaseBuffer(heapbuf);
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot inspect tuple at (%u,%u): line pointer is %s",
+						blkno, offnum, lp_state)));
+	}
+
+	htup = (HeapTupleHeader) PageGetItem(heappage, lp);
+
+	/* Determine relation epoch mode */
+	is_materialized = EpochRelationIsMaterialized(rel);
+
+	/* If materialized, read epoch slot */
+	if (is_materialized)
+	{
+		epochbuf = EpochReadBuffer(rel, blkno, false);
+		if (BufferIsValid(epochbuf))
+		{
+			Page		epochpage;
+			EpochPageOpaque opaque;
+
+			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
+			epochpage = BufferGetPage(epochbuf);
+
+			if (!PageIsNew(epochpage))
+			{
+				opaque = EpochPageGetOpaque(epochpage);
+				if (offnum <= opaque->num_slots)
+					slot = EpochGetSlot(epochpage, offnum);
+				/* else: offnum beyond high-water mark, slot stays NULL */
+			}
+			/* else: PageIsNew, slot stays NULL (per-slot-absence rule) */
+		}
+		/* else: epoch block doesn't exist yet for this heap block, slot NULL */
+	}
+
+	/* Interpret */
+	interp = EpochInterpretTuple(htup, slot, is_materialized);
+
+	/* Release buffers */
+	if (BufferIsValid(epochbuf))
+		UnlockReleaseBuffer(epochbuf);
+	UnlockReleaseBuffer(heapbuf);
+	table_close(rel, AccessShareLock);
+
+	/* Build result tuple */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) U64FromFullTransactionId(interp.full_xmin));
+	values[1] = Int64GetDatum((int64) U64FromFullTransactionId(interp.full_xmax));
+	values[2] = CStringGetTextDatum(EpochInterpModeString(interp.xmin_interp));
+	values[3] = CStringGetTextDatum(EpochInterpModeString(interp.xmax_interp));
+	values[4] = CStringGetTextDatum(is_materialized ? "materialized" : "implicit");
+
+	result_tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
 }

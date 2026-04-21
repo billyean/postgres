@@ -12786,4 +12786,13 @@
   prorettype => 'text', proargtypes => 'regclass',
   prosrc => 'epoch_xid_relation_mode' },
 
+{ oid => '9905',
+  descr => 'interpret epoch-backed full xid state for a tuple',
+  proname => 'epoch_xid_tuple_visibility_info', provolatile => 'v',
+  prorettype => 'record', proargtypes => 'regclass tid',
+  proallargtypes => '{regclass,tid,int8,int8,text,text,text}',
+  proargmodes => '{i,i,o,o,o,o,o}',
+  proargnames => '{rel,tid,full_xmin,full_xmax,xmin_interp,xmax_interp,relation_mode}',
+  prosrc => 'epoch_xid_tuple_visibility_info' },
+
 ]
