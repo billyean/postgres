@@ -330,6 +330,70 @@ is($mode_b, 'materialized',
 
 $node->safe_psql('postgres', 'DROP TABLE epoch_mode_recovery_a, epoch_mode_recovery_b');
 
+# ============================================================
+# Test 9: Phase 4 — txn-state classification stable after recovery
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_txnstate_recovery (id int);
+INSERT INTO epoch_txnstate_recovery VALUES (1);
+DELETE FROM epoch_txnstate_recovery WHERE id = 1;
+});
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $ts_after = $node->safe_psql('postgres',
+	"SELECT tuple_state FROM epoch_xid_tuple_txn_state_info('epoch_txnstate_recovery'::regclass, '(0,1)'::tid)");
+is($ts_after, 'dead_committed',
+	'Phase 4: dead_committed classification stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_txnstate_recovery');
+
+# ============================================================
+# Test 10: Phase 4 — live_committed stable after recovery
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_txnlive_recovery (id int);
+INSERT INTO epoch_txnlive_recovery VALUES (1);
+});
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $live_state = $node->safe_psql('postgres',
+	"SELECT tuple_state, relation_mode
+	 FROM epoch_xid_tuple_txn_state_info('epoch_txnlive_recovery'::regclass, '(0,1)'::tid)");
+is($live_state, 'live_committed|materialized',
+	'Phase 4: live_committed + materialized stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_txnlive_recovery');
+
+# ============================================================
+# Test 11: Phase 4 — implicit mode classification after restart
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_txn_implicit_rec (id int);
+});
+$node->safe_psql('postgres',
+	"COPY epoch_txn_implicit_rec FROM stdin;\n1\n\\.\n");
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $implicit_state = $node->safe_psql('postgres',
+	"SELECT tuple_state, relation_mode
+	 FROM epoch_xid_tuple_txn_state_info('epoch_txn_implicit_rec'::regclass, '(0,1)'::tid)");
+is($implicit_state, 'live_committed|implicit',
+	'Phase 4: implicit mode classification stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_txn_implicit_rec');
+
 $node->stop;
 
 done_testing();

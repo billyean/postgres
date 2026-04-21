@@ -450,3 +450,115 @@ SELECT xmin_interp, xmax_interp
 FROM epoch_xid_tuple_visibility_info('epoch_interp_fallback'::regclass, '(0,2)'::tid);
 
 DROP TABLE epoch_interp_fallback;
+
+
+-- ======================================================
+-- Phase 4: Transaction-state classification tests
+-- ======================================================
+
+-- Test t1: Committed live tuple
+CREATE TABLE epoch_txn_live (id int);
+INSERT INTO epoch_txn_live VALUES (1);
+
+SELECT xmin_status, xmax_status, tuple_state, relation_mode
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_live'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_live;
+
+-- Test t2: Dead committed tuple
+CREATE TABLE epoch_txn_dead (id int);
+INSERT INTO epoch_txn_dead VALUES (1);
+DELETE FROM epoch_txn_dead WHERE id = 1;
+
+SELECT xmin_status, xmax_status, tuple_state
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_dead'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_dead;
+
+-- Test t3: Implicit-mode tuple
+CREATE TABLE epoch_txn_implicit (id int);
+COPY epoch_txn_implicit FROM stdin;
+1
+\.
+
+SELECT xmin_status, xmax_status, tuple_state, relation_mode
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_implicit'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_implicit;
+
+-- Test t4: Mixed old-slot
+CREATE TABLE epoch_txn_mixed (id int, val text);
+COPY epoch_txn_mixed FROM stdin;
+1	before
+\.
+
+UPDATE epoch_txn_mixed SET val = 'after' WHERE id = 1;
+
+SELECT xmin_status, xmax_status, tuple_state, relation_mode
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_mixed'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_mixed;
+
+-- Test t5: Frozen tuple
+CREATE TABLE epoch_txn_frozen (id int);
+INSERT INTO epoch_txn_frozen VALUES (1);
+VACUUM FREEZE epoch_txn_frozen;
+
+SELECT xmin_status, xmax_status, tuple_state
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_frozen'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_frozen;
+
+-- Test t6: Unset xmax
+CREATE TABLE epoch_txn_unset (id int);
+INSERT INTO epoch_txn_unset VALUES (1);
+
+SELECT xmax_status, tuple_state
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_unset'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_unset;
+
+-- Test t7: Non-LP_NORMAL → ERROR
+CREATE TABLE epoch_txn_lp (id int);
+INSERT INTO epoch_txn_lp VALUES (1);
+DELETE FROM epoch_txn_lp WHERE id = 1;
+VACUUM epoch_txn_lp;
+
+SELECT * FROM epoch_xid_tuple_txn_state_info('epoch_txn_lp'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_lp;
+
+-- Test t8: Aborted insert (PROVES CLOG consulted)
+CREATE TABLE epoch_txn_abort (id int);
+BEGIN;
+INSERT INTO epoch_txn_abort VALUES (1);
+ROLLBACK;
+
+SELECT xmin_status, tuple_state
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_abort'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_abort;
+
+-- Test t9: In-progress insert
+CREATE TABLE epoch_txn_inprog (id int);
+BEGIN;
+INSERT INTO epoch_txn_inprog VALUES (1);
+
+SELECT xmin_status, tuple_state
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_inprog'::regclass, '(0,1)'::tid);
+
+COMMIT;
+DROP TABLE epoch_txn_inprog;
+
+-- Test t10: Materialized + per-slot fallback
+CREATE TABLE epoch_txn_fallback (id int, val text);
+COPY epoch_txn_fallback FROM stdin;
+1	pre-materialization row
+\.
+
+INSERT INTO epoch_txn_fallback VALUES (2, 'materializer');
+
+SELECT xmin_status, xmax_status, tuple_state, relation_mode
+FROM epoch_xid_tuple_txn_state_info('epoch_txn_fallback'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_txn_fallback;

@@ -261,4 +261,39 @@ EpochInterpretTuple(HeapTupleHeader htup, EpochSlotData *slot,
 /* Return the text label for an EpochInterpMode value */
 extern const char *EpochInterpModeString(EpochInterpMode mode);
 
+/* ---------- Transaction-state classification (Phase 4) ---------- */
+
+/*
+ * EpochXidStatus -- classification of a single xid's transaction state.
+ * Produced by consulting hint bits and CLOG.
+ */
+typedef enum EpochXidStatus
+{
+	EPOCH_XID_COMMITTED,
+	EPOCH_XID_ABORTED,
+	EPOCH_XID_IN_PROGRESS,
+	EPOCH_XID_FROZEN,
+	EPOCH_XID_INVALID_UNSET,
+	EPOCH_XID_MULTIXACT_UNSUPPORTED
+} EpochXidStatus;
+
+/*
+ * EpochTupleState -- derived verdict from xmin_status + xmax_status.
+ * Fixed vocabulary with no overlap.
+ */
+typedef enum EpochTupleState
+{
+	EPOCH_TUPLE_LIVE_COMMITTED,
+	EPOCH_TUPLE_DEAD_COMMITTED,
+	EPOCH_TUPLE_INSERTING_IN_PROGRESS,
+	EPOCH_TUPLE_DELETING_IN_PROGRESS,
+	EPOCH_TUPLE_ABORTED_INSERT,
+	EPOCH_TUPLE_FROZEN_LIVE,
+	EPOCH_TUPLE_FROZEN_DELETED,
+	EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE
+} EpochTupleState;
+
+extern const char *EpochXidStatusString(EpochXidStatus status);
+extern const char *EpochTupleStateString(EpochTupleState state);
+
 #endif							/* EPOCH_XID_H */

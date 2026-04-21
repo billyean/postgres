@@ -128,3 +128,4 @@ test: lock-nowait
 test: for-portion-of
 test: epoch_xid_mxid
 test: epoch_xid_mxid_read
+test: epoch_xid_mxid_txnstate

@@ -21,9 +21,11 @@
 #include "access/epoch_xid.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "catalog/storage_xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 
 
@@ -466,6 +468,118 @@ EpochInterpretTuple(HeapTupleHeader htup, EpochSlotData *slot,
 
 
 /* ----------------------------------------------------------------
+ *	Transaction-state classification (Phase 4)
+ * ----------------------------------------------------------------
+ */
+
+const char *
+EpochXidStatusString(EpochXidStatus status)
+{
+	switch (status)
+	{
+		case EPOCH_XID_COMMITTED:		return "committed";
+		case EPOCH_XID_ABORTED:			return "aborted";
+		case EPOCH_XID_IN_PROGRESS:		return "in_progress";
+		case EPOCH_XID_FROZEN:			return "frozen";
+		case EPOCH_XID_INVALID_UNSET:	return "invalid_unset";
+		case EPOCH_XID_MULTIXACT_UNSUPPORTED: return "multixact_unsupported";
+	}
+	return "unknown";
+}
+
+const char *
+EpochTupleStateString(EpochTupleState state)
+{
+	switch (state)
+	{
+		case EPOCH_TUPLE_LIVE_COMMITTED:		return "live_committed";
+		case EPOCH_TUPLE_DEAD_COMMITTED:		return "dead_committed";
+		case EPOCH_TUPLE_INSERTING_IN_PROGRESS:	return "inserting_in_progress";
+		case EPOCH_TUPLE_DELETING_IN_PROGRESS:	return "deleting_in_progress";
+		case EPOCH_TUPLE_ABORTED_INSERT:		return "aborted_insert";
+		case EPOCH_TUPLE_FROZEN_LIVE:			return "frozen_live";
+		case EPOCH_TUPLE_FROZEN_DELETED:		return "frozen_deleted";
+		case EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE: return "multixact_unclassifiable";
+	}
+	return "unknown";
+}
+
+/*
+ * EpochClassifyXidStatus -- classify transaction state of one xid.
+ * Uses hint bits first, then CLOG lookup.  Read-only: does not set hint bits.
+ */
+static EpochXidStatus
+EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin)
+{
+	if (is_xmin)
+	{
+		if (htup->t_infomask & HEAP_XMIN_FROZEN)
+			return EPOCH_XID_FROZEN;
+		if (htup->t_infomask & HEAP_XMIN_COMMITTED)
+			return EPOCH_XID_COMMITTED;
+		if (htup->t_infomask & HEAP_XMIN_INVALID)
+			return EPOCH_XID_ABORTED;
+	}
+	else
+	{
+		if (htup->t_infomask & HEAP_XMAX_INVALID)
+			return EPOCH_XID_INVALID_UNSET;
+		if (htup->t_infomask & HEAP_XMAX_IS_MULTI)
+			return EPOCH_XID_MULTIXACT_UNSUPPORTED;
+		if (htup->t_infomask & HEAP_XMAX_COMMITTED)
+			return EPOCH_XID_COMMITTED;
+	}
+
+	if (!TransactionIdIsValid(xid))
+		return EPOCH_XID_INVALID_UNSET;
+	if (TransactionIdIsCurrentTransactionId(xid))
+		return EPOCH_XID_IN_PROGRESS;
+	if (TransactionIdIsInProgress(xid))
+		return EPOCH_XID_IN_PROGRESS;
+	if (TransactionIdDidCommit(xid))
+		return EPOCH_XID_COMMITTED;
+
+	return EPOCH_XID_ABORTED;
+}
+
+/*
+ * EpochDeriveTupleState -- derive tuple-state verdict from xmin/xmax status.
+ * Priority-ordered derivation per the accepted Phase 4 contract.
+ */
+static EpochTupleState
+EpochDeriveTupleState(EpochXidStatus xmin_st, EpochXidStatus xmax_st)
+{
+	if (xmax_st == EPOCH_XID_MULTIXACT_UNSUPPORTED)
+		return EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE;
+
+	if (xmin_st == EPOCH_XID_FROZEN)
+	{
+		if (xmax_st == EPOCH_XID_COMMITTED)
+			return EPOCH_TUPLE_FROZEN_DELETED;
+		return EPOCH_TUPLE_FROZEN_LIVE;
+	}
+
+	if (xmin_st == EPOCH_XID_IN_PROGRESS)
+		return EPOCH_TUPLE_INSERTING_IN_PROGRESS;
+	if (xmin_st == EPOCH_XID_ABORTED)
+		return EPOCH_TUPLE_ABORTED_INSERT;
+
+	if (xmin_st == EPOCH_XID_COMMITTED)
+	{
+		if (xmax_st == EPOCH_XID_INVALID_UNSET || xmax_st == EPOCH_XID_ABORTED)
+			return EPOCH_TUPLE_LIVE_COMMITTED;
+		if (xmax_st == EPOCH_XID_IN_PROGRESS)
+			return EPOCH_TUPLE_DELETING_IN_PROGRESS;
+		if (xmax_st == EPOCH_XID_COMMITTED)
+			return EPOCH_TUPLE_DEAD_COMMITTED;
+		return EPOCH_TUPLE_LIVE_COMMITTED;
+	}
+
+	return EPOCH_TUPLE_LIVE_COMMITTED;
+}
+
+
+/* ----------------------------------------------------------------
  *	SQL-callable debug/inspection functions
  *
  *	These are for development and testing of the epoch fork prototype.
@@ -744,6 +858,132 @@ epoch_xid_tuple_visibility_info(PG_FUNCTION_ARGS)
 	values[2] = CStringGetTextDatum(EpochInterpModeString(interp.xmin_interp));
 	values[3] = CStringGetTextDatum(EpochInterpModeString(interp.xmax_interp));
 	values[4] = CStringGetTextDatum(is_materialized ? "materialized" : "implicit");
+
+	result_tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
+}
+
+/*
+ * epoch_xid_tuple_txn_state_info(regclass, tid) RETURNS TABLE(...)
+ *
+ * Phase 4: Combines Phase 3 full-xid interpretation with transaction-status
+ * classification (hint bits + CLOG) to produce a tuple-state verdict.
+ *
+ * This is a narrow inspection function.  It does NOT set hint bits,
+ * does NOT consult snapshots, and does NOT change query semantics.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_tuple_txn_state_info);
+
+Datum
+epoch_xid_tuple_txn_state_info(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ItemPointer tid = (ItemPointer) PG_GETARG_POINTER(1);
+	Relation	rel;
+	Buffer		heapbuf;
+	Page		heappage;
+	ItemId		lp;
+	HeapTupleHeader htup;
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	bool		is_materialized;
+	EpochSlotData *slot = NULL;
+	Buffer		epochbuf = InvalidBuffer;
+	EpochTupleInterpResult interp;
+	EpochXidStatus xmin_status;
+	EpochXidStatus xmax_status;
+	EpochTupleState tuple_state;
+	TransactionId xmin_xid, xmax_xid;
+	TupleDesc	tupdesc;
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
+	HeapTuple	result_tuple;
+
+	blkno = ItemPointerGetBlockNumber(tid);
+	offnum = ItemPointerGetOffsetNumber(tid);
+
+	rel = table_open(relid, AccessShareLock);
+	heapbuf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+	LockBuffer(heapbuf, BUFFER_LOCK_SHARE);
+	heappage = BufferGetPage(heapbuf);
+
+	if (offnum < 1 || offnum > PageGetMaxOffsetNumber(heappage))
+	{
+		UnlockReleaseBuffer(heapbuf);
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("offset number %u is out of range for page %u",
+						offnum, blkno)));
+	}
+
+	lp = PageGetItemId(heappage, offnum);
+	if (!ItemIdIsNormal(lp))
+	{
+		const char *lp_state;
+
+		if (ItemIdIsDead(lp))
+			lp_state = "LP_DEAD";
+		else if (ItemIdIsRedirected(lp))
+			lp_state = "LP_REDIRECT";
+		else
+			lp_state = "LP_UNUSED";
+
+		UnlockReleaseBuffer(heapbuf);
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot inspect tuple at (%u,%u): line pointer is %s",
+						blkno, offnum, lp_state)));
+	}
+
+	htup = (HeapTupleHeader) PageGetItem(heappage, lp);
+
+	/* Phase 3 interpretation */
+	is_materialized = EpochRelationIsMaterialized(rel);
+	if (is_materialized)
+	{
+		epochbuf = EpochReadBuffer(rel, blkno, false);
+		if (BufferIsValid(epochbuf))
+		{
+			Page epochpage;
+			EpochPageOpaque opaque;
+
+			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
+			epochpage = BufferGetPage(epochbuf);
+			if (!PageIsNew(epochpage))
+			{
+				opaque = EpochPageGetOpaque(epochpage);
+				if (offnum <= opaque->num_slots)
+					slot = EpochGetSlot(epochpage, offnum);
+			}
+		}
+	}
+
+	interp = EpochInterpretTuple(htup, slot, is_materialized);
+
+	/* Phase 4: classify transaction status */
+	xmin_xid = HeapTupleHeaderGetRawXmin(htup);
+	xmax_xid = HeapTupleHeaderGetRawXmax(htup);
+	xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true);
+	xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false);
+	tuple_state = EpochDeriveTupleState(xmin_status, xmax_status);
+
+	if (BufferIsValid(epochbuf))
+		UnlockReleaseBuffer(epochbuf);
+	UnlockReleaseBuffer(heapbuf);
+	table_close(rel, AccessShareLock);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) U64FromFullTransactionId(interp.full_xmin));
+	values[1] = Int64GetDatum((int64) U64FromFullTransactionId(interp.full_xmax));
+	values[2] = CStringGetTextDatum(EpochXidStatusString(xmin_status));
+	values[3] = CStringGetTextDatum(EpochXidStatusString(xmax_status));
+	values[4] = CStringGetTextDatum(EpochTupleStateString(tuple_state));
+	values[5] = CStringGetTextDatum(is_materialized ? "materialized" : "implicit");
 
 	result_tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
