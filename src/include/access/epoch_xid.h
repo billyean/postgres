@@ -296,4 +296,33 @@ typedef enum EpochTupleState
 extern const char *EpochXidStatusString(EpochXidStatus status);
 extern const char *EpochTupleStateString(EpochTupleState state);
 
+/* ---------- Snapshot-relative visibility (Phase 5) ---------- */
+
+typedef enum EpochVisibilityVerdict
+{
+	EPOCH_VIS_VISIBLE,
+	EPOCH_VIS_INVISIBLE,
+	EPOCH_VIS_MULTIXACT_UNSUPPORTED,
+	EPOCH_VIS_CANNOT_CLASSIFY
+} EpochVisibilityVerdict;
+
+typedef enum EpochVerdictReason
+{
+	EPOCH_REASON_XMIN_COMMITTED_VISIBLE,
+	EPOCH_REASON_FROZEN,
+	EPOCH_REASON_OWN_INSERT_VISIBLE,
+	EPOCH_REASON_XMIN_IN_PROGRESS,
+	EPOCH_REASON_XMIN_ABORTED,
+	EPOCH_REASON_XMIN_COMMITTED_NOT_IN_SNAPSHOT,
+	EPOCH_REASON_XMAX_COMMITTED_VISIBLE_IN_SNAPSHOT,
+	EPOCH_REASON_XMAX_COMMITTED_NOT_IN_SNAPSHOT,
+	EPOCH_REASON_XMAX_IN_PROGRESS,
+	EPOCH_REASON_OWN_DELETE_INVISIBLE,
+	EPOCH_REASON_MULTIXACT_UNSUPPORTED,
+	EPOCH_REASON_NO_SNAPSHOT
+} EpochVerdictReason;
+
+extern const char *EpochVisibilityVerdictString(EpochVisibilityVerdict v);
+extern const char *EpochVerdictReasonString(EpochVerdictReason r);
+
 #endif							/* EPOCH_XID_H */

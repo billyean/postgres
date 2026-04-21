@@ -628,3 +628,124 @@ FROM epoch_xid_tuple_txn_state_info('epoch_txn_fallback'::regclass, '(0,1)'::tid
 (1 row)
 
 DROP TABLE epoch_txn_fallback;
+-- ======================================================
+-- Phase 5: Current-snapshot visibility tests
+-- ======================================================
+-- Test v1: Committed live → visible
+CREATE TABLE epoch_vis_live (id int);
+INSERT INTO epoch_vis_live VALUES (1);
+SELECT visibility_verdict, verdict_reason, relation_mode
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_live'::regclass, '(0,1)'::tid);
+ visibility_verdict |     verdict_reason     | relation_mode
+--------------------+------------------------+---------------
+ visible            | xmin_committed_visible | materialized
+(1 row)
+
+DROP TABLE epoch_vis_live;
+-- Test v2: Deleted committed → invisible
+CREATE TABLE epoch_vis_dead (id int);
+INSERT INTO epoch_vis_dead VALUES (1);
+DELETE FROM epoch_vis_dead WHERE id = 1;
+SELECT visibility_verdict, verdict_reason
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_dead'::regclass, '(0,1)'::tid);
+ visibility_verdict |           verdict_reason
+--------------------+------------------------------------
+ invisible          | xmax_committed_visible_in_snapshot
+(1 row)
+
+DROP TABLE epoch_vis_dead;
+-- Test v3: Frozen → visible / frozen
+CREATE TABLE epoch_vis_frozen (id int);
+INSERT INTO epoch_vis_frozen VALUES (1);
+VACUUM FREEZE epoch_vis_frozen;
+SELECT visibility_verdict, verdict_reason
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_frozen'::regclass, '(0,1)'::tid);
+ visibility_verdict | verdict_reason
+--------------------+----------------
+ visible            | frozen
+(1 row)
+
+DROP TABLE epoch_vis_frozen;
+-- Test v4: Aborted insert → invisible / xmin_aborted
+CREATE TABLE epoch_vis_abort (id int);
+BEGIN;
+INSERT INTO epoch_vis_abort VALUES (1);
+ROLLBACK;
+SELECT visibility_verdict, verdict_reason
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_abort'::regclass, '(0,1)'::tid);
+ visibility_verdict | verdict_reason
+--------------------+----------------
+ invisible          | xmin_aborted
+(1 row)
+
+DROP TABLE epoch_vis_abort;
+-- Test v5: Own insert → visible / own_insert_visible
+CREATE TABLE epoch_vis_own (id int);
+BEGIN;
+INSERT INTO epoch_vis_own VALUES (1);
+SELECT visibility_verdict, verdict_reason
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_own'::regclass, '(0,1)'::tid);
+ visibility_verdict |   verdict_reason
+--------------------+---------------------
+ visible            | own_insert_visible
+(1 row)
+
+COMMIT;
+DROP TABLE epoch_vis_own;
+-- Test v6: Own delete → invisible / own_delete_invisible
+CREATE TABLE epoch_vis_owndel (id int);
+INSERT INTO epoch_vis_owndel VALUES (1);
+BEGIN;
+DELETE FROM epoch_vis_owndel WHERE id = 1;
+SELECT visibility_verdict, verdict_reason
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_owndel'::regclass, '(0,1)'::tid);
+ visibility_verdict |    verdict_reason
+--------------------+-----------------------
+ invisible          | own_delete_invisible
+(1 row)
+
+COMMIT;
+DROP TABLE epoch_vis_owndel;
+-- Test v7: Implicit mode → visible
+CREATE TABLE epoch_vis_implicit (id int);
+COPY epoch_vis_implicit FROM stdin;
+SELECT visibility_verdict, verdict_reason, relation_mode
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_implicit'::regclass, '(0,1)'::tid);
+ visibility_verdict |     verdict_reason     | relation_mode
+--------------------+------------------------+---------------
+ visible            | xmin_committed_visible | implicit
+(1 row)
+
+DROP TABLE epoch_vis_implicit;
+-- Test v8: Non-LP_NORMAL → ERROR
+CREATE TABLE epoch_vis_lp (id int);
+INSERT INTO epoch_vis_lp VALUES (1);
+DELETE FROM epoch_vis_lp WHERE id = 1;
+VACUUM epoch_vis_lp;
+SELECT * FROM epoch_xid_tuple_current_visibility_info('epoch_vis_lp'::regclass, '(0,1)'::tid);
+ERROR:  cannot inspect tuple at (0,1): line pointer is LP_UNUSED
+DROP TABLE epoch_vis_lp;
+-- Test v9: Mixed old-slot transitional case
+CREATE TABLE epoch_vis_mixed (id int, val text);
+COPY epoch_vis_mixed FROM stdin;
+UPDATE epoch_vis_mixed SET val = 'after' WHERE id = 1;
+SELECT xmin_status, xmax_status, visibility_verdict, verdict_reason, relation_mode
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_mixed'::regclass, '(0,1)'::tid);
+ xmin_status | xmax_status | visibility_verdict |           verdict_reason           | relation_mode
+-------------+-------------+--------------------+------------------------------------+---------------
+ committed   | committed   | invisible          | xmax_committed_visible_in_snapshot | materialized
+(1 row)
+
+DROP TABLE epoch_vis_mixed;
+-- Test v10: Materialized + per-slot fallback
+CREATE TABLE epoch_vis_fallback (id int, val text);
+COPY epoch_vis_fallback FROM stdin;
+INSERT INTO epoch_vis_fallback VALUES (2, 'materializer');
+SELECT xmin_status, xmax_status, visibility_verdict, verdict_reason, relation_mode
+FROM epoch_xid_tuple_current_visibility_info('epoch_vis_fallback'::regclass, '(0,1)'::tid);
+ xmin_status | xmax_status  | visibility_verdict |     verdict_reason     | relation_mode
+-------------+--------------+--------------------+------------------------+---------------
+ committed   | invalid_unset | visible            | xmin_committed_visible | materialized
+(1 row)
+
+DROP TABLE epoch_vis_fallback;

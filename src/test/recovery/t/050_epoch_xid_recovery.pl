@@ -394,6 +394,95 @@ is($implicit_state, 'live_committed|implicit',
 
 $node->safe_psql('postgres', 'DROP TABLE epoch_txn_implicit_rec');
 
+# ============================================================
+# Test 12: Phase 5 — visibility verdict stable after recovery
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_vis_recovery (id int);
+INSERT INTO epoch_vis_recovery VALUES (1);
+});
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $vis_live = $node->safe_psql('postgres',
+	"SELECT visibility_verdict, verdict_reason
+	 FROM epoch_xid_tuple_current_visibility_info('epoch_vis_recovery'::regclass, '(0,1)'::tid)");
+is($vis_live, 'visible|xmin_committed_visible',
+	'Phase 5: visible verdict stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_vis_recovery');
+
+# ============================================================
+# Test 13: Phase 5 — invisible verdict after recovery
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_vis_dead_rec (id int);
+INSERT INTO epoch_vis_dead_rec VALUES (1);
+DELETE FROM epoch_vis_dead_rec WHERE id = 1;
+});
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $vis_dead = $node->safe_psql('postgres',
+	"SELECT visibility_verdict, verdict_reason
+	 FROM epoch_xid_tuple_current_visibility_info('epoch_vis_dead_rec'::regclass, '(0,1)'::tid)");
+is($vis_dead, 'invisible|xmax_committed_visible_in_snapshot',
+	'Phase 5: invisible verdict stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_vis_dead_rec');
+
+# ============================================================
+# Test 14: Phase 5 — implicit mode visibility after restart
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_vis_implicit_rec (id int);
+});
+$node->safe_psql('postgres',
+	"COPY epoch_vis_implicit_rec FROM stdin;\n1\n\\.\n");
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $vis_implicit = $node->safe_psql('postgres',
+	"SELECT visibility_verdict, verdict_reason, relation_mode
+	 FROM epoch_xid_tuple_current_visibility_info('epoch_vis_implicit_rec'::regclass, '(0,1)'::tid)");
+is($vis_implicit, 'visible|xmin_committed_visible|implicit',
+	'Phase 5: implicit mode visibility verdict stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_vis_implicit_rec');
+
+# ============================================================
+# Test 15: Phase 5 — mixed old-slot visibility after recovery
+# ============================================================
+
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_vis_mixed_rec (id int, val text);
+});
+$node->safe_psql('postgres',
+	"COPY epoch_vis_mixed_rec FROM stdin;\n1\tbefore\n\\.\n");
+$node->safe_psql('postgres',
+	"UPDATE epoch_vis_mixed_rec SET val = 'after' WHERE id = 1");
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+$node->stop('immediate');
+$node->start;
+
+my $mixed_post = $node->safe_psql('postgres',
+	"SELECT xmin_status, xmax_status, visibility_verdict, verdict_reason, relation_mode
+	 FROM epoch_xid_tuple_current_visibility_info('epoch_vis_mixed_rec'::regclass, '(0,1)'::tid)");
+is($mixed_post, 'committed|committed|invisible|xmax_committed_visible_in_snapshot|materialized',
+	'Phase 5: mixed old-slot visibility verdict stable after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_vis_mixed_rec');
+
 $node->stop;
 
 done_testing();

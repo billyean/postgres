@@ -12804,4 +12804,13 @@
   proargnames => '{rel,tid,full_xmin,full_xmax,xmin_status,xmax_status,tuple_state,relation_mode}',
   prosrc => 'epoch_xid_tuple_txn_state_info' },
 
+{ oid => '9907',
+  descr => 'current-snapshot visibility verdict for a tuple using epoch-backed full xid',
+  proname => 'epoch_xid_tuple_current_visibility_info', provolatile => 'v',
+  prorettype => 'record', proargtypes => 'regclass tid',
+  proallargtypes => '{regclass,tid,int8,int8,text,text,text,text,text}',
+  proargmodes => '{i,i,o,o,o,o,o,o,o}',
+  proargnames => '{rel,tid,full_xmin,full_xmax,xmin_status,xmax_status,visibility_verdict,verdict_reason,relation_mode}',
+  prosrc => 'epoch_xid_tuple_current_visibility_info' },
+
 ]

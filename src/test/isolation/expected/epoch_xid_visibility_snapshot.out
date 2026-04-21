@@ -1,0 +1,17 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_begin s1_insert s2_inspect s2_end
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;
+?column?
+--------
+       1
+(1 row)
+
+step s1_insert: INSERT INTO epoch_vis_snapshot_test VALUES (1);
+step s2_inspect: SELECT visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_vis_snapshot_test'::regclass, '(0,1)'::tid);
+visibility_verdict|verdict_reason
+------------------+----------------------------------
+invisible         |xmin_committed_not_in_snapshot
+(1 row)
+
+step s2_end: COMMIT;

@@ -27,6 +27,7 @@
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "utils/snapmgr.h"
 
 
 /* ----------------------------------------------------------------
@@ -580,6 +581,160 @@ EpochDeriveTupleState(EpochXidStatus xmin_st, EpochXidStatus xmax_st)
 
 
 /* ----------------------------------------------------------------
+ *	Snapshot-relative visibility (Phase 5)
+ * ----------------------------------------------------------------
+ */
+
+const char *
+EpochVisibilityVerdictString(EpochVisibilityVerdict v)
+{
+	switch (v)
+	{
+		case EPOCH_VIS_VISIBLE:					return "visible";
+		case EPOCH_VIS_INVISIBLE:				return "invisible";
+		case EPOCH_VIS_MULTIXACT_UNSUPPORTED:	return "multixact_unsupported";
+		case EPOCH_VIS_CANNOT_CLASSIFY:			return "cannot_classify";
+	}
+	return "unknown";
+}
+
+const char *
+EpochVerdictReasonString(EpochVerdictReason r)
+{
+	switch (r)
+	{
+		case EPOCH_REASON_XMIN_COMMITTED_VISIBLE:	return "xmin_committed_visible";
+		case EPOCH_REASON_FROZEN:					return "frozen";
+		case EPOCH_REASON_OWN_INSERT_VISIBLE:		return "own_insert_visible";
+		case EPOCH_REASON_XMIN_IN_PROGRESS:			return "xmin_in_progress";
+		case EPOCH_REASON_XMIN_ABORTED:				return "xmin_aborted";
+		case EPOCH_REASON_XMIN_COMMITTED_NOT_IN_SNAPSHOT: return "xmin_committed_not_in_snapshot";
+		case EPOCH_REASON_XMAX_COMMITTED_VISIBLE_IN_SNAPSHOT: return "xmax_committed_visible_in_snapshot";
+		case EPOCH_REASON_XMAX_COMMITTED_NOT_IN_SNAPSHOT: return "xmax_committed_not_in_snapshot";
+		case EPOCH_REASON_XMAX_IN_PROGRESS:			return "xmax_in_progress";
+		case EPOCH_REASON_OWN_DELETE_INVISIBLE:		return "own_delete_invisible";
+		case EPOCH_REASON_MULTIXACT_UNSUPPORTED:	return "multixact_unsupported";
+		case EPOCH_REASON_NO_SNAPSHOT:				return "no_snapshot";
+	}
+	return "unknown";
+}
+
+/*
+ * EpochDeriveVisibility -- snapshot-relative visibility verdict.
+ * Uses GetActiveSnapshot() + XidInMVCCSnapshot().
+ */
+static void
+EpochDeriveVisibility(HeapTupleHeader htup,
+					  TransactionId xmin_xid, TransactionId xmax_xid,
+					  EpochXidStatus xmin_status, EpochXidStatus xmax_status,
+					  EpochVisibilityVerdict *verdict,
+					  EpochVerdictReason *reason)
+{
+	Snapshot	snapshot = GetActiveSnapshot();
+
+	if (snapshot == NULL)
+	{
+		*verdict = EPOCH_VIS_CANNOT_CLASSIFY;
+		*reason = EPOCH_REASON_NO_SNAPSHOT;
+		return;
+	}
+
+	if (xmax_status == EPOCH_XID_MULTIXACT_UNSUPPORTED)
+	{
+		*verdict = EPOCH_VIS_MULTIXACT_UNSUPPORTED;
+		*reason = EPOCH_REASON_MULTIXACT_UNSUPPORTED;
+		return;
+	}
+
+	if (xmin_status == EPOCH_XID_FROZEN)
+	{
+		*verdict = EPOCH_VIS_VISIBLE;
+		*reason = EPOCH_REASON_FROZEN;
+		return;
+	}
+
+	if (xmin_status == EPOCH_XID_ABORTED)
+	{
+		*verdict = EPOCH_VIS_INVISIBLE;
+		*reason = EPOCH_REASON_XMIN_ABORTED;
+		return;
+	}
+
+	if (xmin_status == EPOCH_XID_IN_PROGRESS)
+	{
+		if (TransactionIdIsCurrentTransactionId(xmin_xid))
+		{
+			if (xmax_status == EPOCH_XID_INVALID_UNSET ||
+				xmax_status == EPOCH_XID_ABORTED)
+			{
+				*verdict = EPOCH_VIS_VISIBLE;
+				*reason = EPOCH_REASON_OWN_INSERT_VISIBLE;
+				return;
+			}
+			if (TransactionIdIsValid(xmax_xid) &&
+				TransactionIdIsCurrentTransactionId(xmax_xid))
+			{
+				*verdict = EPOCH_VIS_INVISIBLE;
+				*reason = EPOCH_REASON_OWN_DELETE_INVISIBLE;
+				return;
+			}
+			*verdict = EPOCH_VIS_VISIBLE;
+			*reason = EPOCH_REASON_OWN_INSERT_VISIBLE;
+			return;
+		}
+		*verdict = EPOCH_VIS_INVISIBLE;
+		*reason = EPOCH_REASON_XMIN_IN_PROGRESS;
+		return;
+	}
+
+	/* Committed xmin: check snapshot */
+	Assert(xmin_status == EPOCH_XID_COMMITTED);
+
+	if (XidInMVCCSnapshot(xmin_xid, snapshot))
+	{
+		*verdict = EPOCH_VIS_INVISIBLE;
+		*reason = EPOCH_REASON_XMIN_COMMITTED_NOT_IN_SNAPSHOT;
+		return;
+	}
+
+	/* xmin visible in snapshot → check xmax */
+	if (xmax_status == EPOCH_XID_INVALID_UNSET ||
+		xmax_status == EPOCH_XID_ABORTED)
+	{
+		*verdict = EPOCH_VIS_VISIBLE;
+		*reason = EPOCH_REASON_XMIN_COMMITTED_VISIBLE;
+		return;
+	}
+
+	if (xmax_status == EPOCH_XID_IN_PROGRESS)
+	{
+		if (TransactionIdIsValid(xmax_xid) &&
+			TransactionIdIsCurrentTransactionId(xmax_xid))
+		{
+			*verdict = EPOCH_VIS_INVISIBLE;
+			*reason = EPOCH_REASON_OWN_DELETE_INVISIBLE;
+			return;
+		}
+		*verdict = EPOCH_VIS_VISIBLE;
+		*reason = EPOCH_REASON_XMAX_IN_PROGRESS;
+		return;
+	}
+
+	Assert(xmax_status == EPOCH_XID_COMMITTED);
+
+	if (XidInMVCCSnapshot(xmax_xid, snapshot))
+	{
+		*verdict = EPOCH_VIS_VISIBLE;
+		*reason = EPOCH_REASON_XMAX_COMMITTED_NOT_IN_SNAPSHOT;
+		return;
+	}
+
+	*verdict = EPOCH_VIS_INVISIBLE;
+	*reason = EPOCH_REASON_XMAX_COMMITTED_VISIBLE_IN_SNAPSHOT;
+}
+
+
+/* ----------------------------------------------------------------
  *	SQL-callable debug/inspection functions
  *
  *	These are for development and testing of the epoch fork prototype.
@@ -984,6 +1139,128 @@ epoch_xid_tuple_txn_state_info(PG_FUNCTION_ARGS)
 	values[3] = CStringGetTextDatum(EpochXidStatusString(xmax_status));
 	values[4] = CStringGetTextDatum(EpochTupleStateString(tuple_state));
 	values[5] = CStringGetTextDatum(is_materialized ? "materialized" : "implicit");
+
+	result_tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
+}
+
+/*
+ * epoch_xid_tuple_current_visibility_info(regclass, tid) RETURNS TABLE(...)
+ *
+ * Phase 5: Snapshot-relative visibility verdict using GetActiveSnapshot()
+ * + XidInMVCCSnapshot().  This is a narrow inspection/debug function.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_tuple_current_visibility_info);
+
+Datum
+epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ItemPointer tid = (ItemPointer) PG_GETARG_POINTER(1);
+	Relation	rel;
+	Buffer		heapbuf;
+	Page		heappage;
+	ItemId		lp;
+	HeapTupleHeader htup;
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	bool		is_materialized;
+	EpochSlotData *slot = NULL;
+	Buffer		epochbuf = InvalidBuffer;
+	EpochTupleInterpResult interp;
+	EpochXidStatus xmin_status, xmax_status;
+	TransactionId xmin_xid, xmax_xid;
+	EpochVisibilityVerdict vis_verdict;
+	EpochVerdictReason vis_reason;
+	TupleDesc	tupdesc;
+	Datum		values[7];
+	bool		nulls[7] = {false, false, false, false, false, false, false};
+	HeapTuple	result_tuple;
+
+	blkno = ItemPointerGetBlockNumber(tid);
+	offnum = ItemPointerGetOffsetNumber(tid);
+
+	rel = table_open(relid, AccessShareLock);
+	heapbuf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+	LockBuffer(heapbuf, BUFFER_LOCK_SHARE);
+	heappage = BufferGetPage(heapbuf);
+
+	if (offnum < 1 || offnum > PageGetMaxOffsetNumber(heappage))
+	{
+		UnlockReleaseBuffer(heapbuf);
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("offset number %u is out of range for page %u",
+						offnum, blkno)));
+	}
+
+	lp = PageGetItemId(heappage, offnum);
+	if (!ItemIdIsNormal(lp))
+	{
+		const char *lp_state;
+		if (ItemIdIsDead(lp))			lp_state = "LP_DEAD";
+		else if (ItemIdIsRedirected(lp)) lp_state = "LP_REDIRECT";
+		else							lp_state = "LP_UNUSED";
+
+		UnlockReleaseBuffer(heapbuf);
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot inspect tuple at (%u,%u): line pointer is %s",
+						blkno, offnum, lp_state)));
+	}
+
+	htup = (HeapTupleHeader) PageGetItem(heappage, lp);
+
+	/* Phase 3: interpretation */
+	is_materialized = EpochRelationIsMaterialized(rel);
+	if (is_materialized)
+	{
+		epochbuf = EpochReadBuffer(rel, blkno, false);
+		if (BufferIsValid(epochbuf))
+		{
+			Page epochpage;
+			EpochPageOpaque opaque;
+			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
+			epochpage = BufferGetPage(epochbuf);
+			if (!PageIsNew(epochpage))
+			{
+				opaque = EpochPageGetOpaque(epochpage);
+				if (offnum <= opaque->num_slots)
+					slot = EpochGetSlot(epochpage, offnum);
+			}
+		}
+	}
+	interp = EpochInterpretTuple(htup, slot, is_materialized);
+
+	/* Phase 4: status */
+	xmin_xid = HeapTupleHeaderGetRawXmin(htup);
+	xmax_xid = HeapTupleHeaderGetRawXmax(htup);
+	xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true);
+	xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false);
+
+	/* Phase 5: snapshot-relative visibility */
+	EpochDeriveVisibility(htup, xmin_xid, xmax_xid,
+						  xmin_status, xmax_status,
+						  &vis_verdict, &vis_reason);
+
+	if (BufferIsValid(epochbuf))
+		UnlockReleaseBuffer(epochbuf);
+	UnlockReleaseBuffer(heapbuf);
+	table_close(rel, AccessShareLock);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	values[0] = Int64GetDatum((int64) U64FromFullTransactionId(interp.full_xmin));
+	values[1] = Int64GetDatum((int64) U64FromFullTransactionId(interp.full_xmax));
+	values[2] = CStringGetTextDatum(EpochXidStatusString(xmin_status));
+	values[3] = CStringGetTextDatum(EpochXidStatusString(xmax_status));
+	values[4] = CStringGetTextDatum(EpochVisibilityVerdictString(vis_verdict));
+	values[5] = CStringGetTextDatum(EpochVerdictReasonString(vis_reason));
+	values[6] = CStringGetTextDatum(is_materialized ? "materialized" : "implicit");
 
 	result_tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));

@@ -1,0 +1,23 @@
+Parsed test spec with 3 sessions
+
+starting permutation: lock1 lock2 inspect release1 release2
+step lock1: BEGIN; SELECT * FROM epoch_vis_mxid_test WHERE id = 1 FOR KEY SHARE;
+id|val
+--+----
+ 1|test
+(1 row)
+
+step lock2: BEGIN; SELECT * FROM epoch_vis_mxid_test WHERE id = 1 FOR KEY SHARE;
+id|val
+--+----
+ 1|test
+(1 row)
+
+step inspect: SELECT xmin_status, xmax_status, visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_vis_mxid_test'::regclass, '(0,1)'::tid);
+xmin_status|xmax_status           |visibility_verdict     |verdict_reason
+-----------+-----------------------+-----------------------+------------------------
+committed  |multixact_unsupported|multixact_unsupported|multixact_unsupported
+(1 row)
+
+step release1: ROLLBACK;
+step release2: ROLLBACK;
