@@ -143,6 +143,33 @@ extern Buffer EpochReadBuffer(Relation rel, BlockNumber heapBlk,
 extern void EpochPinBuffer(Relation rel, BlockNumber heapBlk,
 						   Buffer *epochbuf);
 
+/*
+ * EpochReadBufferReadOnly -- read-only epoch buffer access (Phase 6).
+ *
+ * Returns InvalidBuffer if:
+ *   - Relation is not materialized (fork absent)
+ *   - Block is beyond EOF
+ * Both are legal absence states per the storage contract.
+ *
+ * Contract guarantees:
+ *   - NEVER creates the fork
+ *   - NEVER extends the file
+ *   - NEVER initializes, dirties, or WAL-logs any page
+ *
+ * Caller must treat PageIsNew pages as absent (slot = NULL).
+ * Returns a pinned but NOT locked buffer (caller must lock).
+ */
+extern Buffer EpochReadBufferReadOnly(Relation rel, BlockNumber heapBlk);
+
+/*
+ * EpochPageValidate -- structural validation of a non-new epoch page (Phase 6).
+ *
+ * Returns true if the page has valid epoch structure; false if corrupt.
+ * Caller must have already verified !PageIsNew(page).
+ * Caller decides whether to ERROR or log a warning on false.
+ */
+extern bool EpochPageValidate(Page page);
+
 /* Slot access */
 extern EpochSlotData *EpochGetSlot(Page epochPage, OffsetNumber offnum);
 

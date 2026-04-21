@@ -171,6 +171,77 @@ EpochPinBuffer(Relation rel, BlockNumber heapBlk, Buffer *epochbuf)
 	*epochbuf = EpochReadBuffer(rel, heapBlk, true);
 }
 
+/*
+ * EpochReadBufferReadOnly
+ *
+ * Read-only epoch buffer access for inspection / read paths (Phase 6).
+ *
+ * Uses the backend's current view of the relation and fork state to
+ * determine whether the fork exists and whether the requested block
+ * is within EOF.
+ *
+ * Returns InvalidBuffer if:
+ *   - Fork does not exist (relation in implicit mode)
+ *   - Block is beyond EOF
+ * Both are legal absence states per the storage contract.
+ *
+ * Contract guarantees:
+ *   - Never creates the epoch fork
+ *   - Never extends the epoch fork
+ *   - Never initializes, dirties, or WAL-logs any page
+ *
+ * Caller must lock the returned buffer and treat PageIsNew pages
+ * as absent (slot = NULL).  Returns a pinned but NOT locked buffer.
+ */
+Buffer
+EpochReadBufferReadOnly(Relation rel, BlockNumber heapBlk)
+{
+	SMgrRelation smgr = RelationGetSmgr(rel);
+
+	/* Fork absent → implicit mode, legal absence */
+	if (!smgrexists(smgr, EPOCH_FORKNUM))
+		return InvalidBuffer;
+
+	/* Block beyond EOF → legal absence, no extension */
+	if (heapBlk >= smgrnblocks(smgr, EPOCH_FORKNUM))
+		return InvalidBuffer;
+
+	return ReadBufferExtended(rel, EPOCH_FORKNUM, heapBlk,
+							 RBM_NORMAL, NULL);
+}
+
+/*
+ * EpochPageValidate
+ *
+ * Structural validation of a non-new epoch page (Phase 6).
+ *
+ * Returns true if the page is structurally valid as an epoch page;
+ * false if corrupt (wrong version or impossible num_slots).
+ *
+ * Caller must have already verified !PageIsNew(page).
+ * Caller decides whether to ERROR or log a warning on false.
+ *
+ * This enforces the corruption boundary: a non-new page that fails
+ * this check must not be silently treated as absent/new.
+ */
+bool
+EpochPageValidate(Page page)
+{
+	EpochPageOpaque opaque;
+
+	Assert(!PageIsNew(page));
+
+	opaque = EpochPageGetOpaque(page);
+
+	if (opaque->epoch_version != EPOCH_PAGE_VERSION)
+		return false;
+
+	if (opaque->num_slots > MaxEpochSlotsPerPage)
+		return false;
+
+	return true;
+}
+
 
 /* ----------------------------------------------------------------
  *	Slot access
@@ -800,7 +871,7 @@ epoch_xid_inspect(PG_FUNCTION_ARGS)
 			SRF_RETURN_DONE(funcctx);
 		}
 
-		buf = EpochReadBuffer(rel, (BlockNumber) blkno, false);
+		buf = EpochReadBufferReadOnly(rel, (BlockNumber) blkno);
 
 		if (!BufferIsValid(buf))
 		{
@@ -816,7 +887,19 @@ epoch_xid_inspect(PG_FUNCTION_ARGS)
 		slots = NULL;
 		if (!PageIsNew(page))
 		{
-			EpochPageOpaque opaque = EpochPageGetOpaque(page);
+			EpochPageOpaque opaque;
+
+			if (!EpochPageValidate(page))
+			{
+				UnlockReleaseBuffer(buf);
+				table_close(rel, AccessShareLock);
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("epoch page %u has invalid structure",
+								(unsigned) blkno)));
+			}
+
+			opaque = EpochPageGetOpaque(page);
 
 			num_slots = opaque->num_slots;
 			if (num_slots > 0)
@@ -970,28 +1053,40 @@ epoch_xid_tuple_visibility_info(PG_FUNCTION_ARGS)
 	/* Determine relation epoch mode */
 	is_materialized = EpochRelationIsMaterialized(rel);
 
-	/* If materialized, read epoch slot */
+	/* If materialized, read epoch slot (read-only: no create/extend/dirty) */
 	if (is_materialized)
 	{
-		epochbuf = EpochReadBuffer(rel, blkno, false);
+		epochbuf = EpochReadBufferReadOnly(rel, blkno);
 		if (BufferIsValid(epochbuf))
 		{
 			Page		epochpage;
-			EpochPageOpaque opaque;
 
 			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
 			epochpage = BufferGetPage(epochbuf);
 
 			if (!PageIsNew(epochpage))
 			{
+				EpochPageOpaque opaque;
+
+				if (!EpochPageValidate(epochpage))
+				{
+					UnlockReleaseBuffer(epochbuf);
+					UnlockReleaseBuffer(heapbuf);
+					table_close(rel, AccessShareLock);
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("epoch page %u has invalid structure",
+									blkno)));
+				}
+
 				opaque = EpochPageGetOpaque(epochpage);
 				if (offnum <= opaque->num_slots)
 					slot = EpochGetSlot(epochpage, offnum);
 				/* else: offnum beyond high-water mark, slot stays NULL */
 			}
-			/* else: PageIsNew, slot stays NULL (per-slot-absence rule) */
+			/* else: PageIsNew, slot stays NULL (legal absence per contract) */
 		}
-		/* else: epoch block doesn't exist yet for this heap block, slot NULL */
+		/* else: epoch block beyond EOF, slot NULL (legal absence) */
 	}
 
 	/* Interpret */
@@ -1094,20 +1189,32 @@ epoch_xid_tuple_txn_state_info(PG_FUNCTION_ARGS)
 
 	htup = (HeapTupleHeader) PageGetItem(heappage, lp);
 
-	/* Phase 3 interpretation */
+	/* Phase 3 interpretation (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
 	if (is_materialized)
 	{
-		epochbuf = EpochReadBuffer(rel, blkno, false);
+		epochbuf = EpochReadBufferReadOnly(rel, blkno);
 		if (BufferIsValid(epochbuf))
 		{
 			Page epochpage;
-			EpochPageOpaque opaque;
 
 			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
 			epochpage = BufferGetPage(epochbuf);
 			if (!PageIsNew(epochpage))
 			{
+				EpochPageOpaque opaque;
+
+				if (!EpochPageValidate(epochpage))
+				{
+					UnlockReleaseBuffer(epochbuf);
+					UnlockReleaseBuffer(heapbuf);
+					table_close(rel, AccessShareLock);
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("epoch page %u has invalid structure",
+									blkno)));
+				}
+
 				opaque = EpochPageGetOpaque(epochpage);
 				if (offnum <= opaque->num_slots)
 					slot = EpochGetSlot(epochpage, offnum);
@@ -1213,19 +1320,31 @@ epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
 
 	htup = (HeapTupleHeader) PageGetItem(heappage, lp);
 
-	/* Phase 3: interpretation */
+	/* Phase 3: interpretation (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
 	if (is_materialized)
 	{
-		epochbuf = EpochReadBuffer(rel, blkno, false);
+		epochbuf = EpochReadBufferReadOnly(rel, blkno);
 		if (BufferIsValid(epochbuf))
 		{
 			Page epochpage;
-			EpochPageOpaque opaque;
 			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
 			epochpage = BufferGetPage(epochbuf);
 			if (!PageIsNew(epochpage))
 			{
+				EpochPageOpaque opaque;
+
+				if (!EpochPageValidate(epochpage))
+				{
+					UnlockReleaseBuffer(epochbuf);
+					UnlockReleaseBuffer(heapbuf);
+					table_close(rel, AccessShareLock);
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("epoch page %u has invalid structure",
+									blkno)));
+				}
+
 				opaque = EpochPageGetOpaque(epochpage);
 				if (offnum <= opaque->num_slots)
 					slot = EpochGetSlot(epochpage, offnum);
@@ -1264,4 +1383,230 @@ epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
 
 	result_tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(result_tuple));
+}
+
+
+/* ----------------------------------------------------------------
+ *	Phase 6: Storage contract inspection / test helpers
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * epoch_xid_page_state(regclass, int4) -> text
+ *
+ * Returns the storage-contract state of an epoch block:
+ *   'fork_absent'    - relation has no epoch fork (implicit mode)
+ *   'beyond_eof'     - epoch fork exists but block is past EOF
+ *   'page_new'       - block is within EOF, page is PageIsNew / all-zero
+ *   'valid'          - block is within EOF, page passes structural validation
+ *   'corrupt'        - block is within EOF, page is non-new but fails validation
+ *
+ * This is a read-only inspection function (Phase 6).  It never creates,
+ * extends, initializes, or dirties the epoch fork.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_page_state);
+
+Datum
+epoch_xid_page_state(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	Relation	rel;
+	Buffer		buf;
+	const char *state;
+
+	rel = table_open(relid, AccessShareLock);
+
+	if (!EpochRelationIsMaterialized(rel))
+	{
+		table_close(rel, AccessShareLock);
+		PG_RETURN_TEXT_P(cstring_to_text("fork_absent"));
+	}
+
+	buf = EpochReadBufferReadOnly(rel, (BlockNumber) blkno);
+
+	if (!BufferIsValid(buf))
+	{
+		table_close(rel, AccessShareLock);
+		PG_RETURN_TEXT_P(cstring_to_text("beyond_eof"));
+	}
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	{
+		Page		page = BufferGetPage(buf);
+
+		if (PageIsNew(page))
+			state = "page_new";
+		else if (EpochPageValidate(page))
+			state = "valid";
+		else
+			state = "corrupt";
+	}
+	UnlockReleaseBuffer(buf);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(state));
+}
+
+/*
+ * epoch_xid_corrupt_page(regclass, int4) -> void
+ *
+ * TEST-ONLY function.  Writes an invalid epoch_version to the specified
+ * epoch block to produce a corrupt page state for Phase 6 corruption
+ * boundary testing.
+ *
+ * The page must already exist and be a valid initialized epoch page.
+ * After this call, the page will fail EpochPageValidate().
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_corrupt_page);
+
+Datum
+epoch_xid_corrupt_page(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	Relation	rel;
+	Buffer		buf;
+	Page		page;
+	EpochPageOpaque opaque;
+
+	rel = table_open(relid, RowExclusiveLock);
+
+	if (!EpochRelationIsMaterialized(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("relation is not in materialized epoch mode")));
+
+	buf = EpochReadBufferReadOnly(rel, (BlockNumber) blkno);
+	if (!BufferIsValid(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("epoch block %d does not exist", blkno)));
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+
+	if (PageIsNew(page))
+	{
+		UnlockReleaseBuffer(buf);
+		table_close(rel, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("epoch block %d is PageIsNew, cannot corrupt", blkno)));
+	}
+
+	/* Write an invalid version to make the page corrupt */
+	opaque = EpochPageGetOpaque(page);
+	opaque->epoch_version = 0xDEAD;
+
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+
+	table_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * epoch_xid_reset_page(regclass, int4) -> void
+ *
+ * TEST-ONLY function.  Zeros out the specified epoch block, resetting it
+ * to the PageIsNew / all-zero state.  This creates the "within-EOF but
+ * PageIsNew" condition that the Phase 6 storage contract treats as a
+ * legal absence state.
+ *
+ * The block must already exist within the epoch fork's EOF.
+ * After this call, the page will pass PageIsNew() and read paths must
+ * fall back rather than error.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_reset_page);
+
+Datum
+epoch_xid_reset_page(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	Relation	rel;
+	Buffer		buf;
+	Page		page;
+
+	rel = table_open(relid, RowExclusiveLock);
+
+	if (!EpochRelationIsMaterialized(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("relation is not in materialized epoch mode")));
+
+	buf = EpochReadBufferReadOnly(rel, (BlockNumber) blkno);
+	if (!BufferIsValid(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("epoch block %d does not exist", blkno)));
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+
+	/* Zero out the entire page → PageIsNew state */
+	MemSet(page, 0, BLCKSZ);
+
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+
+	table_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * epoch_xid_set_num_slots(regclass, int4, int4) -> void
+ *
+ * TEST-ONLY function.  Artificially sets num_slots (the high-water mark)
+ * on a valid initialized epoch page.  This creates the condition where
+ * heap tuples exist at offsets beyond num_slots, exercising the
+ * slot-beyond-HWM fallback contract.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_set_num_slots);
+
+Datum
+epoch_xid_set_num_slots(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	int32		new_num_slots = PG_GETARG_INT32(2);
+	Relation	rel;
+	Buffer		buf;
+	Page		page;
+	EpochPageOpaque opaque;
+
+	rel = table_open(relid, RowExclusiveLock);
+
+	if (!EpochRelationIsMaterialized(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("relation is not in materialized epoch mode")));
+
+	buf = EpochReadBufferReadOnly(rel, (BlockNumber) blkno);
+	if (!BufferIsValid(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("epoch block %d does not exist", blkno)));
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+
+	if (PageIsNew(page))
+	{
+		UnlockReleaseBuffer(buf);
+		table_close(rel, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("epoch block %d is PageIsNew", blkno)));
+	}
+
+	opaque = EpochPageGetOpaque(page);
+	opaque->num_slots = new_num_slots;
+
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+
+	table_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
 }

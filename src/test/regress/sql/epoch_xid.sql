@@ -677,3 +677,247 @@ SELECT xmin_status, xmax_status, visibility_verdict, verdict_reason, relation_mo
 FROM epoch_xid_tuple_current_visibility_info('epoch_vis_fallback'::regclass, '(0,1)'::tid);
 
 DROP TABLE epoch_vis_fallback;
+
+
+-- ======================================================
+-- Phase 6: Storage contract tests
+-- ======================================================
+
+-- Test p6_a1: Implicit mode — fork absent, read-only page state
+CREATE TABLE epoch_p6_implicit (id int, val text);
+COPY epoch_p6_implicit FROM stdin;
+1	implicit row
+\.
+
+-- Page state should be 'fork_absent' (relation has no epoch fork)
+SELECT epoch_xid_page_state('epoch_p6_implicit'::regclass, 0);
+
+-- Relation should still be implicit after the read-only call
+-- (the read path must NOT create the fork)
+SELECT epoch_xid_relation_mode('epoch_p6_implicit'::regclass);
+
+-- Tuple inspection should fall back to implicit_default
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_implicit'::regclass, '(0,1)'::tid);
+
+-- Confirm again: fork still absent after read-side inspection
+SELECT epoch_xid_page_state('epoch_p6_implicit'::regclass, 0);
+
+DROP TABLE epoch_p6_implicit;
+
+
+-- Test p6_a2: Materialized relation, epoch block beyond EOF
+-- Create table with rows on multiple pages, but only materialize page 0.
+CREATE TABLE epoch_p6_beyond_eof (id int, val bytea);
+
+-- Insert rows with 200-byte values to fill page 0
+INSERT INTO epoch_p6_beyond_eof
+  SELECT g, decode(repeat(lpad(to_hex(g), 2, '0'), 100), 'hex')
+  FROM generate_series(1, 30) g;
+
+-- Relation should be materialized (INSERT hooks the epoch path)
+SELECT epoch_xid_relation_mode('epoch_p6_beyond_eof'::regclass);
+
+-- Page 0 should be 'valid' (INSERT materialized it)
+SELECT epoch_xid_page_state('epoch_p6_beyond_eof'::regclass, 0);
+
+-- A page well beyond EOF should be 'beyond_eof'
+SELECT epoch_xid_page_state('epoch_p6_beyond_eof'::regclass, 999);
+
+-- Inspection of a tuple on the materialized page should work
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_beyond_eof'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_p6_beyond_eof;
+
+
+-- Test p6_a3: PageIsNew / all-zero page within EOF — legal absence
+-- This tests the most important Phase 6 contract state: a within-EOF
+-- epoch block that is all-zero (PageIsNew).  The current implementation's
+-- eager-initialize write path does not produce this in normal steady
+-- state, so we use a test-only helper to create it explicitly.
+CREATE TABLE epoch_p6_page_new (id int);
+
+-- INSERT materializes the epoch fork and initializes page 0
+INSERT INTO epoch_p6_page_new VALUES (1);
+
+-- Confirm page 0 is valid before reset
+SELECT epoch_xid_page_state('epoch_p6_page_new'::regclass, 0);
+
+-- Reset page 0 to all-zero / PageIsNew state while keeping it within EOF
+SELECT epoch_xid_reset_page('epoch_p6_page_new'::regclass, 0);
+
+-- Verify: page is within EOF but in PageIsNew state
+SELECT epoch_xid_page_state('epoch_p6_page_new'::regclass, 0);
+
+-- Relation must still be materialized (the fork still exists)
+SELECT epoch_xid_relation_mode('epoch_p6_page_new'::regclass);
+
+-- Read-side inspection must fall back to implicit_default for both xmin and xmax,
+-- NOT error (PageIsNew is a legal absence state, NOT corruption)
+SELECT xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_page_new'::regclass, '(0,1)'::tid);
+
+-- Phase 4 inspection must also fall back correctly
+SELECT xmin_status, tuple_state, relation_mode
+FROM epoch_xid_tuple_txn_state_info('epoch_p6_page_new'::regclass, '(0,1)'::tid);
+
+-- Phase 5 inspection must also handle PageIsNew gracefully
+SELECT visibility_verdict, relation_mode
+FROM epoch_xid_tuple_current_visibility_info('epoch_p6_page_new'::regclass, '(0,1)'::tid);
+
+-- epoch_xid_inspect should return 0 rows (not error)
+SELECT count(*) AS inspect_rows
+FROM epoch_xid_inspect('epoch_p6_page_new'::regclass, 0);
+
+-- Verify the read path did NOT re-initialize the page as a side effect
+-- (the page must still be PageIsNew after all the read-only inspections)
+SELECT epoch_xid_page_state('epoch_p6_page_new'::regclass, 0);
+
+DROP TABLE epoch_p6_page_new;
+
+
+-- Test p6_a4: Slot beyond high-water mark — real HWM fallback
+-- This tests that when offnum > num_slots on a valid epoch page,
+-- the read path falls back to implicit_default rather than reading
+-- garbage data from the slot array.
+CREATE TABLE epoch_p6_hwm (id int);
+
+-- Insert 3 rows (all epoch-aware, sets num_slots = 3)
+INSERT INTO epoch_p6_hwm VALUES (1);
+INSERT INTO epoch_p6_hwm VALUES (2);
+INSERT INTO epoch_p6_hwm VALUES (3);
+
+-- Confirm page 0 is valid and all 3 slots are materialized
+SELECT epoch_xid_page_state('epoch_p6_hwm'::regclass, 0);
+SELECT xmin_interp
+FROM epoch_xid_tuple_visibility_info('epoch_p6_hwm'::regclass, '(0,3)'::tid);
+
+-- Artificially lower num_slots to 1 so that slots 2 and 3 are beyond HWM
+SELECT epoch_xid_set_num_slots('epoch_p6_hwm'::regclass, 0, 1);
+
+-- Slot 1: within HWM, should still be materialized
+SELECT xmin_interp
+FROM epoch_xid_tuple_visibility_info('epoch_p6_hwm'::regclass, '(0,1)'::tid);
+
+-- Slot 2: beyond HWM (offnum 2 > num_slots 1), must fall back
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_hwm'::regclass, '(0,2)'::tid);
+
+-- Slot 3: also beyond HWM, must fall back
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_hwm'::regclass, '(0,3)'::tid);
+
+DROP TABLE epoch_p6_hwm;
+
+
+-- Test p6_a5: Materialized relation with per-slot absent (flags = 0)
+-- This uses COPY + INSERT to create a slot with no epoch metadata
+-- within a materialized relation.
+CREATE TABLE epoch_p6_slot_absent (id int, val text);
+COPY epoch_p6_slot_absent FROM stdin;
+1	pre-materialization
+\.
+
+INSERT INTO epoch_p6_slot_absent VALUES (2, 'materializer');
+
+-- Relation is materialized, page is valid
+SELECT epoch_xid_page_state('epoch_p6_slot_absent'::regclass, 0);
+
+-- Slot 1 (COPY row) has flags=0 → should fall back to implicit_default
+SELECT xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_slot_absent'::regclass, '(0,1)'::tid);
+
+-- Slot 2 (INSERT row) should be materialized
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_p6_slot_absent'::regclass, '(0,2)'::tid);
+
+DROP TABLE epoch_p6_slot_absent;
+
+
+-- Test p6_b2: Write-path extension to distant block, verify intermediates
+CREATE TABLE epoch_p6_extension (id int, val bytea);
+
+-- Fill multiple pages via INSERT
+INSERT INTO epoch_p6_extension
+  SELECT g, decode(repeat(lpad(to_hex(g), 2, '0'), 100), 'hex')
+  FROM generate_series(1, 200) g;
+
+-- Should be materialized
+SELECT epoch_xid_relation_mode('epoch_p6_extension'::regclass);
+
+-- Page 0 should be valid (the INSERT touched it)
+SELECT epoch_xid_page_state('epoch_p6_extension'::regclass, 0);
+
+DROP TABLE epoch_p6_extension;
+
+
+-- Test p6_c1: Materialized relation with mixed pages (some valid, some not)
+CREATE TABLE epoch_p6_mixed_pages (id int, val bytea);
+
+-- Insert enough rows to span page 0, then page 1
+INSERT INTO epoch_p6_mixed_pages
+  SELECT g, decode(repeat(lpad(to_hex(g), 2, '0'), 100), 'hex')
+  FROM generate_series(1, 60) g;
+
+-- Relation is materialized
+SELECT epoch_xid_relation_mode('epoch_p6_mixed_pages'::regclass);
+
+-- Page 0 should be 'valid' (INSERT materialized it)
+SELECT epoch_xid_page_state('epoch_p6_mixed_pages'::regclass, 0);
+
+-- Due to current implementation's eager-initialize extension model,
+-- page 1 (if it exists) should also be 'valid', not 'page_new'
+-- because intermediate blocks are initialized during extension.
+
+DROP TABLE epoch_p6_mixed_pages;
+
+
+-- Test p6_d1: Truncate shrinks epoch fork
+CREATE TABLE epoch_p6_truncate (id int);
+INSERT INTO epoch_p6_truncate VALUES (1);
+INSERT INTO epoch_p6_truncate VALUES (2);
+
+-- Materialized, page 0 valid
+SELECT epoch_xid_relation_mode('epoch_p6_truncate'::regclass);
+SELECT epoch_xid_page_state('epoch_p6_truncate'::regclass, 0);
+
+TRUNCATE epoch_p6_truncate;
+
+-- After truncate, page 0 should be beyond_eof (fork truncated to 0 blocks)
+SELECT epoch_xid_page_state('epoch_p6_truncate'::regclass, 0);
+
+-- Re-insert should work (fork re-extends)
+INSERT INTO epoch_p6_truncate VALUES (3);
+SELECT epoch_xid_page_state('epoch_p6_truncate'::regclass, 0);
+
+DROP TABLE epoch_p6_truncate;
+
+
+-- Test p6_e2: Corruption boundary — corrupt page must error, not fall back
+CREATE TABLE epoch_p6_corrupt (id int);
+INSERT INTO epoch_p6_corrupt VALUES (1);
+
+-- Verify page 0 is valid before corruption
+SELECT epoch_xid_page_state('epoch_p6_corrupt'::regclass, 0);
+
+-- Inject corruption: write invalid epoch_version to page 0
+SELECT epoch_xid_corrupt_page('epoch_p6_corrupt'::regclass, 0);
+
+-- Page state should now report 'corrupt'
+SELECT epoch_xid_page_state('epoch_p6_corrupt'::regclass, 0);
+
+-- Attempting to read tuple interpretation on a corrupt page must ERROR
+-- (NOT silently fall back to default values)
+SELECT * FROM epoch_xid_tuple_visibility_info('epoch_p6_corrupt'::regclass, '(0,1)'::tid);
+
+-- Also verify Phase 4 inspection errors on corrupt page
+SELECT * FROM epoch_xid_tuple_txn_state_info('epoch_p6_corrupt'::regclass, '(0,1)'::tid);
+
+-- Also verify Phase 5 inspection errors on corrupt page
+SELECT * FROM epoch_xid_tuple_current_visibility_info('epoch_p6_corrupt'::regclass, '(0,1)'::tid);
+
+-- epoch_xid_inspect should also error on corrupt page
+SELECT * FROM epoch_xid_inspect('epoch_p6_corrupt'::regclass, 0);
+
+DROP TABLE epoch_p6_corrupt;

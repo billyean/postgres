@@ -483,6 +483,97 @@ is($mixed_post, 'committed|committed|invisible|xmax_committed_visible_in_snapsho
 
 $node->safe_psql('postgres', 'DROP TABLE epoch_vis_mixed_rec');
 
+# ============================================================
+# Phase 6: Storage contract recovery tests
+# ============================================================
+
+# Test 16: Truncate → restart → page_state is beyond_eof → re-materialization works
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_p6_trunc_rec (id int);
+INSERT INTO epoch_p6_trunc_rec VALUES (1);
+INSERT INTO epoch_p6_trunc_rec VALUES (2);
+});
+
+# Verify page 0 is valid before truncate
+my $p6_state_before = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_p6_trunc_rec'::regclass, 0)");
+is($p6_state_before, 'valid',
+	'Phase 6: page 0 is valid before truncate');
+
+$node->safe_psql('postgres', 'TRUNCATE epoch_p6_trunc_rec');
+$node->safe_psql('postgres', 'CHECKPOINT');
+
+# Crash and restart
+$node->stop('immediate');
+$node->start;
+
+# After recovery, page 0 should be beyond_eof (fork truncated)
+my $p6_state_after_trunc = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_p6_trunc_rec'::regclass, 0)");
+is($p6_state_after_trunc, 'beyond_eof',
+	'Phase 6: page 0 is beyond_eof after truncate + recovery');
+
+# Re-materialization: INSERT should work and page 0 should become valid
+$node->safe_psql('postgres',
+	"INSERT INTO epoch_p6_trunc_rec VALUES (3)");
+
+my $p6_state_remat = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_p6_trunc_rec'::regclass, 0)");
+is($p6_state_remat, 'valid',
+	'Phase 6: page 0 is valid again after re-materialization');
+
+# Verify the new tuple's epoch data is correct
+my $p6_xmin_interp = $node->safe_psql('postgres',
+	"SELECT xmin_interp FROM epoch_xid_tuple_visibility_info('epoch_p6_trunc_rec'::regclass, '(0,1)'::tid)");
+is($p6_xmin_interp, 'materialized',
+	'Phase 6: re-materialized tuple has correct epoch interpretation');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_p6_trunc_rec');
+
+# Test 17: PageIsNew within EOF survives restart as legal absence
+$node->safe_psql('postgres', qq{
+CREATE TABLE epoch_p6_pagenew_rec (id int);
+INSERT INTO epoch_p6_pagenew_rec VALUES (1);
+});
+
+# Reset page 0 to PageIsNew state
+$node->safe_psql('postgres',
+	"SELECT epoch_xid_reset_page('epoch_p6_pagenew_rec'::regclass, 0)");
+
+my $p6_new_before = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_p6_pagenew_rec'::regclass, 0)");
+is($p6_new_before, 'page_new',
+	'Phase 6: page 0 is page_new before crash');
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+
+# Crash and restart
+$node->stop('immediate');
+$node->start;
+
+# After recovery, the page should still be in a fallback-safe state.
+# It may be page_new (if the zero page was flushed at checkpoint) or
+# valid (if recovery replayed WAL that re-initialized it).
+# Either is a legal state per the Phase 6 contract.
+my $p6_new_after = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_p6_pagenew_rec'::regclass, 0)");
+ok($p6_new_after eq 'page_new' || $p6_new_after eq 'valid',
+	"Phase 6: page state after recovery is legal ($p6_new_after)");
+
+# Read-side inspection must not error regardless of which state the page is in
+my $p6_interp_after = $node->safe_psql('postgres',
+	"SELECT xmin_interp FROM epoch_xid_tuple_visibility_info('epoch_p6_pagenew_rec'::regclass, '(0,1)'::tid)");
+ok($p6_interp_after eq 'implicit_default' || $p6_interp_after eq 'materialized',
+	"Phase 6: read-side inspection works after recovery ($p6_interp_after)");
+
+# Relation mode should still be materialized
+my $p6_mode_after = $node->safe_psql('postgres',
+	"SELECT epoch_xid_relation_mode('epoch_p6_pagenew_rec'::regclass)");
+is($p6_mode_after, 'materialized',
+	'Phase 6: relation is still materialized after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_p6_pagenew_rec');
+
 $node->stop;
 
 done_testing();

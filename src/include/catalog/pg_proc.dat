@@ -12813,4 +12813,28 @@
   proargnames => '{rel,tid,full_xmin,full_xmax,xmin_status,xmax_status,visibility_verdict,verdict_reason,relation_mode}',
   prosrc => 'epoch_xid_tuple_current_visibility_info' },
 
+
+{ oid => '9908',
+  descr => 'report page-level storage-contract state of an epoch block',
+  proname => 'epoch_xid_page_state', provolatile => 'v',
+  prorettype => 'text', proargtypes => 'regclass int4',
+  prosrc => 'epoch_xid_page_state' },
+
+{ oid => '9909',
+  descr => 'TEST-ONLY: corrupt an epoch page for Phase 6 corruption boundary testing',
+  proname => 'epoch_xid_corrupt_page', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'regclass int4',
+  prosrc => 'epoch_xid_corrupt_page' },
+
+{ oid => '9910',
+  descr => 'TEST-ONLY: reset an epoch page to PageIsNew/all-zero state',
+  proname => 'epoch_xid_reset_page', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'regclass int4',
+  prosrc => 'epoch_xid_reset_page' },
+
+{ oid => '9911',
+  descr => 'TEST-ONLY: set num_slots on an epoch page for Phase 6 HWM testing',
+  proname => 'epoch_xid_set_num_slots', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'regclass int4 int4',
+  prosrc => 'epoch_xid_set_num_slots' },
 ]
