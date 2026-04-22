@@ -23,6 +23,7 @@
 
 #include "access/epoch_xid.h"
 #include "access/htup_details.h"
+#include "access/multixact.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/storage_xlog.h"
@@ -690,6 +691,103 @@ EpochRedoSlotUpdate(Page epochPage, xl_epoch_slot_update *xlrec)
 
 
 /* ----------------------------------------------------------------
+ *	MultiXact read-side classification helper (Patch 8)
+ *
+ *	EpochClassifyMultiXactXmax -- classify a MultiXact xmax for Phase 4.
+ *
+ *	Decomposes the MultiXact, identifies the shape (locker-only vs
+ *	updater-containing), and returns the effective EpochXidStatus plus the
+ *	effective TransactionId that downstream Phase 4/5 logic should use.
+ *
+ *	Read-only: does not set hint bits, does not create MultiXacts, does
+ *	not modify any page or buffer.
+ *
+ *	Supported cases:
+ *	  - HEAP_LOCKED_UPGRADED: locker-only (skip decomposition)
+ *	  - HEAP_XMAX_IS_LOCKED_ONLY: locker-only (skip decomposition)
+ *	  - Resolvable updater: classify updater XID via CLOG
+ *	  - Current xid is the updater: classified as IN_PROGRESS
+ *
+ *	Not separately supported in Patch 8:
+ *	  - Current xid is a locker: no behavioral difference from any other
+ *	    locker-only case, so not worth decomposing to detect
+ *
+ *	Unsupported cases (return EPOCH_XID_MULTIXACT_UNSUPPORTED):
+ *	  - GetMultiXactIdMembers returns <= 0 (truncated SLRU)
+ *	  - No updater found despite !LOCKED_ONLY (contradictory state)
+ * ----------------------------------------------------------------
+ */
+static EpochXidStatus
+EpochClassifyMultiXactXmax(HeapTupleHeader htup,
+						   TransactionId *effective_xid_out)
+{
+	MultiXactId multi;
+	MultiXactMember *members;
+	int			nmembers;
+	TransactionId updater_xid = InvalidTransactionId;
+	int			i;
+
+	Assert(htup->t_infomask & HEAP_XMAX_IS_MULTI);
+
+	if (effective_xid_out)
+		*effective_xid_out = InvalidTransactionId;
+
+	/*
+	 * Locker-only fast paths.  We intentionally do not decompose locker-only
+	 * MultiXacts to check whether the current xid is a member.  For locker-only
+	 * MultiXacts, current-xid membership does not change any Phase 4 or Phase 5
+	 * output: the tuple is live_locked / visible / multixact_lockers_only
+	 * regardless.  Decomposing would add SLRU access cost with no behavioral
+	 * difference.  Current-xid-as-locker is therefore not a separately supported
+	 * case in Patch 8.  (Current-xid-as-updater IS supported, because there the
+	 * membership determines the visibility verdict.)
+	 */
+
+	/* Pre-9.3 pg_upgrade'd share-lock: always locker-only */
+	if (HEAP_LOCKED_UPGRADED(htup->t_infomask))
+		return EPOCH_XID_MULTIXACT_LOCKERS_ONLY;
+
+	/* infomask guarantees no updater: locker-only */
+	if (HEAP_XMAX_IS_LOCKED_ONLY(htup->t_infomask))
+		return EPOCH_XID_MULTIXACT_LOCKERS_ONLY;
+
+	/* !LOCKED_ONLY: decompose to find the updater */
+	multi = HeapTupleHeaderGetRawXmax(htup);
+	nmembers = GetMultiXactIdMembers(multi, &members, false, false);
+
+	if (nmembers <= 0)
+		return EPOCH_XID_MULTIXACT_UNSUPPORTED;
+
+	for (i = 0; i < nmembers; i++)
+	{
+		if (ISUPDATE_from_mxstatus(members[i].status))
+		{
+			updater_xid = members[i].xid;
+			break;
+		}
+	}
+
+	pfree(members);
+
+	if (!TransactionIdIsValid(updater_xid))
+		return EPOCH_XID_MULTIXACT_UNSUPPORTED;
+
+	/* Classify the updater's XID via CLOG (no hint bits available) */
+	if (effective_xid_out)
+		*effective_xid_out = updater_xid;
+
+	if (TransactionIdIsCurrentTransactionId(updater_xid))
+		return EPOCH_XID_IN_PROGRESS;
+	if (TransactionIdIsInProgress(updater_xid))
+		return EPOCH_XID_IN_PROGRESS;
+	if (TransactionIdDidCommit(updater_xid))
+		return EPOCH_XID_COMMITTED;
+
+	return EPOCH_XID_ABORTED;
+}
+
+
+/* ----------------------------------------------------------------
  *	Read-side interpretation (Phase 3)
  * ----------------------------------------------------------------
  */
@@ -712,8 +810,8 @@ EpochInterpModeString(EpochInterpMode mode)
 			return "invalid";
 		case EPOCH_INTERP_INVALID_UNSET:
 			return "invalid_unset";
-		case EPOCH_INTERP_MULTIXACT_UNSUPPORTED:
-			return "multixact_unsupported";
+		case EPOCH_INTERP_MULTIXACT:
+			return "multixact";
 	}
 	return "unknown";
 }
@@ -763,9 +861,9 @@ EpochInterpretTuple(HeapTupleHeader htup, EpochSlotData *slot,
 	}
 	else if (htup->t_infomask & HEAP_XMAX_IS_MULTI)
 	{
-		/* Read path: report unsupported, do not ERROR */
+		/* Read path: MultiXact detected, decomposition deferred to Phase 4 */
 		result.full_xmax = InvalidFullTransactionId;
-		result.xmax_interp = EPOCH_INTERP_MULTIXACT_UNSUPPORTED;
+		result.xmax_interp = EPOCH_INTERP_MULTIXACT;
 	}
 	else if (!TransactionIdIsValid(xmax))
 	{
@@ -803,6 +901,7 @@ EpochXidStatusString(EpochXidStatus status)
 		case EPOCH_XID_FROZEN:			return "frozen";
 		case EPOCH_XID_INVALID_UNSET:	return "invalid_unset";
 		case EPOCH_XID_MULTIXACT_UNSUPPORTED: return "multixact_unsupported";
+		case EPOCH_XID_MULTIXACT_LOCKERS_ONLY: return "multixact_lockers_only";
 	}
 	return "unknown";
 }
@@ -820,6 +919,8 @@ EpochTupleStateString(EpochTupleState state)
 		case EPOCH_TUPLE_FROZEN_LIVE:			return "frozen_live";
 		case EPOCH_TUPLE_FROZEN_DELETED:		return "frozen_deleted";
 		case EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE: return "multixact_unclassifiable";
+		case EPOCH_TUPLE_LIVE_LOCKED:		return "live_locked";
+		case EPOCH_TUPLE_FROZEN_LOCKED:		return "frozen_locked";
 	}
 	return "unknown";
 }
@@ -827,10 +928,18 @@ EpochTupleStateString(EpochTupleState state)
 /*
  * EpochClassifyXidStatus -- classify transaction state of one xid.
  * Uses hint bits first, then CLOG lookup.  Read-only: does not set hint bits.
+ *
+ * effective_xid_out: for MultiXact xmax with a resolvable updater, set to the
+ * updater's TransactionId; otherwise set to the input xid.  Callers that need
+ * the effective xid for Phase 5 snapshot checks must pass a non-NULL pointer.
  */
 static EpochXidStatus
-EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin)
+EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin,
+					   TransactionId *effective_xid_out)
 {
+	if (effective_xid_out)
+		*effective_xid_out = xid;
+
 	if (is_xmin)
 	{
 		if (htup->t_infomask & HEAP_XMIN_FROZEN)
@@ -845,7 +954,7 @@ EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin)
 		if (htup->t_infomask & HEAP_XMAX_INVALID)
 			return EPOCH_XID_INVALID_UNSET;
 		if (htup->t_infomask & HEAP_XMAX_IS_MULTI)
-			return EPOCH_XID_MULTIXACT_UNSUPPORTED;
+			return EpochClassifyMultiXactXmax(htup, effective_xid_out);
 		if (htup->t_infomask & HEAP_XMAX_COMMITTED)
 			return EPOCH_XID_COMMITTED;
 	}
@@ -869,6 +978,19 @@ EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin)
 static EpochTupleState
 EpochDeriveTupleState(EpochXidStatus xmin_st, EpochXidStatus xmax_st)
 {
+	/* Locker-only MultiXact: tuple not deleted/updated by xmax */
+	if (xmax_st == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
+	{
+		if (xmin_st == EPOCH_XID_FROZEN)
+			return EPOCH_TUPLE_FROZEN_LOCKED;
+		if (xmin_st == EPOCH_XID_IN_PROGRESS)
+			return EPOCH_TUPLE_INSERTING_IN_PROGRESS;
+		if (xmin_st == EPOCH_XID_ABORTED)
+			return EPOCH_TUPLE_ABORTED_INSERT;
+		return EPOCH_TUPLE_LIVE_LOCKED;
+	}
+
+	/* Unresolvable MultiXact: members unavailable or contradictory state */
 	if (xmax_st == EPOCH_XID_MULTIXACT_UNSUPPORTED)
 		return EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE;
 
@@ -933,6 +1055,7 @@ EpochVerdictReasonString(EpochVerdictReason r)
 		case EPOCH_REASON_XMAX_IN_PROGRESS:			return "xmax_in_progress";
 		case EPOCH_REASON_OWN_DELETE_INVISIBLE:		return "own_delete_invisible";
 		case EPOCH_REASON_MULTIXACT_UNSUPPORTED:	return "multixact_unsupported";
+		case EPOCH_REASON_MULTIXACT_LOCKERS_ONLY: return "multixact_lockers_only";
 		case EPOCH_REASON_NO_SNAPSHOT:				return "no_snapshot";
 	}
 	return "unknown";
@@ -984,10 +1107,13 @@ EpochDeriveVisibility(HeapTupleHeader htup,
 		if (TransactionIdIsCurrentTransactionId(xmin_xid))
 		{
 			if (xmax_status == EPOCH_XID_INVALID_UNSET ||
-				xmax_status == EPOCH_XID_ABORTED)
+				xmax_status == EPOCH_XID_ABORTED ||
+				xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
 			{
 				*verdict = EPOCH_VIS_VISIBLE;
-				*reason = EPOCH_REASON_OWN_INSERT_VISIBLE;
+				*reason = (xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
+					? EPOCH_REASON_MULTIXACT_LOCKERS_ONLY
+					: EPOCH_REASON_OWN_INSERT_VISIBLE;
 				return;
 			}
 			if (TransactionIdIsValid(xmax_xid) &&
@@ -1018,10 +1144,13 @@ EpochDeriveVisibility(HeapTupleHeader htup,
 
 	/* xmin visible in snapshot → check xmax */
 	if (xmax_status == EPOCH_XID_INVALID_UNSET ||
-		xmax_status == EPOCH_XID_ABORTED)
+		xmax_status == EPOCH_XID_ABORTED ||
+		xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
 	{
 		*verdict = EPOCH_VIS_VISIBLE;
-		*reason = EPOCH_REASON_XMIN_COMMITTED_VISIBLE;
+		*reason = (xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
+			? EPOCH_REASON_MULTIXACT_LOCKERS_ONLY
+			: EPOCH_REASON_XMIN_COMMITTED_VISIBLE;
 		return;
 	}
 
@@ -1466,8 +1595,8 @@ epoch_xid_tuple_txn_state_info(PG_FUNCTION_ARGS)
 	/* Phase 4: classify transaction status */
 	xmin_xid = HeapTupleHeaderGetRawXmin(htup);
 	xmax_xid = HeapTupleHeaderGetRawXmax(htup);
-	xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true);
-	xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false);
+	xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true, NULL);
+	xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false, NULL);
 	tuple_state = EpochDeriveTupleState(xmin_status, xmax_status);
 
 	if (BufferIsValid(epochbuf))
@@ -1592,16 +1721,20 @@ epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
 	}
 	interp = EpochInterpretTuple(htup, slot, is_materialized);
 
-	/* Phase 4: status */
+	/* Phase 4: status (effective_xmax captures updater XID for MultiXact) */
 	xmin_xid = HeapTupleHeaderGetRawXmin(htup);
 	xmax_xid = HeapTupleHeaderGetRawXmax(htup);
-	xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true);
-	xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false);
+	{
+		TransactionId effective_xmax;
 
-	/* Phase 5: snapshot-relative visibility */
-	EpochDeriveVisibility(htup, xmin_xid, xmax_xid,
-						  xmin_status, xmax_status,
-						  &vis_verdict, &vis_reason);
+		xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true, NULL);
+		xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false, &effective_xmax);
+
+		/* Phase 5: snapshot-relative visibility using effective xmax */
+		EpochDeriveVisibility(htup, xmin_xid, effective_xmax,
+							  xmin_status, xmax_status,
+							  &vis_verdict, &vis_reason);
+	}
 
 	if (BufferIsValid(epochbuf))
 		UnlockReleaseBuffer(epochbuf);

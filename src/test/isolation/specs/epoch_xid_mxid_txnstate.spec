@@ -1,4 +1,4 @@
-# Test: Phase 4 MultiXact classification via epoch_xid_tuple_txn_state_info
+# Test: Phase 4 MultiXact classification — locker-only
 
 setup
 {

@@ -1,4 +1,4 @@
-# Phase 5 MultiXact unsupported via current-visibility function
+# Phase 5 MultiXact locker-only via current-visibility function
 
 setup
 {

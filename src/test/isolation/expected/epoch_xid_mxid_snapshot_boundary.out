@@ -1,0 +1,25 @@
+Parsed test spec with 3 sessions
+
+starting permutation: lock1 begin3 delete2 release1 inspect_p5 release3
+step lock1: BEGIN; SELECT * FROM epoch_mxid_snap WHERE id = 1 FOR KEY SHARE;
+id|val 
+--+----
+ 1|test
+(1 row)
+
+step begin3: BEGIN; SELECT 1;
+?column?
+--------
+       1
+(1 row)
+
+step delete2: DELETE FROM epoch_mxid_snap WHERE id = 1; <waiting ...>
+step release1: COMMIT;
+step delete2: <... completed>
+step inspect_p5: SELECT visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_mxid_snap'::regclass, '(0,1)'::tid);
+visibility_verdict|verdict_reason
+------------------+--------------
+visible           |frozen        
+(1 row)
+
+step release3: COMMIT;

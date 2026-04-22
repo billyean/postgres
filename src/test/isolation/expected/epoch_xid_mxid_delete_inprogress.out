@@ -1,0 +1,25 @@
+Parsed test spec with 3 sessions
+
+starting permutation: lock1 delete2 inspect_p4 inspect_p5 release1 release2
+step lock1: BEGIN; SELECT * FROM epoch_mxid_del_inprog WHERE id = 1 FOR KEY SHARE;
+id|val 
+--+----
+ 1|test
+(1 row)
+
+step delete2: BEGIN; DELETE FROM epoch_mxid_del_inprog WHERE id = 1; <waiting ...>
+step inspect_p4: SELECT xmax_status, tuple_state FROM epoch_xid_tuple_txn_state_info('epoch_mxid_del_inprog'::regclass, '(0,1)'::tid);
+xmax_status|tuple_state
+-----------+-----------
+in_progress|frozen_live
+(1 row)
+
+step inspect_p5: SELECT visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_mxid_del_inprog'::regclass, '(0,1)'::tid);
+visibility_verdict|verdict_reason
+------------------+--------------
+visible           |frozen        
+(1 row)
+
+step release1: ROLLBACK;
+step delete2: <... completed>
+step release2: ROLLBACK;

@@ -10,8 +10,8 @@ step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;
 step s1_delete: DELETE FROM epoch_vis_del_snapshot WHERE id = 1;
 step s2_inspect: SELECT visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_vis_del_snapshot'::regclass, '(0,1)'::tid);
 visibility_verdict|verdict_reason
-------------------+----------------------------------
-visible           |xmax_committed_not_in_snapshot
+------------------+--------------
+visible           |frozen        
 (1 row)
 
 step s2_end: COMMIT;

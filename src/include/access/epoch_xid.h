@@ -257,7 +257,7 @@ typedef enum EpochInterpMode
 	EPOCH_INTERP_FROZEN,				/* HEAP_XMIN_FROZEN; epoch irrelevant */
 	EPOCH_INTERP_INVALID,				/* TransactionId is invalid (0) */
 	EPOCH_INTERP_INVALID_UNSET,			/* xmax: HEAP_XMAX_INVALID is set */
-	EPOCH_INTERP_MULTIXACT_UNSUPPORTED	/* xmax: HEAP_XMAX_IS_MULTI; cannot interpret */
+	EPOCH_INTERP_MULTIXACT				/* xmax: HEAP_XMAX_IS_MULTI */
 } EpochInterpMode;
 
 /*
@@ -305,7 +305,8 @@ typedef enum EpochXidStatus
 	EPOCH_XID_IN_PROGRESS,
 	EPOCH_XID_FROZEN,
 	EPOCH_XID_INVALID_UNSET,
-	EPOCH_XID_MULTIXACT_UNSUPPORTED
+	EPOCH_XID_MULTIXACT_UNSUPPORTED,	/* unresolvable MultiXact (truncated SLRU etc.) */
+	EPOCH_XID_MULTIXACT_LOCKERS_ONLY	/* MultiXact with only lockers, no updater */
 } EpochXidStatus;
 
 /*
@@ -321,7 +322,9 @@ typedef enum EpochTupleState
 	EPOCH_TUPLE_ABORTED_INSERT,
 	EPOCH_TUPLE_FROZEN_LIVE,
 	EPOCH_TUPLE_FROZEN_DELETED,
-	EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE
+	EPOCH_TUPLE_MULTIXACT_UNCLASSIFIABLE,	/* unresolvable MultiXact */
+	EPOCH_TUPLE_LIVE_LOCKED,				/* xmin committed, xmax = lockers only */
+	EPOCH_TUPLE_FROZEN_LOCKED				/* xmin frozen, xmax = lockers only */
 } EpochTupleState;
 
 extern const char *EpochXidStatusString(EpochXidStatus status);
@@ -350,6 +353,7 @@ typedef enum EpochVerdictReason
 	EPOCH_REASON_XMAX_IN_PROGRESS,
 	EPOCH_REASON_OWN_DELETE_INVISIBLE,
 	EPOCH_REASON_MULTIXACT_UNSUPPORTED,
+	EPOCH_REASON_MULTIXACT_LOCKERS_ONLY,
 	EPOCH_REASON_NO_SNAPSHOT
 } EpochVerdictReason;
 
