@@ -19,17 +19,206 @@
 #include "postgres.h"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "access/epoch_xid.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/storage_xlog.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/snapmgr.h"
+
+
+/* ----------------------------------------------------------------
+ *	Segment-aware sparse-file helpers
+ *
+ *	PostgreSQL relation forks are segmented: each segment file holds
+ *	at most RELSEG_SIZE blocks.  Logical block N maps to:
+ *
+ *	  segment number    = N / RELSEG_SIZE
+ *	  in-segment offset = N % RELSEG_SIZE
+ *
+ *	Segment 0 uses the fork's base relpath (e.g., "base/5/16384_epoch").
+ *	Segment K>0 appends ".K" (e.g., "base/5/16384_epoch.1").
+ *
+ *	All sparse-extension and hole-inspection operations must use the
+ *	correct physical segment file and in-segment offset.
+ * ----------------------------------------------------------------
+ */
+
+#define EPOCH_SEG_PATH_MAXLEN (REL_PATH_STR_MAXLEN + 1 + 10 + 1)
+
+/*
+ * epoch_seg_path
+ *
+ * Build the filesystem path for epoch fork segment 'segno'.
+ * Segment 0 = base relpath; segment K>0 = relpath + ".K".
+ */
+static void
+epoch_seg_path(char *buf, size_t bufsz,
+			   SMgrRelation smgr, BlockNumber segno)
+{
+	RelPathStr	base;
+
+	base = relpath(smgr->smgr_rlocator, EPOCH_FORKNUM);
+	if (segno == 0)
+		strlcpy(buf, base.str, bufsz);
+	else
+		snprintf(buf, bufsz, "%s.%u", base.str, segno);
+}
+
+
+/*
+ * epoch_seg_extend_sparse
+ *
+ * Extend a single epoch fork segment file to new_seg_blocks using
+ * ftruncate().  This creates true filesystem holes for the new region:
+ *
+ *   Linux (ext4/XFS): ftruncate beyond EOF creates a file hole.
+ *     The kernel does not allocate physical disk blocks for the gap.
+ *     Reading the hole returns zeros.  This is POSIX-standard behavior.
+ *
+ *   macOS (APFS): ftruncate beyond EOF creates a sparse region.
+ *     APFS does not allocate physical storage for the gap.  Reading
+ *     returns zeros.  Supported since macOS 10.13 (High Sierra).
+ *
+ * Unlike smgrzeroextend (which uses posix_fallocate or pg_pwrite_zeros),
+ * ftruncate is the only POSIX mechanism that creates true holes —
+ * neither posix_fallocate nor pwrite preserves sparseness.
+ *
+ * If a platform or filesystem does not preserve holes (e.g., some
+ * network filesystems), ftruncate still correctly extends the file
+ * with zero-filled blocks.  Correctness is preserved because
+ * PageIsNew (all-zero) is a legal absence state per Phase 6.
+ * Sparseness is an optimization, not a correctness dependency.
+ *
+ * segno: physical segment number
+ * new_seg_blocks: desired segment size in blocks
+ */
+static void
+epoch_seg_extend_sparse(SMgrRelation smgr, BlockNumber segno,
+						BlockNumber new_seg_blocks)
+{
+	char		segpath[EPOCH_SEG_PATH_MAXLEN];
+	int			fd;
+
+	epoch_seg_path(segpath, sizeof(segpath), smgr, segno);
+
+	fd = BasicOpenFile(segpath, O_RDWR | O_CREAT | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open epoch fork segment \"%s\": %m",
+						segpath)));
+
+	if (ftruncate(fd, (off_t) new_seg_blocks * BLCKSZ) < 0)
+	{
+		int			save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not extend epoch fork segment \"%s\" to %u blocks: %m",
+						segpath, new_seg_blocks)));
+	}
+
+	close(fd);
+}
+
+/*
+ * epoch_fork_extend_sparse
+ *
+ * Extend the epoch fork to cover logical block new_nblocks_total,
+ * using segment-correct sparse extension via ftruncate.
+ *
+ * For each segment that needs to grow:
+ *   - segment files before the target segment are extended to
+ *     RELSEG_SIZE blocks (full segment, sparse holes)
+ *   - the target segment file is extended to cover the target
+ *     in-segment block (sparse holes for untouched blocks)
+ *   - only the target block itself will later be materialized
+ *     by the caller; all other blocks remain as filesystem holes
+ *
+ * After extension, the smgr cached nblocks is invalidated so
+ * subsequent smgrnblocks() queries re-read from the kernel.
+ *
+ * Caller must hold the relation extension lock.
+ */
+static void
+epoch_fork_extend_sparse(SMgrRelation smgr, BlockNumber new_nblocks_total)
+{
+	BlockNumber target_segno;
+	BlockNumber target_seg_blocks;
+	BlockNumber seg;
+	BlockNumber current_nblocks;
+	BlockNumber current_last_segno;
+	BlockNumber current_seg_blocks_in_last;
+
+	target_segno = new_nblocks_total / ((BlockNumber) RELSEG_SIZE);
+	target_seg_blocks = new_nblocks_total % ((BlockNumber) RELSEG_SIZE);
+	if (target_seg_blocks == 0 && new_nblocks_total > 0)
+	{
+		target_segno--;
+		target_seg_blocks = (BlockNumber) RELSEG_SIZE;
+	}
+
+	/*
+	 * Determine current fork size to avoid redundant segment operations.
+	 * smgrnblocks is safe here because the caller holds the extension
+	 * lock, preventing concurrent modification.  It ultimately calls
+	 * lseek(SEEK_END) which returns the correct size even after our
+	 * prior ftruncate calls in the same session.
+	 */
+	current_nblocks = smgrnblocks(smgr, EPOCH_FORKNUM);
+	if (current_nblocks > 0)
+	{
+		current_last_segno = (current_nblocks - 1) / ((BlockNumber) RELSEG_SIZE);
+		current_seg_blocks_in_last =
+			current_nblocks - current_last_segno * ((BlockNumber) RELSEG_SIZE);
+	}
+	else
+	{
+		current_last_segno = 0;
+		current_seg_blocks_in_last = 0;
+	}
+
+	/*
+	 * Extend each segment that needs to grow.  Segments before the target
+	 * segment are extended to full RELSEG_SIZE.  The target segment is
+	 * extended to cover the target in-segment block.
+	 */
+	for (seg = 0; seg <= target_segno; seg++)
+	{
+		BlockNumber needed;
+		BlockNumber have;
+
+		if (seg < target_segno)
+			needed = (BlockNumber) RELSEG_SIZE;
+		else
+			needed = target_seg_blocks;
+
+		/* What does this segment currently have? */
+		if (seg < current_last_segno)
+			have = (BlockNumber) RELSEG_SIZE;  /* full prior segment */
+		else if (seg == current_last_segno)
+			have = current_seg_blocks_in_last;
+		else
+			have = 0;  /* segment does not exist yet */
+
+		if (needed > have)
+			epoch_seg_extend_sparse(smgr, seg, needed);
+	}
+
+	/* Invalidate smgr cache so next nblocks query re-reads from kernel */
+	smgr->smgr_cached_nblocks[EPOCH_FORKNUM] = InvalidBlockNumber;
+}
 
 
 /* ----------------------------------------------------------------
@@ -134,6 +323,15 @@ EpochPageInit(Page page)
  * Read (and optionally extend) the epoch buffer for a heap block.
  * Returns a pinned but NOT locked buffer.
  *
+ * When extending, uses ftruncate-based sparse extension so that
+ * intermediate blocks between the current EOF and the target become
+ * true filesystem holes (Linux ext4/XFS, macOS APFS).  Only the
+ * target block is materialized with epoch page metadata.
+ *
+ * Extension is segment-aware: logical block N maps to segment
+ * N / RELSEG_SIZE at in-segment offset N % RELSEG_SIZE.  Each
+ * segment file is independently extended via ftruncate.
+ *
  * If extend_ok is false and the block does not exist, returns
  * InvalidBuffer.
  */
@@ -161,33 +359,41 @@ EpochReadBuffer(Relation rel, BlockNumber heapBlk, bool extend_ok)
 
 	/* Extend the fork to cover heapBlk */
 	LockRelationForExtension(rel, ExclusiveLock);
+	smgr = RelationGetSmgr(rel);
 	nblocks = smgrnblocks(smgr, EPOCH_FORKNUM);
 
-	buf = InvalidBuffer;
-
-	while (nblocks <= heapBlk)
+	/* Re-check: another backend may have extended past our target */
+	if (heapBlk < nblocks)
 	{
-		Buffer		newbuf;
-		Page		page;
-
-		newbuf = ReadBufferExtended(rel, EPOCH_FORKNUM, P_NEW,
-									RBM_ZERO_AND_LOCK, NULL);
-		page = BufferGetPage(newbuf);
-		EpochPageInit(page);
-		MarkBufferDirty(newbuf);
-
-		if (nblocks == heapBlk)
-		{
-			LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
-			buf = newbuf;
-		}
-		else
-		{
-			UnlockReleaseBuffer(newbuf);
-		}
-
-		nblocks++;
+		UnlockRelationForExtension(rel, ExclusiveLock);
+		return ReadBufferExtended(rel, EPOCH_FORKNUM, heapBlk,
+								 RBM_NORMAL, NULL);
 	}
+
+	/*
+	 * Sparse extension via ftruncate.
+	 *
+	 * Grow the fork's segment file(s) to cover block heapBlk.
+	 * ftruncate creates true filesystem holes for all new blocks —
+	 * no physical disk allocation occurs on Linux (ext4/XFS) or
+	 * macOS (APFS).
+	 *
+	 * Only the target block is then materialized in shared_buffers.
+	 * Intermediate hole-backed blocks remain unmaterialized until
+	 * their first DML write touch, at which point the existing
+	 * PageIsNew guards in heapam.c initialize them on demand.
+	 */
+	epoch_fork_extend_sparse(smgr, heapBlk + 1);
+
+	buf = ReadBufferExtended(rel, EPOCH_FORKNUM, heapBlk,
+							 RBM_ZERO_AND_LOCK, NULL);
+	{
+		Page		page = BufferGetPage(buf);
+
+		EpochPageInit(page);
+		MarkBufferDirty(buf);
+	}
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 	UnlockRelationForExtension(rel, ExclusiveLock);
 	Assert(BufferIsValid(buf));
@@ -1642,4 +1848,252 @@ epoch_xid_set_num_slots(PG_FUNCTION_ARGS)
 
 	table_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
+}
+
+
+/* ----------------------------------------------------------------
+ *	Patch 7: Segment-aware sparse-file introspection (test-only)
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * epoch_xid_block_status(regclass, int4) -> text
+ *
+ * TEST-ONLY function.  Reports the physical allocation status of a
+ * logical epoch block by mapping it to the correct segment file and
+ * in-segment offset, then using SEEK_HOLE / SEEK_DATA.
+ *
+ * Logical block N maps to:
+ *   segment file  = relpath + "." + (N / RELSEG_SIZE), or base for seg 0
+ *   in-seg offset = (N % RELSEG_SIZE) * BLCKSZ
+ *
+ * Returns:
+ *   'hole'        - block within EOF, is a sparse hole (SEEK_HOLE)
+ *   'data'        - block within EOF, contains allocated data
+ *   'beyond_eof'  - block past the segment file size, or segment absent
+ *   'fork_absent' - epoch fork does not exist
+ *   'unsupported' - SEEK_HOLE/SEEK_DATA not available
+ *
+ * Platform assumptions:
+ *   Linux:  SEEK_HOLE/SEEK_DATA available since kernel 3.1 (2011).
+ *           Works on ext4, XFS, btrfs, tmpfs.
+ *   macOS:  SEEK_HOLE/SEEK_DATA available since 10.4 (2005).
+ *           Works on APFS and HFS+.
+ *   If a filesystem does not support SEEK_HOLE (returns ENXIO or
+ *   treats the entire file as data), this function returns 'data'
+ *   for all within-EOF blocks.  That is correct: the semantics still
+ *   hold (PageIsNew = legal absence), only the sparse optimization
+ *   is not active.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_block_status);
+
+Datum
+epoch_xid_block_status(PG_FUNCTION_ARGS)
+{
+#if defined(SEEK_HOLE) && defined(SEEK_DATA)
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	Relation	rel;
+	SMgrRelation smgr;
+	BlockNumber	segno;
+	BlockNumber	seg_offset;
+	char		segpath[EPOCH_SEG_PATH_MAXLEN];
+	int			fd;
+	off_t		file_size;
+	off_t		byte_offset;
+	off_t		hole_start;
+	const char *status;
+
+	rel = table_open(relid, AccessShareLock);
+	smgr = RelationGetSmgr(rel);
+
+	if (!epoch_fork_exists_on_disk(smgr))
+	{
+		table_close(rel, AccessShareLock);
+		PG_RETURN_TEXT_P(cstring_to_text("fork_absent"));
+	}
+
+	segno = (BlockNumber) blkno / ((BlockNumber) RELSEG_SIZE);
+	seg_offset = (BlockNumber) blkno % ((BlockNumber) RELSEG_SIZE);
+
+	epoch_seg_path(segpath, sizeof(segpath), smgr, segno);
+	table_close(rel, AccessShareLock);
+
+	fd = BasicOpenFile(segpath, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		PG_RETURN_TEXT_P(cstring_to_text("beyond_eof"));
+
+	file_size = lseek(fd, 0, SEEK_END);
+	byte_offset = (off_t) seg_offset * BLCKSZ;
+
+	if (byte_offset >= file_size)
+	{
+		close(fd);
+		PG_RETURN_TEXT_P(cstring_to_text("beyond_eof"));
+	}
+
+	hole_start = lseek(fd, byte_offset, SEEK_HOLE);
+
+	if (hole_start < 0)
+	{
+		close(fd);
+		PG_RETURN_TEXT_P(cstring_to_text("unsupported"));
+	}
+
+	if (hole_start <= byte_offset)
+		status = "hole";
+	else
+		status = "data";
+
+	close(fd);
+	PG_RETURN_TEXT_P(cstring_to_text(status));
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("unsupported"));
+#endif
+}
+
+/*
+ * epoch_xid_block_segment_info(regclass, int4) -> text
+ *
+ * TEST-ONLY function.  Exposes the logical-block -> physical-segment
+ * mapping for the epoch fork.  Returns a text string:
+ *   "seg=<N> offset=<M> path=<path>"
+ *
+ * Validates that the segment-aware helpers compute the correct
+ * mapping, especially for blocks beyond the first segment boundary.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_block_segment_info);
+
+Datum
+epoch_xid_block_segment_info(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	Relation	rel;
+	SMgrRelation smgr;
+	BlockNumber	segno;
+	BlockNumber	seg_offset;
+	char		segpath[EPOCH_SEG_PATH_MAXLEN];
+	char		result[EPOCH_SEG_PATH_MAXLEN + 64];
+
+	rel = table_open(relid, AccessShareLock);
+	smgr = RelationGetSmgr(rel);
+
+	segno = (BlockNumber) blkno / ((BlockNumber) RELSEG_SIZE);
+	seg_offset = (BlockNumber) blkno % ((BlockNumber) RELSEG_SIZE);
+
+	epoch_seg_path(segpath, sizeof(segpath), smgr, segno);
+	table_close(rel, AccessShareLock);
+
+	snprintf(result, sizeof(result), "seg=%u offset=%u path=%s",
+			 segno, seg_offset, segpath);
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
+ * epoch_xid_force_materialize_block(regclass, int4) -> void
+ *
+ * TEST-ONLY function.  Directly materializes a specific logical epoch
+ * block using the real sparse extension code path (EpochEnsureFork +
+ * epoch_fork_extend_sparse + buffer init).  This allows testing
+ * cross-segment sparse materialization without needing a heap that
+ * actually spans >1GB.
+ *
+ * After this call:
+ *   - the epoch fork exists and covers logical block 'blkno'
+ *   - the target block is initialized with epoch page metadata
+ *   - all intermediate blocks are sparse holes (ftruncate-backed)
+ *   - segment files are created as needed for cross-segment blocks
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_force_materialize_block);
+
+Datum
+epoch_xid_force_materialize_block(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		blkno = PG_GETARG_INT32(1);
+	Relation	rel;
+	SMgrRelation smgr;
+	Buffer		buf;
+	Page		page;
+
+	rel = table_open(relid, RowExclusiveLock);
+
+	EpochEnsureFork(rel);
+
+	smgr = RelationGetSmgr(rel);
+
+	LockRelationForExtension(rel, ExclusiveLock);
+
+	epoch_fork_extend_sparse(smgr, (BlockNumber) blkno + 1);
+
+	buf = ReadBufferExtended(rel, EPOCH_FORKNUM, (BlockNumber) blkno,
+							 RBM_ZERO_AND_LOCK, NULL);
+	page = BufferGetPage(buf);
+	EpochPageInit(page);
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+
+	UnlockRelationForExtension(rel, ExclusiveLock);
+
+	table_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * epoch_xid_sparse_platform_check() -> text
+ *
+ * TEST-ONLY function.  Validates that SEEK_HOLE/SEEK_DATA is
+ * functional on the current platform by creating a temporary file,
+ * extending it via ftruncate, and probing with SEEK_HOLE.
+ *
+ * Returns:
+ *   'sparse_supported' - SEEK_HOLE detects holes created by ftruncate
+ *   'no_seek_hole'     - SEEK_HOLE/SEEK_DATA not available at compile time
+ *   'seek_hole_broken' - SEEK_HOLE available but does not detect holes
+ *
+ * This function is intended for Linux and macOS, where SEEK_HOLE
+ * must detect ftruncate-created holes for the sparse-file tests to
+ * be meaningful.  If this returns anything other than
+ * 'sparse_supported' on Linux or macOS, the filesystem may not
+ * support sparse files (e.g., some NFS or virtualized mounts).
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_sparse_platform_check);
+
+Datum
+epoch_xid_sparse_platform_check(PG_FUNCTION_ARGS)
+{
+#if defined(SEEK_HOLE) && defined(SEEK_DATA)
+	char		tmppath[MAXPGPATH];
+	int			fd;
+	off_t		hole_pos;
+
+	snprintf(tmppath, sizeof(tmppath), "%s/epoch_sparse_check.tmp",
+			 DataDir);
+
+	fd = BasicOpenFile(tmppath, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0)
+		PG_RETURN_TEXT_P(cstring_to_text("seek_hole_broken"));
+
+	/* Extend to 2 blocks via ftruncate — should create a hole */
+	if (ftruncate(fd, 2 * BLCKSZ) < 0)
+	{
+		close(fd);
+		unlink(tmppath);
+		PG_RETURN_TEXT_P(cstring_to_text("seek_hole_broken"));
+	}
+
+	/* SEEK_HOLE from offset 0: if the file is sparse, returns 0 */
+	hole_pos = lseek(fd, 0, SEEK_HOLE);
+	close(fd);
+	unlink(tmppath);
+
+	if (hole_pos == 0)
+		PG_RETURN_TEXT_P(cstring_to_text("sparse_supported"));
+	else
+		PG_RETURN_TEXT_P(cstring_to_text("seek_hole_broken"));
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("no_seek_hole"));
+#endif
 }

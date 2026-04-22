@@ -869,9 +869,8 @@ SELECT epoch_xid_relation_mode('epoch_p6_mixed_pages'::regclass);
 -- Page 0 should be 'valid' (INSERT materialized it)
 SELECT epoch_xid_page_state('epoch_p6_mixed_pages'::regclass, 0);
 
--- Due to current implementation's eager-initialize extension model,
--- page 1 (if it exists) should also be 'valid', not 'page_new'
--- because intermediate blocks are initialized during extension.
+-- Sequential INSERT extends the epoch fork one block at a time (no gap),
+-- so each page is individually materialized.  Page 1 should be 'valid'.
 
 DROP TABLE epoch_p6_mixed_pages;
 
@@ -1043,3 +1042,261 @@ SELECT epoch_xid_page_state('epoch_pfx_corrupt'::regclass, 0);
 SELECT * FROM epoch_xid_tuple_visibility_info('epoch_pfx_corrupt'::regclass, '(0,1)'::tid);
 
 DROP TABLE epoch_pfx_corrupt;
+
+
+-- ======================================================
+-- Patch 7: Sparse-file epoch fork extension tests
+-- ======================================================
+-- These tests validate that ftruncate-based sparse extension creates
+-- true filesystem holes for intermediate epoch blocks, that the
+-- segment-aware mapping is correct, and that all Phase 6 semantics
+-- are preserved.
+--
+-- Platform-specific expectations:
+--   Linux (ext4/XFS):  SEEK_HOLE/SEEK_DATA available since kernel 3.1.
+--     ftruncate beyond EOF creates file holes.  epoch_xid_block_status
+--     reports 'hole' for unwritten blocks.
+--   macOS (APFS):  SEEK_HOLE/SEEK_DATA available since macOS 10.4.
+--     ftruncate beyond EOF creates sparse regions on APFS.
+--     epoch_xid_block_status reports 'hole' for unwritten blocks.
+--   If a filesystem does not report holes (some network/virtualized FS),
+--     epoch_xid_block_status returns 'data' for all within-EOF blocks.
+--     Correctness is preserved (PageIsNew = legal absence per Phase 6);
+--     only the sparse optimization is inactive.
+
+
+-- Test sp_a: Sparse extension — intermediates are real holes.
+CREATE TABLE epoch_sp_sparse (id int, pad char(2000));
+ALTER TABLE epoch_sp_sparse ALTER COLUMN pad SET STORAGE PLAIN;
+
+COPY epoch_sp_sparse FROM stdin;
+1	x
+2	x
+3	x
+4	x
+5	x
+6	x
+7	x
+8	x
+9	x
+10	x
+11	x
+12	x
+13	x
+14	x
+15	x
+16	x
+\.
+
+SELECT epoch_xid_relation_mode('epoch_sp_sparse'::regclass);
+
+-- Verify data spans multiple pages
+SELECT (ctid::text::point)[0]::int AS page FROM epoch_sp_sparse WHERE id = 1;
+SELECT (ctid::text::point)[0]::int AS page FROM epoch_sp_sparse WHERE id = 16;
+
+-- UPDATE materializes epoch fork via ftruncate sparse extension
+UPDATE epoch_sp_sparse SET pad = 'y' WHERE id = 16;
+SELECT epoch_xid_relation_mode('epoch_sp_sparse'::regclass);
+
+-- PHYSICAL PROOF: intermediate is a real hole, not zero-written
+SELECT epoch_xid_block_status('epoch_sp_sparse'::regclass, 0);
+
+-- SEMANTIC PROOF: page_state confirms legal absence
+SELECT epoch_xid_page_state('epoch_sp_sparse'::regclass, 0);
+
+-- Read-side fallback on hole-backed page
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_sp_sparse'::regclass, '(0,1)'::tid);
+
+
+-- Test sp_b: On-demand materialization of a sparse intermediate.
+DELETE FROM epoch_sp_sparse WHERE id = 1;
+
+-- Block 0 should now be initialized (hole → data on first write)
+SELECT epoch_xid_page_state('epoch_sp_sparse'::regclass, 0);
+
+-- Epoch xmax was written by DELETE
+SELECT xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_sp_sparse'::regclass, '(0,1)'::tid);
+
+-- Other intermediates still sparse
+SELECT epoch_xid_block_status('epoch_sp_sparse'::regclass, 1);
+SELECT epoch_xid_page_state('epoch_sp_sparse'::regclass, 1);
+
+DROP TABLE epoch_sp_sparse;
+
+
+-- Test sp_c: Non-sparse semantics identical to sparse.
+CREATE TABLE epoch_sp_nonsparse (id int);
+INSERT INTO epoch_sp_nonsparse VALUES (1);
+INSERT INTO epoch_sp_nonsparse VALUES (2);
+
+SELECT epoch_xid_page_state('epoch_sp_nonsparse'::regclass, 0);
+
+-- Reset to zero: simulates non-sparse zero-filled block
+SELECT epoch_xid_reset_page('epoch_sp_nonsparse'::regclass, 0);
+SELECT epoch_xid_page_state('epoch_sp_nonsparse'::regclass, 0);
+
+-- Read behavior identical to sparse hole: fallback
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_sp_nonsparse'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_sp_nonsparse;
+
+
+-- Test sp_d: Full lifecycle — stat→create→ftruncate→write→read.
+CREATE TABLE epoch_sp_lifecycle (id int, pad char(2000));
+ALTER TABLE epoch_sp_lifecycle ALTER COLUMN pad SET STORAGE PLAIN;
+
+SELECT epoch_xid_relation_mode('epoch_sp_lifecycle'::regclass);
+
+COPY epoch_sp_lifecycle FROM stdin;
+1	a
+2	a
+3	a
+4	a
+5	a
+6	a
+7	a
+8	a
+\.
+
+SELECT epoch_xid_relation_mode('epoch_sp_lifecycle'::regclass);
+
+UPDATE epoch_sp_lifecycle SET pad = 'b' WHERE id = 8;
+SELECT epoch_xid_relation_mode('epoch_sp_lifecycle'::regclass);
+
+SELECT epoch_xid_block_status('epoch_sp_lifecycle'::regclass, 0);
+
+DROP TABLE epoch_sp_lifecycle;
+
+
+-- Test sp_e: Persistence — CHECKPOINT preserves semantic state.
+CREATE TABLE epoch_sp_persist (id int, pad char(2000));
+ALTER TABLE epoch_sp_persist ALTER COLUMN pad SET STORAGE PLAIN;
+
+COPY epoch_sp_persist FROM stdin;
+1	p
+2	p
+3	p
+4	p
+5	p
+6	p
+7	p
+8	p
+9	p
+10	p
+11	p
+12	p
+\.
+
+UPDATE epoch_sp_persist SET pad = 'q' WHERE id = 12;
+
+-- Pre-checkpoint: intermediate is hole (dirty buffer not yet flushed)
+SELECT epoch_xid_block_status('epoch_sp_persist'::regclass, 0);
+
+CHECKPOINT;
+
+-- Post-checkpoint: semantic state preserved regardless of filesystem
+SELECT epoch_xid_page_state('epoch_sp_persist'::regclass, 0);
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_sp_persist'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_sp_persist;
+
+
+-- Test sp_seg: Segment-aware mapping validation.
+-- epoch_xid_block_segment_info exposes the logical→physical mapping.
+-- This proves the implementation is not limited to a single segment.
+CREATE TABLE epoch_sp_segmap (id int);
+INSERT INTO epoch_sp_segmap VALUES (1);
+
+-- Block 0: must map to segment 0 offset 0
+SELECT epoch_xid_block_segment_info('epoch_sp_segmap'::regclass, 0) ~ '^seg=0 offset=0';
+
+-- Block RELSEG_SIZE-1: last block of segment 0
+SELECT epoch_xid_block_segment_info('epoch_sp_segmap'::regclass, 131071) ~ '^seg=0 offset=131071';
+
+-- Block RELSEG_SIZE: first block of segment 1
+SELECT epoch_xid_block_segment_info('epoch_sp_segmap'::regclass, 131072) ~ '^seg=1 offset=0';
+
+-- Block RELSEG_SIZE+5: offset 5 in segment 1
+SELECT epoch_xid_block_segment_info('epoch_sp_segmap'::regclass, 131077) ~ '^seg=1 offset=5';
+
+-- Block 2*RELSEG_SIZE: first block of segment 2
+SELECT epoch_xid_block_segment_info('epoch_sp_segmap'::regclass, 262144) ~ '^seg=2 offset=0';
+
+-- Introspection of an unmapped block: block_status with segment awareness
+-- Block 131072 (segment 1, offset 0) should be beyond_eof since we only
+-- wrote to block 0 in segment 0.
+SELECT epoch_xid_block_status('epoch_sp_segmap'::regclass, 131072);
+
+DROP TABLE epoch_sp_segmap;
+
+
+-- Test sp_platform: Explicit Linux/macOS sparse-file platform validation.
+-- This test verifies that SEEK_HOLE actually detects ftruncate-created
+-- holes on the current platform.  On Linux (ext4/XFS) and macOS (APFS),
+-- this MUST return 'sparse_supported'.  If it does not, the filesystem
+-- does not support sparse files and the hole/data assertions in other
+-- sp_* tests will report 'data' instead of 'hole'.
+--
+-- This is not a silent fallback: on the two target platforms (Linux and
+-- macOS with standard filesystems), 'sparse_supported' is the expected
+-- and required result.
+SELECT epoch_xid_sparse_platform_check();
+
+
+-- Test sp_cross_seg: Cross-segment sparse materialization.
+-- This is the critical test proving the implementation handles blocks
+-- beyond the first segment boundary.  We use the test-only helper
+-- epoch_xid_force_materialize_block() to materialize a specific
+-- logical epoch block in segment 1 (RELSEG_SIZE + 5 = 131077),
+-- then verify:
+--   1. segment 1 file was created
+--   2. the target block (offset 5 in segment 1) is initialized
+--   3. lower untouched blocks in segment 1 remain sparse holes
+--   4. semantic inspection works on the materialized block
+--   5. read-only inspection of untouched segment-1 blocks falls back
+CREATE TABLE epoch_sp_crossseg (id int);
+INSERT INTO epoch_sp_crossseg VALUES (1);
+
+-- Confirm materialized (epoch fork exists with block 0 initialized)
+SELECT epoch_xid_relation_mode('epoch_sp_crossseg'::regclass);
+SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 0);
+
+-- Force-materialize logical block RELSEG_SIZE + 5 (131077) in segment 1.
+-- This exercises the real code path: EpochEnsureFork +
+-- epoch_fork_extend_sparse (creates segment 0 at full RELSEG_SIZE,
+-- creates segment 1 with 6 blocks, all via ftruncate holes) +
+-- ReadBufferExtended + EpochPageInit for only the target block.
+SELECT epoch_xid_force_materialize_block('epoch_sp_crossseg'::regclass, 131077);
+
+-- Verify segment mapping is correct for the target block
+SELECT epoch_xid_block_segment_info('epoch_sp_crossseg'::regclass, 131077) ~ '^seg=1 offset=5';
+
+-- Target block in segment 1 should be page_state 'valid' (initialized)
+SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 131077);
+
+-- Untouched block at offset 0 in segment 1 (logical 131072):
+-- should be a sparse hole and page_state 'page_new'
+SELECT epoch_xid_block_status('epoch_sp_crossseg'::regclass, 131072);
+SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 131072);
+
+-- Untouched block at offset 3 in segment 1 (logical 131075):
+-- should also be a sparse hole
+SELECT epoch_xid_block_status('epoch_sp_crossseg'::regclass, 131075);
+
+-- Semantic inspection: page_state read-only path for untouched seg-1
+-- blocks must fall back without materializing
+SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 131073);
+
+-- Original block 0 in segment 0: still valid (the INSERT-materialized page)
+SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 0);
+
+-- Segment 0 intermediate blocks (e.g., block 100) should be sparse holes
+-- (segment 0 was ftruncated to full RELSEG_SIZE to support segment 1)
+SELECT epoch_xid_block_status('epoch_sp_crossseg'::regclass, 100);
+SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 100);
+
+DROP TABLE epoch_sp_crossseg;

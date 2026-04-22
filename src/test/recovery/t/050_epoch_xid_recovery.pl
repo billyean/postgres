@@ -574,6 +574,65 @@ is($p6_mode_after, 'materialized',
 
 $node->safe_psql('postgres', 'DROP TABLE epoch_p6_pagenew_rec');
 
+
+# ================================================================
+# Patch 7: Sparse extension survives crash recovery
+# ================================================================
+# COPY populates heap across pages without epoch fork.  UPDATE
+# materializes the fork via ftruncate (sparse extension).  After
+# crash recovery, intermediate sparse holes and the materialized
+# target must remain semantically correct.
+
+$node->safe_psql('postgres', qq{
+	CREATE TABLE epoch_sparse_rec (id int, pad char(2000));
+	ALTER TABLE epoch_sparse_rec ALTER COLUMN pad SET STORAGE PLAIN;
+});
+
+my $copy_data = join("\n", map { "$_\tx" } (1..16));
+$node->safe_psql('postgres',
+	"COPY epoch_sparse_rec FROM stdin;\n${copy_data}\n\\.\n");
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+
+$node->safe_psql('postgres',
+	"UPDATE epoch_sparse_rec SET pad = 'y' WHERE id = 16");
+
+my $target_page = $node->safe_psql('postgres',
+	"SELECT (ctid::text::point)[0]::int FROM epoch_sparse_rec WHERE id = 16");
+
+my $pre_page0_state = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_sparse_rec'::regclass, 0)");
+my $pre_page0_status = $node->safe_psql('postgres',
+	"SELECT epoch_xid_block_status('epoch_sparse_rec'::regclass, 0)");
+
+is($pre_page0_state, 'page_new',
+	'Patch 7: intermediate page_state is page_new before crash');
+is($pre_page0_status, 'hole',
+	'Patch 7: intermediate block is a sparse hole before crash (SEEK_HOLE proof)');
+
+$node->stop('immediate');
+$node->start;
+
+my $post_mode = $node->safe_psql('postgres',
+	"SELECT epoch_xid_relation_mode('epoch_sparse_rec'::regclass)");
+my $post_page0_state = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_sparse_rec'::regclass, 0)");
+my $post_target_state = $node->safe_psql('postgres',
+	"SELECT epoch_xid_page_state('epoch_sparse_rec'::regclass, $target_page)");
+my $post_interp = $node->safe_psql('postgres',
+	"SELECT xmin_interp FROM epoch_xid_tuple_visibility_info('epoch_sparse_rec'::regclass, '(0,1)'::tid)");
+
+is($post_mode, 'materialized',
+	'Patch 7: relation still materialized after recovery');
+is($post_page0_state, 'page_new',
+	'Patch 7: intermediate page survives recovery as page_new');
+is($post_target_state, 'valid',
+	'Patch 7: target page survives recovery as valid');
+is($post_interp, 'implicit_default',
+	'Patch 7: read fallback on intermediate works after recovery');
+
+$node->safe_psql('postgres', 'DROP TABLE epoch_sparse_rec');
+
 $node->stop;
 
 done_testing();

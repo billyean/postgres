@@ -825,3 +825,235 @@ INSERT 0 1
 
 ERROR:  epoch page 0 has invalid structure
 DROP TABLE
+CREATE TABLE
+ALTER TABLE
+COPY 16
+ epoch_xid_relation_mode 
+-------------------------
+ implicit
+(1 row)
+
+ page 
+------
+    0
+(1 row)
+
+ page 
+------
+    3
+(1 row)
+
+UPDATE 1
+ epoch_xid_relation_mode 
+-------------------------
+ materialized
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+ xmin_interp | relation_mode 
+-------------+---------------
+ frozen      | materialized
+(1 row)
+
+DELETE 1
+ epoch_xid_page_state 
+----------------------
+ valid
+(1 row)
+
+ xmin_interp | xmax_interp  | relation_mode 
+-------------+--------------+---------------
+ frozen      | materialized | materialized
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ epoch_xid_page_state 
+----------------------
+ valid
+(1 row)
+
+ epoch_xid_reset_page 
+----------------------
+ 
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+   xmin_interp    | relation_mode 
+------------------+---------------
+ implicit_default | materialized
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+ epoch_xid_relation_mode 
+-------------------------
+ implicit
+(1 row)
+
+COPY 8
+ epoch_xid_relation_mode 
+-------------------------
+ implicit
+(1 row)
+
+UPDATE 1
+ epoch_xid_relation_mode 
+-------------------------
+ materialized
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+ALTER TABLE
+COPY 12
+UPDATE 1
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+CHECKPOINT
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+ xmin_interp | relation_mode 
+-------------+---------------
+ frozen      | materialized
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ beyond_eof
+(1 row)
+
+DROP TABLE
+ epoch_xid_sparse_platform_check 
+---------------------------------
+ sparse_supported
+(1 row)
+
+CREATE TABLE
+INSERT 0 1
+ epoch_xid_relation_mode 
+-------------------------
+ materialized
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ valid
+(1 row)
+
+ epoch_xid_force_materialize_block 
+-----------------------------------
+ 
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ valid
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ valid
+(1 row)
+
+ epoch_xid_block_status 
+------------------------
+ hole
+(1 row)
+
+ epoch_xid_page_state 
+----------------------
+ page_new
+(1 row)
+
+DROP TABLE
