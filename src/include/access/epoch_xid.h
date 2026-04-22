@@ -129,9 +129,13 @@ StaticAssertDecl(MaxEpochSlotsPerPage >= MaxHeapTuplesPerPage,
  *
  * A relation is materialized if and only if its epoch fork file exists.
  * If absent, the relation is in implicit default-epoch mode.
+ *
+ * Uses direct stat() on the fork's filesystem path instead of
+ * smgrexists(), which calls mdclose() + mdopenfork() and can leave
+ * md_num_open_segs inconsistent for a fork that does not yet exist,
+ * causing assertion failures in a subsequent smgrcreate/mdcreate.
  */
-#define EpochRelationIsMaterialized(rel) \
-	(smgrexists(RelationGetSmgr(rel), EPOCH_FORKNUM))
+extern bool EpochRelationIsMaterialized(Relation rel);
 
 /* ---------- Public API ---------- */
 

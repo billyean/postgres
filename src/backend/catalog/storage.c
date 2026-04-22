@@ -19,6 +19,7 @@
 
 #include "postgres.h"
 
+#include "access/epoch_xid.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -340,7 +341,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	}
 
 	/* Prepare for truncation of the epoch fork too if it exists */
-	if (smgrexists(RelationGetSmgr(rel), EPOCH_FORKNUM))
+	if (EpochRelationIsMaterialized(rel))
 	{
 		BlockNumber epoch_nblocks = smgrnblocks(reln, EPOCH_FORKNUM);
 

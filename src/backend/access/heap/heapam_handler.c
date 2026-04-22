@@ -19,6 +19,7 @@
  */
 #include "postgres.h"
 
+#include "access/epoch_xid.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
@@ -638,7 +639,8 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 	 * are expected to route here as well, but have not been independently
 	 * verified for this prototype.
 	 */
-	if (smgrexists(RelationGetSmgr(OldHeap), EPOCH_FORKNUM))
+	if (!IsCatalogRelation(OldHeap) &&
+		EpochRelationIsMaterialized(OldHeap))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot rewrite table \"%s\" because it has a materialized epoch fork",

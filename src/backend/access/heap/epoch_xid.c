@@ -18,6 +18,8 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+
 #include "access/epoch_xid.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
@@ -36,6 +38,41 @@
  */
 
 /*
+ * epoch_fork_exists_on_disk
+ *
+ * Low-level helper: check whether the epoch fork file exists by stat().
+ *
+ * We avoid smgrexists() because its implementation (mdexists) calls
+ * mdclose() + mdopenfork().  When the fork does not yet exist,
+ * mdopenfork() returns NULL but mdclose() has already executed,
+ * and the resulting md_num_open_segs state can be inconsistent on
+ * some platforms — tripping Assert(md_num_open_segs[forknum] == 0)
+ * in a subsequent mdcreate().  Direct stat() has no side effects on
+ * smgr internal state.
+ */
+static bool
+epoch_fork_exists_on_disk(SMgrRelation smgr)
+{
+	RelPathStr	path;
+	struct stat	st;
+
+	path = relpath(smgr->smgr_rlocator, EPOCH_FORKNUM);
+	return (stat(path.str, &st) == 0);
+}
+
+/*
+ * EpochRelationIsMaterialized
+ *
+ * Check whether a relation has a materialized epoch fork.
+ * Returns true iff the epoch fork file exists on disk.
+ */
+bool
+EpochRelationIsMaterialized(Relation rel)
+{
+	return epoch_fork_exists_on_disk(RelationGetSmgr(rel));
+}
+
+/*
  * EpochEnsureFork
  *
  * Create the epoch fork for a relation if it does not already exist.
@@ -47,22 +84,27 @@
 void
 EpochEnsureFork(Relation rel)
 {
-	if (!smgrexists(RelationGetSmgr(rel), EPOCH_FORKNUM))
+	SMgrRelation smgr = RelationGetSmgr(rel);
+
+	if (epoch_fork_exists_on_disk(smgr))
+		return;
+
+	LockRelationForExtension(rel, ExclusiveLock);
+
+	/* Re-check after acquiring lock (another backend may have created it) */
+	smgr = RelationGetSmgr(rel);
+	if (epoch_fork_exists_on_disk(smgr))
 	{
-		LockRelationForExtension(rel, ExclusiveLock);
-
-		/* Re-check after acquiring lock (another backend may have created it) */
-		if (!smgrexists(RelationGetSmgr(rel), EPOCH_FORKNUM))
-		{
-			smgrcreate(RelationGetSmgr(rel), EPOCH_FORKNUM, false);
-
-			if (RelationNeedsWAL(rel))
-				log_smgrcreate(&RelationGetSmgr(rel)->smgr_rlocator.locator,
-							   EPOCH_FORKNUM);
-		}
-
 		UnlockRelationForExtension(rel, ExclusiveLock);
+		return;
 	}
+
+	smgrcreate(smgr, EPOCH_FORKNUM, false);
+
+	if (RelationNeedsWAL(rel))
+		log_smgrcreate(&smgr->smgr_rlocator.locator, EPOCH_FORKNUM);
+
+	UnlockRelationForExtension(rel, ExclusiveLock);
 }
 
 /*
@@ -847,17 +889,8 @@ epoch_xid_inspect(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(5);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "offnum",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "xmin_epoch",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "xmax_epoch",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "epoch_flags",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "is_materialized",
-						   BOOLOID, -1, 0);
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		rel = table_open(relid, AccessShareLock);

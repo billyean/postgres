@@ -2045,8 +2045,13 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	 * This may create the epoch fork (transitioning the relation from
 	 * implicit default-epoch mode to materialized epoch mode) and/or
 	 * extend it to cover this heap block.
+	 *
+	 * Skip for catalog relations (they do not need epoch metadata in the
+	 * v1 prototype) and during bootstrap/init processing modes where the
+	 * storage infrastructure is not fully initialized.
 	 */
-	EpochPinBuffer(relation, BufferGetBlockNumber(buffer), &epoch_buffer);
+	if (IsNormalProcessingMode() && !IsCatalogRelation(relation))
+		EpochPinBuffer(relation, BufferGetBlockNumber(buffer), &epoch_buffer);
 
 	/*
 	 * We're about to do the actual insert -- but check for conflict first, to
@@ -2386,8 +2391,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	 * This is allowed only because the relation may still be in implicit
 	 * default-epoch mode (no epoch fork exists).  Once epoch
 	 * materialization has occurred, silent fallback is not allowed.
+	 *
+	 * Skip the check for catalog relations: they never have epoch forks.
 	 */
-	if (smgrexists(RelationGetSmgr(relation), EPOCH_FORKNUM))
+	if (!IsCatalogRelation(relation) &&
+		EpochRelationIsMaterialized(relation))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("heap_multi_insert not supported for epoch-materialized relation \"%s\"",
@@ -3078,9 +3086,11 @@ l1:
 
 	/*
 	 * XID64 EPOCH FORK: Pin epoch buffer before critical section.
-	 * Only if the relation is in materialized epoch mode.
+	 * Only if the relation is in materialized epoch mode and is not
+	 * a system catalog relation.
 	 */
-	if (EpochRelationIsMaterialized(relation))
+	if (!IsCatalogRelation(relation) &&
+		EpochRelationIsMaterialized(relation))
 		EpochPinBuffer(relation, block, &epoch_buffer_del);
 
 	START_CRIT_SECTION();
@@ -4119,10 +4129,16 @@ l2:
 	 *
 	 * Pin in semantic old/new order.  Locking (inside the critical section)
 	 * uses ascending block number order to prevent deadlock.
+	 *
+	 * Skip for catalog relations and non-normal processing modes:
+	 * same rationale as heap_insert.
 	 */
-	EpochPinBuffer(relation, BufferGetBlockNumber(buffer), &epoch_buffer_old);
-	if (newbuf != buffer)
-		EpochPinBuffer(relation, BufferGetBlockNumber(newbuf), &epoch_buffer_new);
+	if (IsNormalProcessingMode() && !IsCatalogRelation(relation))
+	{
+		EpochPinBuffer(relation, BufferGetBlockNumber(buffer), &epoch_buffer_old);
+		if (newbuf != buffer)
+			EpochPinBuffer(relation, BufferGetBlockNumber(newbuf), &epoch_buffer_new);
+	}
 
 	/*
 	 * We're about to do the actual update -- check for conflict first, to
@@ -4269,7 +4285,10 @@ l2:
 	 * the original inserter did not record epoch metadata (the fork did not
 	 * exist at insert time).  This is correct: EPOCH_FLAG_XMIN_SET absent
 	 * means "xmin epoch unknown, use EPOCH_DEFAULT_VALUE for reconstruction."
+	 *
+	 * Skip if epoch buffers were not pinned (catalog relations, bootstrap).
 	 */
+	if (BufferIsValid(epoch_buffer_old))
 	{
 		FullTransactionId fxid = GetCurrentFullTransactionId();
 		OffsetNumber old_offnum = ItemPointerGetOffsetNumber(&oldtup.t_self);

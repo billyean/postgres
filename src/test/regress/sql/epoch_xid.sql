@@ -193,7 +193,7 @@ SELECT epoch_xid_relation_mode('epoch_crosspage_test'::regclass);
 
 -- Record original tuple location before update
 CREATE TEMP TABLE _xpage_before AS
-  SELECT ctid,
+  SELECT ctid AS orig_ctid,
          (ctid::text::point)[0]::int AS orig_page,
          (ctid::text::point)[1]::int AS orig_offnum
   FROM epoch_crosspage_test WHERE id = 1;
@@ -400,6 +400,7 @@ DROP TABLE epoch_interp_live;
 -- Test q: Non-LP_NORMAL → ERROR
 CREATE TABLE epoch_interp_lpdead (id int);
 INSERT INTO epoch_interp_lpdead VALUES (1);
+INSERT INTO epoch_interp_lpdead VALUES (2);
 DELETE FROM epoch_interp_lpdead WHERE id = 1;
 VACUUM epoch_interp_lpdead;
 
@@ -521,6 +522,7 @@ DROP TABLE epoch_txn_unset;
 -- Test t7: Non-LP_NORMAL → ERROR
 CREATE TABLE epoch_txn_lp (id int);
 INSERT INTO epoch_txn_lp VALUES (1);
+INSERT INTO epoch_txn_lp VALUES (2);
 DELETE FROM epoch_txn_lp WHERE id = 1;
 VACUUM epoch_txn_lp;
 
@@ -645,6 +647,7 @@ DROP TABLE epoch_vis_implicit;
 -- Test v8: Non-LP_NORMAL → ERROR
 CREATE TABLE epoch_vis_lp (id int);
 INSERT INTO epoch_vis_lp VALUES (1);
+INSERT INTO epoch_vis_lp VALUES (2);
 DELETE FROM epoch_vis_lp WHERE id = 1;
 VACUUM epoch_vis_lp;
 
@@ -921,3 +924,122 @@ SELECT * FROM epoch_xid_tuple_current_visibility_info('epoch_p6_corrupt'::regcla
 SELECT * FROM epoch_xid_inspect('epoch_p6_corrupt'::regclass, 0);
 
 DROP TABLE epoch_p6_corrupt;
+
+
+-- ======================================================
+-- Probing-fix regression tests (smgrexists → stat)
+-- ======================================================
+-- These tests verify that replacing smgrexists() with stat() for
+-- epoch fork existence probing does not regress the Phase 6 storage
+-- contract.  They exercise the probe→create→probe cycle that
+-- triggered the mdexists() assertion and confirm that the read-side
+-- no-materialization invariant still holds.
+
+-- Test pfx_a: Repeated probing of non-existent fork is side-effect-free.
+-- The stat() probe must never create the fork, even when called multiple
+-- times.  This is the core read-side invariant from Phase 6.
+CREATE TABLE epoch_pfx_probe (id int, val text);
+COPY epoch_pfx_probe FROM stdin;
+1	no epoch fork
+\.
+
+-- Multiple consecutive probes: none should create the fork
+SELECT epoch_xid_relation_mode('epoch_pfx_probe'::regclass);
+SELECT epoch_xid_relation_mode('epoch_pfx_probe'::regclass);
+SELECT epoch_xid_page_state('epoch_pfx_probe'::regclass, 0);
+SELECT epoch_xid_page_state('epoch_pfx_probe'::regclass, 0);
+
+-- Still implicit after all probes
+SELECT epoch_xid_relation_mode('epoch_pfx_probe'::regclass);
+
+-- Tuple inspection also must not create the fork
+SELECT xmin_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_pfx_probe'::regclass, '(0,1)'::tid);
+
+-- Final check: fork still absent
+SELECT epoch_xid_page_state('epoch_pfx_probe'::regclass, 0);
+
+DROP TABLE epoch_pfx_probe;
+
+
+-- Test pfx_b: Probe → create → probe cycle.
+-- This exercises the exact sequence that triggered the mdexists()
+-- assertion: stat() returns ENOENT, then smgrcreate(), then stat()
+-- returns 0.  No assertion should fire.
+CREATE TABLE epoch_pfx_cycle (id int);
+
+-- Probe while implicit (stat returns ENOENT — no smgr side effects)
+SELECT epoch_xid_relation_mode('epoch_pfx_cycle'::regclass);
+
+-- INSERT creates the fork via EpochEnsureFork → smgrcreate
+INSERT INTO epoch_pfx_cycle VALUES (1);
+
+-- Probe again: fork now exists
+SELECT epoch_xid_relation_mode('epoch_pfx_cycle'::regclass);
+
+-- Another insert: EpochEnsureFork detects existing fork via stat()
+INSERT INTO epoch_pfx_cycle VALUES (2);
+
+-- Verify data and fork state
+SELECT count(*) FROM epoch_pfx_cycle;
+SELECT epoch_xid_page_state('epoch_pfx_cycle'::regclass, 0);
+
+DROP TABLE epoch_pfx_cycle;
+
+
+-- Test pfx_c: Read-side probing does not extend the fork.
+-- Verifies that beyond-EOF probes via stat()+EpochReadBufferReadOnly
+-- do not extend the epoch fork.
+CREATE TABLE epoch_pfx_noextend (id int);
+
+-- Materialize via INSERT (creates fork with page 0)
+INSERT INTO epoch_pfx_noextend VALUES (1);
+SELECT epoch_xid_relation_mode('epoch_pfx_noextend'::regclass);
+SELECT epoch_xid_page_state('epoch_pfx_noextend'::regclass, 0);
+
+-- Probe a page well beyond EOF: must return 'beyond_eof', not extend
+SELECT epoch_xid_page_state('epoch_pfx_noextend'::regclass, 999);
+SELECT epoch_xid_page_state('epoch_pfx_noextend'::regclass, 999);
+
+-- Page 0 still valid, no spurious extension
+SELECT epoch_xid_page_state('epoch_pfx_noextend'::regclass, 0);
+
+DROP TABLE epoch_pfx_noextend;
+
+
+-- Test pfx_d: Absent/new states still fall back correctly
+-- after the probing mechanism change.
+CREATE TABLE epoch_pfx_fallback (id int);
+INSERT INTO epoch_pfx_fallback VALUES (1);
+
+-- Page 0 valid, relation materialized
+SELECT epoch_xid_page_state('epoch_pfx_fallback'::regclass, 0);
+SELECT epoch_xid_relation_mode('epoch_pfx_fallback'::regclass);
+
+-- Reset page to PageIsNew — the Phase 6 contract says this is legal absence
+SELECT epoch_xid_reset_page('epoch_pfx_fallback'::regclass, 0);
+SELECT epoch_xid_page_state('epoch_pfx_fallback'::regclass, 0);
+
+-- Read-side must fall back, not error
+SELECT xmin_interp, xmax_interp, relation_mode
+FROM epoch_xid_tuple_visibility_info('epoch_pfx_fallback'::regclass, '(0,1)'::tid);
+
+-- Page must still be PageIsNew (read path did not re-initialize it)
+SELECT epoch_xid_page_state('epoch_pfx_fallback'::regclass, 0);
+
+DROP TABLE epoch_pfx_fallback;
+
+
+-- Test pfx_e: Corruption boundary holds with stat()-based probing.
+-- A non-new corrupt page must still ERROR, not silently fall back.
+CREATE TABLE epoch_pfx_corrupt (id int);
+INSERT INTO epoch_pfx_corrupt VALUES (1);
+SELECT epoch_xid_page_state('epoch_pfx_corrupt'::regclass, 0);
+
+SELECT epoch_xid_corrupt_page('epoch_pfx_corrupt'::regclass, 0);
+SELECT epoch_xid_page_state('epoch_pfx_corrupt'::regclass, 0);
+
+-- Must ERROR, not fall back
+SELECT * FROM epoch_xid_tuple_visibility_info('epoch_pfx_corrupt'::regclass, '(0,1)'::tid);
+
+DROP TABLE epoch_pfx_corrupt;
