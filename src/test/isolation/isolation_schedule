@@ -127,6 +127,7 @@ test: matview-write-skew
 test: lock-nowait
 test: for-portion-of
 test: epoch_xid_mxid
+test: epoch_xid_mxid_resolve
 test: epoch_xid_mxid_read
 test: epoch_xid_mxid_txnstate
 test: epoch_xid_mxid_delete_committed

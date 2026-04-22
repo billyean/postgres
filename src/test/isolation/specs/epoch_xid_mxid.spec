@@ -1,16 +1,16 @@
-# Test: epoch fork MultiXact guard in heap_update
+# Test: epoch fork write-side MultiXact support via heap_update (Patch 9)
 #
-# Validates that concurrent tuple locking (which produces a MultiXact
-# xmax outcome) causes the epoch fork prototype to ERROR explicitly,
-# rather than silently producing incomplete epoch state.
+# Previously, concurrent tuple locking + UPDATE produced an ERROR because
+# the epoch fork could not represent a MultiXact xmax.  Patch 9 removes
+# that guard.
 #
-# This test requires the relation to be in materialized epoch mode
-# (epoch fork exists) before the concurrent locking scenario.
+# This test verifies:
+#   I1: UPDATE succeeds (no ERROR) when concurrent locker creates MultiXact
+#   I1: Phase 3/4/5 correctly classify the resulting MultiXact tuple
 
 setup
 {
     CREATE TABLE epoch_mxid_test (id int PRIMARY KEY, val text);
-    -- INSERT materializes the epoch fork
     INSERT INTO epoch_mxid_test VALUES (1, 'test');
 }
 
@@ -21,13 +21,16 @@ teardown
 
 session s1
 step lock	{ BEGIN; SELECT * FROM epoch_mxid_test WHERE id = 1 FOR KEY SHARE; }
-step release	{ ROLLBACK; }
+step release	{ COMMIT; }
 
 session s2
 step update	{ UPDATE epoch_mxid_test SET val = 'updated' WHERE id = 1; }
 
-# s1 holds FOR KEY SHARE lock, then s2 attempts UPDATE.
-# compute_new_xmax_infomask will produce a MultiXact combining
-# s1's locker with s2's updater.  The epoch fork guard must
-# fire ERROR before the critical section.
-permutation lock update release
+session s3
+step classify_p3	{ SELECT full_xmax, xmax_interp FROM epoch_xid_tuple_visibility_info('epoch_mxid_test'::regclass, '(0,1)'::tid); }
+step classify_p4	{ SELECT xmax_status, tuple_state FROM epoch_xid_tuple_txn_state_info('epoch_mxid_test'::regclass, '(0,1)'::tid); }
+step classify_p5	{ SELECT visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_mxid_test'::regclass, '(0,1)'::tid); }
+
+# s1 holds FOR KEY SHARE, s2 UPDATE is blocked until s1 releases.
+# After both finish, s3 classifies the old tuple (Phase 3/4/5).
+permutation lock update release classify_p3 classify_p4 classify_p5

@@ -3853,18 +3853,19 @@ l2:
 							  &infomask2_old_tuple);
 
 	/*
-	 * XID64 EPOCH FORK: Unconditional MultiXact guard.  The epoch fork
-	 * cannot represent a MultiXact xmax.  This fires regardless of whether
-	 * the relation is currently implicit or materialized, because allowing
-	 * a MultiXact-shaped update to trigger materialization would create an
-	 * epoch fork with incomplete state from its very first write.
+	 * XID64 EPOCH FORK: MultiXact xmax is supported (Patch 9).
+	 *
+	 * When compute_new_xmax_infomask combines existing lockers with the
+	 * current updater into a MultiXact, EpochSlotSetXmax stores the current
+	 * transaction's epoch.  This is correct because:
+	 *
+	 * (1) The current transaction IS the updater in the MultiXact.
+	 * (2) Patch 8's read path detects HEAP_XMAX_IS_MULTI from infomask and
+	 *     classifies via GetMultiXactIdMembers — it ignores xmax_epoch.
+	 * (3) After MultiXact resolution, the tuple's xmax becomes the updater's
+	 *     TransactionId.  The stored epoch then matches the resolved xmax,
+	 *     so EpochReconstructXmax produces the correct full 64-bit XID.
 	 */
-	if (infomask_old_tuple & HEAP_XMAX_IS_MULTI)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("epoch fork v1 does not support MultiXact xmax in heap_update"),
-				 errhint("Concurrent tuple locking produced a MultiXact outcome "
-						 "which is not representable in the epoch fork prototype.")));
 
 	/*
 	 * And also prepare an Xmax value for the new copy of the tuple.  If there

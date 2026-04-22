@@ -12857,4 +12857,10 @@
   proname => 'epoch_xid_sparse_platform_check', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_sparse_platform_check' },
+
+{ oid => '9916',
+  descr => 'TEST-ONLY: force resolution of committed-updater MultiXact on a tuple',
+  proname => 'epoch_xid_resolve_multixact', provolatile => 'v',
+  prorettype => 'bool', proargtypes => 'regclass tid',
+  prosrc => 'epoch_xid_resolve_multixact' },
 ]

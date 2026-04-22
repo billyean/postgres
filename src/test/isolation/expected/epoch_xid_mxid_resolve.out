@@ -1,0 +1,45 @@
+Parsed test spec with 3 sessions
+
+starting permutation: lock1 update2 release1 pre_check resolve post_check post_p4
+step lock1: BEGIN; SELECT * FROM epoch_mxid_resolve WHERE id = 1 FOR KEY SHARE;
+id|val     
+--+--------
+ 1|original
+(1 row)
+
+step update2: UPDATE epoch_mxid_resolve SET val = 'updated' WHERE id = 1;
+step release1: COMMIT;
+step pre_check: 
+    SELECT
+        xmax_interp,
+        full_xmax = 0 AS full_xmax_is_zero
+    FROM epoch_xid_tuple_visibility_info('epoch_mxid_resolve'::regclass, '(0,1)'::tid);
+
+xmax_interp|full_xmax_is_zero
+-----------+-----------------
+multixact  |t                
+(1 row)
+
+step resolve: SELECT epoch_xid_resolve_multixact('epoch_mxid_resolve'::regclass, '(0,1)'::tid);
+epoch_xid_resolve_multixact
+---------------------------
+t                          
+(1 row)
+
+step post_check: 
+    SELECT
+        xmax_interp,
+        full_xmax <> 0 AS full_xmax_is_nonzero
+    FROM epoch_xid_tuple_visibility_info('epoch_mxid_resolve'::regclass, '(0,1)'::tid);
+
+xmax_interp |full_xmax_is_nonzero
+------------+--------------------
+materialized|t                   
+(1 row)
+
+step post_p4: SELECT xmax_status, tuple_state FROM epoch_xid_tuple_txn_state_info('epoch_mxid_resolve'::regclass, '(0,1)'::tid);
+xmax_status|tuple_state   
+-----------+--------------
+committed  |frozen_deleted
+(1 row)
+

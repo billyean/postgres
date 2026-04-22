@@ -2230,3 +2230,108 @@ epoch_xid_sparse_platform_check(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text("no_seek_hole"));
 #endif
 }
+
+
+/*
+ * epoch_xid_resolve_multixact(regclass, tid) -> bool
+ *
+ * TEST-ONLY function.  Forces resolution of a committed-updater MultiXact
+ * on a specific tuple: clears HEAP_XMAX_IS_MULTI and rewrites xmax to the
+ * updater's TransactionId with HEAP_XMAX_COMMITTED.
+ *
+ * Returns true if resolution occurred, false if the tuple was not a
+ * committed-updater MultiXact (nothing changed).
+ *
+ * This exists because PostgreSQL does not resolve committed-updater
+ * MultiXacts via simple hint-bit setting — resolution only happens
+ * through VACUUM freeze (which also prunes) or new locking operations
+ * (which expand into a new Multi).  Neither path leaves the old tuple
+ * accessible with a resolved non-Multi xmax for inspection.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_resolve_multixact);
+
+Datum
+epoch_xid_resolve_multixact(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ItemPointer tid = (ItemPointer) PG_GETARG_POINTER(1);
+	Relation	rel;
+	Buffer		buf;
+	Page		page;
+	ItemId		lp;
+	HeapTupleHeader htup;
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	TransactionId updater_xid;
+	MultiXactMember *members;
+	int			nmembers;
+	int			i;
+	bool		resolved = false;
+
+	blkno = ItemPointerGetBlockNumber(tid);
+	offnum = ItemPointerGetOffsetNumber(tid);
+
+	rel = table_open(relid, RowExclusiveLock);
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+
+	if (offnum < 1 || offnum > PageGetMaxOffsetNumber(page))
+	{
+		UnlockReleaseBuffer(buf);
+		table_close(rel, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("offset %u out of range for page %u", offnum, blkno)));
+	}
+
+	lp = PageGetItemId(page, offnum);
+	if (!ItemIdIsNormal(lp))
+	{
+		UnlockReleaseBuffer(buf);
+		table_close(rel, RowExclusiveLock);
+		PG_RETURN_BOOL(false);
+	}
+
+	htup = (HeapTupleHeader) PageGetItem(page, lp);
+
+	if (!(htup->t_infomask & HEAP_XMAX_IS_MULTI) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(htup->t_infomask))
+	{
+		UnlockReleaseBuffer(buf);
+		table_close(rel, RowExclusiveLock);
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Find the committed updater */
+	nmembers = GetMultiXactIdMembers(HeapTupleHeaderGetRawXmax(htup),
+									 &members, false, false);
+	updater_xid = InvalidTransactionId;
+
+	if (nmembers > 0)
+	{
+		for (i = 0; i < nmembers; i++)
+		{
+			if (ISUPDATE_from_mxstatus(members[i].status))
+			{
+				updater_xid = members[i].xid;
+				break;
+			}
+		}
+		pfree(members);
+	}
+
+	if (TransactionIdIsValid(updater_xid) &&
+		TransactionIdDidCommit(updater_xid))
+	{
+		htup->t_infomask &= ~HEAP_XMAX_BITS;
+		htup->t_infomask |= HEAP_XMAX_COMMITTED;
+		HeapTupleHeaderSetXmax(htup, updater_xid);
+		MarkBufferDirty(buf);
+		resolved = true;
+	}
+
+	UnlockReleaseBuffer(buf);
+	table_close(rel, RowExclusiveLock);
+	PG_RETURN_BOOL(resolved);
+}

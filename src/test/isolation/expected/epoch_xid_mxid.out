@@ -1,6 +1,6 @@
-Parsed test spec with 2 sessions
+Parsed test spec with 3 sessions
 
-starting permutation: lock update release
+starting permutation: lock update release classify_p3 classify_p4 classify_p5
 step lock: BEGIN; SELECT * FROM epoch_mxid_test WHERE id = 1 FOR KEY SHARE;
 id|val 
 --+----
@@ -8,5 +8,22 @@ id|val
 (1 row)
 
 step update: UPDATE epoch_mxid_test SET val = 'updated' WHERE id = 1;
-ERROR:  epoch fork v1 does not support MultiXact xmax in heap_update
-step release: ROLLBACK;
+step release: COMMIT;
+step classify_p3: SELECT full_xmax, xmax_interp FROM epoch_xid_tuple_visibility_info('epoch_mxid_test'::regclass, '(0,1)'::tid);
+full_xmax|xmax_interp
+---------+-----------
+        0|multixact  
+(1 row)
+
+step classify_p4: SELECT xmax_status, tuple_state FROM epoch_xid_tuple_txn_state_info('epoch_mxid_test'::regclass, '(0,1)'::tid);
+xmax_status|tuple_state   
+-----------+--------------
+committed  |frozen_deleted
+(1 row)
+
+step classify_p5: SELECT visibility_verdict, verdict_reason FROM epoch_xid_tuple_current_visibility_info('epoch_mxid_test'::regclass, '(0,1)'::tid);
+visibility_verdict|verdict_reason
+------------------+--------------
+visible           |frozen        
+(1 row)
+
