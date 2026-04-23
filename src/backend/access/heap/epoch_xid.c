@@ -71,6 +71,26 @@ static bool epoch_stage1_force_disabled = false;
  */
 static char epoch_classify_last_membership = 'n';
 
+/*
+ * Test-only instrumentation: records whether the 64-bit snapshot horizon
+ * fast-reject was taken by the last EpochClassifyXidStatus call.
+ *
+ * Values:
+ *   'n' = not taken (initial, or XID >= epoch_horizon, or epoch_horizon invalid)
+ *   'h' = horizon fast-reject taken: XID preceded epoch_horizon, ProcArray
+ *         membership scan was skipped
+ *
+ * The fast-reject is justified by snapshot semantics: epoch_horizon is the
+ * 64-bit form of snapshot->xmin.  Any XID strictly preceding snapshot->xmin
+ * had already completed before the snapshot was created, so it cannot be
+ * in-progress.  This does not depend on RecentXmin == snapshot->xmin.
+ */
+static char epoch_classify_last_horizon = 'n';
+
+/* Forward declaration: defined in the Phase 5 section, needed by Phase 4 */
+static inline FullTransactionId
+EpochFullXidRelativeTo(FullTransactionId ref, TransactionId xid);
+
 
 /* ----------------------------------------------------------------
  *	Segment-aware sparse-file helpers
@@ -755,6 +775,7 @@ EpochRedoSlotUpdate(Page epochPage, xl_epoch_slot_update *xlrec)
  */
 static EpochXidStatus
 EpochClassifyMultiXactXmax(HeapTupleHeader htup,
+						   FullTransactionId epoch_horizon,
 						   TransactionId *effective_xid_out)
 {
 	MultiXactId multi;
@@ -814,6 +835,31 @@ EpochClassifyMultiXactXmax(HeapTupleHeader htup,
 
 	if (TransactionIdIsCurrentTransactionId(updater_xid))
 		return EPOCH_XID_IN_PROGRESS;
+
+	/*
+	 * 64-bit horizon fast-reject for the MultiXact updater (Patch 14).
+	 *
+	 * When epoch_horizon is valid, reconstruct the updater's full 64-bit XID
+	 * using epoch_horizon as the anchor (within epoch 0, any FullTransactionId
+	 * from the same epoch is a valid anchor for EpochFullXidRelativeTo).
+	 * If the updater completed before the snapshot, skip the ProcArray scan.
+	 */
+	if (FullTransactionIdIsValid(epoch_horizon))
+	{
+		FullTransactionId full_updater =
+			EpochFullXidRelativeTo(epoch_horizon, updater_xid);
+
+		if (FullTransactionIdPrecedes(full_updater, epoch_horizon))
+		{
+			epoch_classify_last_horizon = 'h';
+
+			if (TransactionIdDidCommit(updater_xid))
+				return EPOCH_XID_COMMITTED;
+			return EPOCH_XID_ABORTED;
+		}
+		epoch_classify_last_horizon = 'n';
+	}
+
 	if (TransactionIdIsInProgress(updater_xid))
 		return EPOCH_XID_IN_PROGRESS;
 	if (TransactionIdDidCommit(updater_xid))
@@ -970,12 +1016,23 @@ EpochTupleStateString(EpochTupleState state)
  * TransactionIdIsInProgress.  Pass InvalidFullTransactionId to use the 32-bit
  * path (e.g., from debug functions that lack the epoch-0 guard context).
  *
+ * epoch_horizon: when valid, a 64-bit fast-reject is applied before the
+ * ProcArray membership check.  If full_xid precedes epoch_horizon, the XID
+ * was completed before the snapshot and is definitely not in-progress.
+ * This is justified directly by snapshot semantics: epoch_horizon is the
+ * 64-bit form of snapshot->xmin, and any XID preceding snapshot->xmin had
+ * already completed before the snapshot was created.  This correctness
+ * argument does not depend on any relationship with RecentXmin.
+ * Pass InvalidFullTransactionId to skip the fast-reject (e.g., from debug
+ * functions or when the epoch-0 guard is off).
+ *
  * effective_xid_out: for MultiXact xmax with a resolvable updater, set to the
  * updater's TransactionId; otherwise set to the input xid.  Callers that need
  * the effective xid for Phase 5 snapshot checks must pass a non-NULL pointer.
  */
 static EpochXidStatus
 EpochClassifyXidStatus(TransactionId xid, FullTransactionId full_xid,
+					   FullTransactionId epoch_horizon,
 					   HeapTupleHeader htup, bool is_xmin,
 					   TransactionId *effective_xid_out)
 {
@@ -996,7 +1053,8 @@ EpochClassifyXidStatus(TransactionId xid, FullTransactionId full_xid,
 		if (htup->t_infomask & HEAP_XMAX_INVALID)
 			return EPOCH_XID_INVALID_UNSET;
 		if (htup->t_infomask & HEAP_XMAX_IS_MULTI)
-			return EpochClassifyMultiXactXmax(htup, effective_xid_out);
+			return EpochClassifyMultiXactXmax(htup, epoch_horizon,
+											  effective_xid_out);
 		if (htup->t_infomask & HEAP_XMAX_COMMITTED)
 			return EPOCH_XID_COMMITTED;
 	}
@@ -1007,8 +1065,33 @@ EpochClassifyXidStatus(TransactionId xid, FullTransactionId full_xid,
 		return EPOCH_XID_IN_PROGRESS;
 
 	/*
+	 * 64-bit snapshot horizon fast-reject (Patch 14).
+	 *
+	 * epoch_horizon is the 64-bit form of snapshot->xmin, derived from
+	 * epoch_anchor.  Any XID strictly preceding snapshot->xmin had already
+	 * completed (committed or aborted) before the snapshot was created.
+	 * A completed transaction cannot re-enter the ProcArray, so it is
+	 * definitely not in-progress.  We can skip the ProcArray membership
+	 * scan and proceed directly to the CLOG lookup for committed/aborted.
+	 *
+	 * This is justified directly by snapshot semantics and does not depend
+	 * on any relationship between epoch_horizon and RecentXmin.
+	 */
+	if (FullTransactionIdIsValid(full_xid) &&
+		FullTransactionIdIsValid(epoch_horizon) &&
+		FullTransactionIdPrecedes(full_xid, epoch_horizon))
+	{
+		epoch_classify_last_horizon = 'h';
+
+		if (TransactionIdDidCommit(xid))
+			return EPOCH_XID_COMMITTED;
+		return EPOCH_XID_ABORTED;
+	}
+	epoch_classify_last_horizon = 'n';
+
+	/*
 	 * Active-transaction membership check: use the 64-bit-aware function
-	 * when a full XID is available (Patch 12), fall back to 32-bit otherwise.
+	 * when a full XID is available (Patch 13), fall back to 32-bit otherwise.
 	 */
 	{
 		bool		in_progress;
@@ -1410,6 +1493,9 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	Assert(snapshot != NULL);
 	Assert(snapshot->snapshot_type == SNAPSHOT_MVCC);
 
+	/* Reset per-invocation instrumentation */
+	epoch_classify_last_horizon = 'n';
+
 	/* Read epoch slot data (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
 	if (is_materialized)
@@ -1476,18 +1562,35 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	 * For xmax, also obtain the effective updater XID for MultiXact cases.
 	 *
 	 * When the Stage 1 guard passes, pass the full 64-bit XIDs so Phase 4
-	 * uses FullTransactionIdIsInProgress for the membership check.  When the
-	 * guard is off, pass InvalidFullTransactionId so Phase 4 falls back to
-	 * the 32-bit TransactionIdIsInProgress.
+	 * uses FullTransactionIdIsInProgress for the membership check (Patch 13),
+	 * and derive a 64-bit snapshot horizon for the fast-reject (Patch 14).
+	 *
+	 * epoch_horizon is the 64-bit form of snapshot->xmin: any XID preceding
+	 * it had already completed before the snapshot was created, so the
+	 * ProcArray membership scan can be skipped.  This is justified directly
+	 * by snapshot semantics; it does not depend on RecentXmin.
+	 *
+	 * When the guard is off, pass InvalidFullTransactionId for both full_xid
+	 * and epoch_horizon so Phase 4 falls back to the 32-bit path.
 	 */
-	xmin_status = EpochClassifyXidStatus(xmin_xid,
-					use_64bit_snapshot ? interp.full_xmin : InvalidFullTransactionId,
-					tuple, true, NULL);
-	xmax_status = EpochClassifyXidStatus(
-					HeapTupleHeaderGetRawXmax(tuple),
-					use_64bit_snapshot ? interp.full_xmax : InvalidFullTransactionId,
-					tuple, false,
-					&effective_xmax);
+	{
+		FullTransactionId epoch_horizon = InvalidFullTransactionId;
+
+		if (use_64bit_snapshot)
+			epoch_horizon = EpochFullXidRelativeTo(snapshot->epoch_anchor,
+												   snapshot->xmin);
+
+		xmin_status = EpochClassifyXidStatus(xmin_xid,
+						use_64bit_snapshot ? interp.full_xmin : InvalidFullTransactionId,
+						epoch_horizon,
+						tuple, true, NULL);
+		xmax_status = EpochClassifyXidStatus(
+						HeapTupleHeaderGetRawXmax(tuple),
+						use_64bit_snapshot ? interp.full_xmax : InvalidFullTransactionId,
+						epoch_horizon,
+						tuple, false,
+						&effective_xmax);
+	}
 
 	/* Unresolvable MultiXact: fall back to native path */
 	if (xmax_status == EPOCH_XID_MULTIXACT_UNSUPPORTED)
@@ -2007,8 +2110,8 @@ epoch_xid_tuple_txn_state_info(PG_FUNCTION_ARGS)
 	/* Phase 4: classify transaction status */
 	xmin_xid = HeapTupleHeaderGetRawXmin(htup);
 	xmax_xid = HeapTupleHeaderGetRawXmax(htup);
-	xmin_status = EpochClassifyXidStatus(xmin_xid, InvalidFullTransactionId, htup, true, NULL);
-	xmax_status = EpochClassifyXidStatus(xmax_xid, InvalidFullTransactionId, htup, false, NULL);
+	xmin_status = EpochClassifyXidStatus(xmin_xid, InvalidFullTransactionId, InvalidFullTransactionId, htup, true, NULL);
+	xmax_status = EpochClassifyXidStatus(xmax_xid, InvalidFullTransactionId, InvalidFullTransactionId, htup, false, NULL);
 	tuple_state = EpochDeriveTupleState(xmin_status, xmax_status);
 
 	if (BufferIsValid(epochbuf))
@@ -2139,8 +2242,8 @@ epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
 	{
 		TransactionId effective_xmax;
 
-		xmin_status = EpochClassifyXidStatus(xmin_xid, InvalidFullTransactionId, htup, true, NULL);
-		xmax_status = EpochClassifyXidStatus(xmax_xid, InvalidFullTransactionId, htup, false, &effective_xmax);
+		xmin_status = EpochClassifyXidStatus(xmin_xid, InvalidFullTransactionId, InvalidFullTransactionId, htup, true, NULL);
+		xmax_status = EpochClassifyXidStatus(xmax_xid, InvalidFullTransactionId, InvalidFullTransactionId, htup, false, &effective_xmax);
 
 		/* Phase 5: snapshot-relative visibility using effective xmax */
 		EpochDeriveVisibility(htup, xmin_xid, effective_xmax,
@@ -2822,6 +2925,44 @@ epoch_xid_classify_last_membership(PG_FUNCTION_ARGS)
 			break;
 		default:
 			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_classify_last_horizon() -> text
+ *
+ * TEST-ONLY function.  Returns whether the 64-bit snapshot horizon fast-reject
+ * (Patch 14) was taken by the last EpochClassifyXidStatus call.
+ *
+ * Returns:
+ *   'horizon_fastpath' - fast-reject fired: full_xid < epoch_horizon,
+ *                        ProcArray membership scan was skipped
+ *   'not_used'         - fast-reject did not fire (XID >= horizon, or
+ *                        epoch_horizon invalid, or resolved by hint bits /
+ *                        own-xid check before reaching the horizon test)
+ *
+ * This complements epoch_xid_classify_last_membership() (Patch 13) and
+ * epoch_xid_mvcc_last_path() (Patch 12), providing complete observability
+ * of the epoch visibility pipeline's fast paths.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_classify_last_horizon);
+
+Datum
+epoch_xid_classify_last_horizon(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_classify_last_horizon)
+	{
+		case 'h':
+			result = "horizon_fastpath";
+			break;
+		default:
+			result = "not_used";
 			break;
 	}
 

@@ -12887,4 +12887,10 @@
   proname => 'epoch_xid_classify_last_membership', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_classify_last_membership' },
+
+{ oid => '9921',
+  descr => 'TEST-ONLY: report whether the 64-bit snapshot horizon fast-reject was taken by Phase 4',
+  proname => 'epoch_xid_classify_last_horizon', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_classify_last_horizon' },
 ]

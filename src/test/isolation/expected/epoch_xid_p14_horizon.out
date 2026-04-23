@@ -1,0 +1,40 @@
+Parsed test spec with 2 sessions
+
+starting permutation: insert_inprogress tid_committed check_horizon_committed check_membership_committed tid_inprogress check_horizon_inprogress check_membership_inprogress release1
+step insert_inprogress: BEGIN; INSERT INTO epoch_p14_horizon VALUES (2, 'inprogress_row');
+step tid_committed: SELECT * FROM epoch_p14_horizon WHERE ctid = '(0,1)';
+id|val          
+--+-------------
+ 1|committed_row
+(1 row)
+
+step check_horizon_committed: SELECT epoch_xid_classify_last_horizon();
+epoch_xid_classify_last_horizon
+-------------------------------
+horizon_fastpath               
+(1 row)
+
+step check_membership_committed: SELECT epoch_xid_classify_last_membership();
+epoch_xid_classify_last_membership
+----------------------------------
+not_called                        
+(1 row)
+
+step tid_inprogress: SELECT * FROM epoch_p14_horizon WHERE ctid = '(0,2)';
+id|val
+--+---
+(0 rows)
+
+step check_horizon_inprogress: SELECT epoch_xid_classify_last_horizon();
+epoch_xid_classify_last_horizon
+-------------------------------
+not_used                       
+(1 row)
+
+step check_membership_inprogress: SELECT epoch_xid_classify_last_membership();
+epoch_xid_classify_last_membership
+----------------------------------
+64bit_membership                  
+(1 row)
+
+step release1: ROLLBACK;

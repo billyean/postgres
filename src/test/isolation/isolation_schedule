@@ -143,3 +143,5 @@ test: epoch_xid_fetch_inprogress_delete
 test: epoch_xid_p12_inprogress_membership
 test: epoch_xid_fetch_mxid_lockers
 test: epoch_xid_fetch_snapshot
+test: epoch_xid_p14_horizon
+test: epoch_xid_p14_mxid_horizon

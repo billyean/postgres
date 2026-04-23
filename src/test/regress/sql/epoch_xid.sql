@@ -1544,3 +1544,79 @@ SELECT epoch_xid_classify_last_membership();
 SELECT epoch_xid_mvcc_last_path();
 
 DROP TABLE epoch_visfetch_p12;
+
+-- ======================================================
+-- Patch 14: 64-bit snapshot horizon fast-reject
+-- ======================================================
+--
+-- These tests prove that Patch 14's epoch_horizon fast-reject is exercised
+-- by the epoch-aware Phase 4 classification path.  The fast-reject is
+-- justified by snapshot semantics: epoch_horizon is the 64-bit form of
+-- snapshot->xmin, and any XID preceding snapshot->xmin had already completed
+-- before the snapshot was created.  This does not depend on RecentXmin.
+
+-- P14_a: Horizon fast-reject fires for a committed tuple
+--
+-- A committed tuple's xmin is older than the current snapshot's xmin.
+-- The 64-bit horizon fast-reject must fire, skipping the ProcArray scan.
+
+CREATE TABLE epoch_visfetch_p14 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch_p14 VALUES (1, 'p14_test');
+
+-- Start a new transaction to get a fresh snapshot whose xmin > committed xmin
+BEGIN;
+
+-- Confirm preconditions
+SELECT epoch_xid_relation_mode('epoch_visfetch_p14'::regclass);
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan: heap_fetch → epoch branch → Phase 4 → horizon fast-reject
+SELECT * FROM epoch_visfetch_p14 WHERE ctid = '(0,1)';
+
+-- Proof 1: horizon fast-reject was taken
+SELECT epoch_xid_classify_last_horizon();
+
+-- Proof 2: membership check was skipped (resolved before reaching it)
+SELECT epoch_xid_classify_last_membership();
+
+-- Proof 3: the epoch path used the 64-bit snapshot bridge
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+-- P14_b: Horizon fast-reject does NOT fire when guard is off
+--
+-- With the Stage 1 guard force-disabled, epoch_horizon is invalid,
+-- so the fast-reject cannot fire.  This proves the guard controls it.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+SELECT * FROM epoch_visfetch_p14 WHERE ctid = '(0,1)';
+
+-- Must be 'not_used' — guard off means no epoch_horizon
+SELECT epoch_xid_classify_last_horizon();
+
+-- Must be '32bit_membership' — fell back to 32-bit path
+SELECT epoch_xid_classify_last_membership();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P14_c: Guard re-enabled — horizon fast-reject resumes
+--
+-- After restoring the guard, the horizon fast-reject must work again.
+
+SELECT epoch_xid_stage1_bridge_enabled();
+
+BEGIN;
+
+SELECT * FROM epoch_visfetch_p14 WHERE ctid = '(0,1)';
+SELECT epoch_xid_classify_last_horizon();
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+DROP TABLE epoch_visfetch_p14;
