@@ -136,3 +136,47 @@ EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF)
 EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF)
   CREATE TABLE IF NOT EXISTS ctas_ine_tbl AS EXECUTE ctas_ine_query; -- ok
 DROP TABLE ctas_ine_tbl;
+
+--
+-- Tests for CTAS with buffered-insert path.
+--
+-- These tests verify correctness of CTAS results under both the buffered
+-- path (no volatile functions) and the fallback single-row path (volatile
+-- functions present, or EXECUTE).  Path selection is not directly observable
+-- in SQL output; these tests validate that results are correct regardless.
+--
+
+-- Buffered path: small row count, verify contents.
+CREATE TABLE ctas_buffered_1 AS SELECT g AS a, g * 10 AS b FROM generate_series(1, 5) g;
+SELECT count(*) FROM ctas_buffered_1;
+SELECT * FROM ctas_buffered_1 ORDER BY a;
+DROP TABLE ctas_buffered_1;
+
+-- Buffered path: enough rows to trigger auto-flush (>1000 slot threshold).
+CREATE TABLE ctas_buffered_2 AS SELECT g AS a FROM generate_series(1, 2500) g;
+SELECT count(*) FROM ctas_buffered_2;
+SELECT min(a), max(a) FROM ctas_buffered_2;
+DROP TABLE ctas_buffered_2;
+
+-- Buffered path: wide tuples to exercise byte-threshold flushing.
+CREATE TABLE ctas_buffered_wide AS
+  SELECT g AS id,
+         repeat('x', 200) AS col1,
+         repeat('y', 200) AS col2,
+         repeat('z', 200) AS col3
+  FROM generate_series(1, 100) g;
+SELECT count(*) FROM ctas_buffered_wide;
+SELECT id, length(col1), length(col2), length(col3) FROM ctas_buffered_wide WHERE id IN (1, 50, 100) ORDER BY id;
+DROP TABLE ctas_buffered_wide;
+
+-- Fallback path: random() triggers the conservative volatile-function guard.
+-- Result must still be correct through the single-row insertion path.
+CREATE TABLE ctas_volatile AS SELECT g AS a, random() AS r FROM generate_series(1, 10) g;
+SELECT count(*) FROM ctas_volatile;
+SELECT a FROM ctas_volatile ORDER BY a;
+DROP TABLE ctas_volatile;
+
+-- WITH NO DATA: no insertion path exercised; verify unchanged behavior.
+CREATE TABLE ctas_nodata AS SELECT 1 AS a WITH NO DATA;
+SELECT count(*) FROM ctas_nodata;
+DROP TABLE ctas_nodata;

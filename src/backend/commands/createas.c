@@ -40,6 +40,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/queryjumble.h"
+#include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/tcopprot.h"
@@ -57,7 +58,9 @@ typedef struct
 	ObjectAddress reladdr;		/* address of rel, for ExecCreateTableAs */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
 	uint32		ti_options;		/* table_tuple_insert performance options */
-	BulkInsertState bistate;	/* bulk insert state */
+	BulkInsertState bistate;	/* bulk insert state (fallback path only) */
+	TableBufferedInsertState buffered_state;	/* buffered-insert state, or NULL */
+	bool		use_buffered_insert;	/* true if buffered path is eligible */
 } DR_intorel;
 
 /* utility functions for CTAS definition creation */
@@ -260,7 +263,15 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		Assert(!is_matview);	/* excluded by syntax */
 		ExecuteQuery(pstate, estmt, into, params, dest, qc);
 
-		/* get object address that intorel_startup saved for us */
+		/*
+		 * get object address that intorel_startup saved for us.
+		 *
+		 * Note: use_buffered_insert stays false (its palloc0 default) for the
+		 * EXECUTE path.  We conservatively skip the buffered-insert
+		 * optimization here because the prepared statement's plan is not
+		 * available for volatile-function inspection at this point.  Relaxing
+		 * this is outside Patch 0002 scope.
+		 */
 		address = ((DR_intorel *) dest)->reladdr;
 
 		return address;
@@ -322,6 +333,24 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		/* plan the query */
 		plan = pg_plan_query(query, pstate->p_sourcetext,
 							 CURSOR_OPT_PARALLEL_OK, params, NULL);
+
+		/*
+		 * Conservative implementation choice: disable the buffered-insert
+		 * path if the planned target list contains volatile functions.
+		 *
+		 * The buffered-insert API contract does not require this check — the
+		 * CTAS target table is created within this statement and cannot be
+		 * referenced by the source query.  This guard is retained for the
+		 * initial patch series as a caller-local conservatism and can be
+		 * relaxed after validation without any API change.
+		 */
+		{
+			DR_intorel *myState = (DR_intorel *) dest;
+
+			myState->use_buffered_insert =
+				!contain_volatile_functions_after_planning(
+					(Expr *) plan->planTree->targetlist);
+		}
 
 		/*
 		 * Use a snapshot with an updated command ID to ensure this query sees
@@ -564,10 +593,46 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 * If WITH NO DATA is specified, there is no need to set up the state for
 	 * bulk inserts as there are no tuples to insert.
 	 */
-	if (!into->skipData)
-		myState->bistate = GetBulkInsertState();
-	else
+	if (into->skipData)
+	{
 		myState->bistate = NULL;
+		myState->buffered_state = NULL;
+	}
+	else if (myState->use_buffered_insert &&
+			 intoRelationDesc->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		/*
+		 * Try the buffered-insert path.  Pass NULL flush callback -- CTAS
+		 * has no indexes, triggers, or per-tuple post-insert work.
+		 */
+		myState->ti_options |= TABLE_INSERT_BAS_BULKWRITE;
+		myState->buffered_state =
+			table_buffered_insert_begin(intoRelationDesc,
+										myState->output_cid,
+										myState->ti_options,
+										NULL, NULL);
+
+		if (myState->buffered_state != NULL)
+		{
+			/* Buffered path active; bistate is managed inside the AM */
+			myState->bistate = NULL;
+		}
+		else
+		{
+			/* AM does not support buffered inserts; fall back */
+			myState->bistate = GetBulkInsertState();
+		}
+	}
+	else
+	{
+		/*
+		 * Fallback to single-row path.  Reached when the volatile-function
+		 * guard fired, for partitioned targets, or for CTAS via EXECUTE
+		 * (where use_buffered_insert stays false by default).
+		 */
+		myState->buffered_state = NULL;
+		myState->bistate = GetBulkInsertState();
+	}
 
 	/*
 	 * Valid smgr_targblock implies something already wrote to the relation.
@@ -587,19 +652,18 @@ intorel_receive(TupleTableSlot *slot, DestReceiver *self)
 	/* Nothing to insert if WITH NO DATA is specified. */
 	if (!myState->into->skipData)
 	{
-		/*
-		 * Note that the input slot might not be of the type of the target
-		 * relation. That's supported by table_tuple_insert(), but slightly
-		 * less efficient than inserting with the right slot - but the
-		 * alternative would be to copy into a slot of the right type, which
-		 * would not be cheap either. This also doesn't allow accessing per-AM
-		 * data (say a tuple's xmin), but since we don't do that here...
-		 */
-		table_tuple_insert(myState->rel,
-						   slot,
-						   myState->output_cid,
-						   myState->ti_options,
-						   myState->bistate);
+		if (myState->buffered_state != NULL)
+		{
+			table_buffered_insert_put(myState->buffered_state, slot);
+		}
+		else
+		{
+			table_tuple_insert(myState->rel,
+							   slot,
+							   myState->output_cid,
+							   myState->ti_options,
+							   myState->bistate);
+		}
 	}
 
 	/* We know this is a newly created relation, so there are no indexes */
@@ -618,8 +682,17 @@ intorel_shutdown(DestReceiver *self)
 
 	if (!into->skipData)
 	{
-		FreeBulkInsertState(myState->bistate);
-		table_finish_bulk_insert(myState->rel, myState->ti_options);
+		if (myState->buffered_state != NULL)
+		{
+			/* end() flushes remaining tuples and subsumes finish_bulk_insert */
+			table_buffered_insert_end(myState->buffered_state);
+			myState->buffered_state = NULL;
+		}
+		else
+		{
+			FreeBulkInsertState(myState->bistate);
+			table_finish_bulk_insert(myState->rel, myState->ti_options);
+		}
 	}
 
 	/* close rel, but keep lock until commit */
