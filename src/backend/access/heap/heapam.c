@@ -1746,8 +1746,36 @@ heap_fetch(Relation relation,
 
 	/*
 	 * check tuple visibility, then release lock
+	 *
+	 * XID64 EPOCH FORK (Patch 10): For epoch-materialized relations with
+	 * MVCC snapshots, use the epoch-aware visibility path.  This is the
+	 * first real heap visibility consumer of the epoch fork prototype.
+	 *
+	 * The epoch path reuses Phase 4 classification (hint bits + CLOG) and
+	 * implements complete MVCC logic with CID checks.  It does not set
+	 * hint bits (known Patch 10 limitation).
+	 *
+	 * Falls back to native HeapTupleSatisfiesVisibility when:
+	 *   - relation is not epoch-materialized (implicit mode)
+	 *   - snapshot is not SNAPSHOT_MVCC
+	 *   - epoch path returns CANNOT_DETERMINE (unresolvable MultiXact)
 	 */
-	valid = HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
+	if (EpochRelationIsMaterialized(relation) &&
+		snapshot->snapshot_type == SNAPSHOT_MVCC)
+	{
+		EpochMVCCResult epoch_result;
+
+		epoch_result = EpochHeapTupleSatisfiesMVCC(relation, tuple,
+												   snapshot, buffer);
+		if (epoch_result == EPOCH_MVCC_CANNOT_DETERMINE)
+			valid = HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
+		else
+			valid = (epoch_result == EPOCH_MVCC_VISIBLE);
+	}
+	else
+	{
+		valid = HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
+	}
 
 	if (valid)
 		PredicateLockTID(relation, &(tuple->t_self), snapshot,

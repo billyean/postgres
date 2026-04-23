@@ -1,0 +1,11 @@
+Parsed test spec with 2 sessions
+
+starting permutation: delete1 tid_scan release1
+step delete1: BEGIN; DELETE FROM epoch_fetch_inprog_del WHERE id = 1;
+step tid_scan: SELECT * FROM epoch_fetch_inprog_del WHERE ctid = '(0,1)';
+id|val        
+--+-----------
+ 1|will_delete
+(1 row)
+
+step release1: ROLLBACK;

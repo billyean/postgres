@@ -138,3 +138,7 @@ test: epoch_xid_mxid_snapshot_boundary
 test: epoch_xid_visibility_snapshot
 test: epoch_xid_visibility_delete_snapshot
 test: epoch_xid_visibility_mxid
+test: epoch_xid_fetch_inprogress_insert
+test: epoch_xid_fetch_inprogress_delete
+test: epoch_xid_fetch_mxid_lockers
+test: epoch_xid_fetch_snapshot

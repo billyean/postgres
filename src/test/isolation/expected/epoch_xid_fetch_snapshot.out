@@ -1,0 +1,16 @@
+Parsed test spec with 2 sessions
+
+starting permutation: begin1 insert2 tid_scan release1
+step begin1: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;
+?column?
+--------
+       1
+(1 row)
+
+step insert2: INSERT INTO epoch_fetch_snap VALUES (1, 'after_snapshot');
+step tid_scan: SELECT * FROM epoch_fetch_snap WHERE ctid = '(0,1)';
+id|val
+--+---
+(0 rows)
+
+step release1: COMMIT;

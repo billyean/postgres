@@ -36,6 +36,21 @@
 #include "utils/snapmgr.h"
 
 
+/*
+ * Test-only instrumentation for Patch 10 heap_fetch() epoch branch.
+ *
+ * Records the last path taken by EpochHeapTupleSatisfiesMVCC so tests
+ * can directly prove which internal branch executed.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'm' = epoch branch, slot-backed materialized epoch data used
+ *   'd' = epoch branch, no-slot fallback (PageIsNew / absent / beyond HWM)
+ *   'u' = epoch branch, returned CANNOT_DETERMINE (unresolvable)
+ */
+static char epoch_mvcc_last_path = 'n';
+
+
 /* ----------------------------------------------------------------
  *	Segment-aware sparse-file helpers
  *
@@ -1063,17 +1078,16 @@ EpochVerdictReasonString(EpochVerdictReason r)
 
 /*
  * EpochDeriveVisibility -- snapshot-relative visibility verdict.
- * Uses GetActiveSnapshot() + XidInMVCCSnapshot().
+ * Caller provides the snapshot explicitly.
  */
 static void
 EpochDeriveVisibility(HeapTupleHeader htup,
 					  TransactionId xmin_xid, TransactionId xmax_xid,
 					  EpochXidStatus xmin_status, EpochXidStatus xmax_status,
+					  Snapshot snapshot,
 					  EpochVisibilityVerdict *verdict,
 					  EpochVerdictReason *reason)
 {
-	Snapshot	snapshot = GetActiveSnapshot();
-
 	if (snapshot == NULL)
 	{
 		*verdict = EPOCH_VIS_CANNOT_CLASSIFY;
@@ -1179,6 +1193,181 @@ EpochDeriveVisibility(HeapTupleHeader htup,
 
 	*verdict = EPOCH_VIS_INVISIBLE;
 	*reason = EPOCH_REASON_XMAX_COMMITTED_VISIBLE_IN_SNAPSHOT;
+}
+
+
+/* ----------------------------------------------------------------
+ *	Real heap visibility consumer (Patch 10)
+ *
+ *	EpochHeapTupleSatisfiesMVCC -- MVCC visibility using epoch fork.
+ *
+ *	Called from the guarded branch in heap_fetch() for epoch-materialized
+ *	relations with MVCC snapshots.  This is the first real heap visibility
+ *	consumer of the epoch fork prototype.
+ *
+ *	Genuinely consumes epoch-fork metadata:
+ *	  - Calls Phase 3 (EpochInterpretTuple) to reconstruct full 64-bit
+ *	    XIDs from the epoch slot data + heap tuple header
+ *	  - Uses the epoch-reconstructed XIDs (not raw header XIDs) as the
+ *	    basis for the MVCC visibility logic
+ *	  - Uses Phase 3 interpretation modes to handle special cases
+ *	    (FROZEN, MULTIXACT, INVALID) from epoch-fork context
+ *
+ *	For Patch 10 (32-bit snapshots), XidInMVCCSnapshot still uses the
+ *	low 32 bits extracted from the reconstructed 64-bit XID.  The result
+ *	is provably identical to the native path for epoch 0.  Future patches
+ *	with 64-bit snapshots will use the full reconstructed value.
+ *
+ *	Read-only: does not set hint bits, does not modify any page.
+ *
+ *	Returns CANNOT_DETERMINE for unresolvable MultiXact cases; the
+ *	caller (heap_fetch) falls back to native HeapTupleSatisfiesVisibility.
+ * ----------------------------------------------------------------
+ */
+EpochMVCCResult
+EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
+							Snapshot snapshot, Buffer heapbuf)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	BlockNumber blkno = ItemPointerGetBlockNumber(&htup->t_self);
+	OffsetNumber offnum = ItemPointerGetOffsetNumber(&htup->t_self);
+	bool		is_materialized;
+	EpochSlotData *slot = NULL;
+	Buffer		epochbuf = InvalidBuffer;
+	EpochTupleInterpResult interp;
+	EpochXidStatus xmin_status,
+				xmax_status;
+	TransactionId xmin_xid,
+				xmax_xid,
+				effective_xmax;
+
+	Assert(snapshot != NULL);
+	Assert(snapshot->snapshot_type == SNAPSHOT_MVCC);
+
+	/* Read epoch slot data (read-only: no create/extend/dirty) */
+	is_materialized = EpochRelationIsMaterialized(rel);
+	if (is_materialized)
+	{
+		epochbuf = EpochReadBufferReadOnly(rel, blkno);
+		if (BufferIsValid(epochbuf))
+		{
+			Page		epochpage;
+
+			LockBuffer(epochbuf, BUFFER_LOCK_SHARE);
+			epochpage = BufferGetPage(epochbuf);
+			if (!PageIsNew(epochpage) && EpochPageValidate(epochpage))
+			{
+				EpochPageOpaque opaque = EpochPageGetOpaque(epochpage);
+
+				if (offnum <= opaque->num_slots)
+					slot = EpochGetSlot(epochpage, offnum);
+			}
+		}
+	}
+
+	/*
+	 * Phase 3: reconstruct full 64-bit XIDs from epoch slot + tuple header.
+	 * This is the real epoch-fork consumption point — the full XIDs produced
+	 * here depend on the epoch slot's xmin_epoch / xmax_epoch / epoch_flags.
+	 */
+	interp = EpochInterpretTuple(tuple, slot, is_materialized);
+
+	/* Test-only: record which internal path Phase 3 took */
+	epoch_mvcc_last_path = (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
+		? 'm' : 'd';
+
+	/* Release epoch buffer now that Phase 3 has consumed the slot */
+	if (BufferIsValid(epochbuf))
+		UnlockReleaseBuffer(epochbuf);
+
+	/*
+	 * Use the epoch-reconstructed XIDs for the MVCC logic below.
+	 * For non-MultiXact xmax, the XID comes from Phase 3 reconstruction.
+	 * For MultiXact xmax, Phase 4 decomposes to find the effective updater.
+	 */
+	xmin_xid = XidFromFullTransactionId(interp.full_xmin);
+
+	/*
+	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
+	 * For xmax, also obtain the effective updater XID for MultiXact cases.
+	 */
+	xmin_status = EpochClassifyXidStatus(xmin_xid, tuple, true, NULL);
+	xmax_status = EpochClassifyXidStatus(
+					HeapTupleHeaderGetRawXmax(tuple), tuple, false,
+					&effective_xmax);
+
+	/* Unresolvable MultiXact: fall back to native path */
+	if (xmax_status == EPOCH_XID_MULTIXACT_UNSUPPORTED)
+	{
+		epoch_mvcc_last_path = 'u';
+		return EPOCH_MVCC_CANNOT_DETERMINE;
+	}
+
+	/*
+	 * Determine the xmax XID to use for snapshot comparison.
+	 * For MultiXact: use the effective updater from Phase 4 decomposition.
+	 * For regular xmax: use the epoch-reconstructed XID from Phase 3.
+	 */
+	if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
+		xmax_xid = effective_xmax;
+	else
+		xmax_xid = XidFromFullTransactionId(interp.full_xmax);
+
+	/*
+	 * MVCC visibility logic with complete CID checks.
+	 * Uses epoch-reconstructed xmin_xid and xmax_xid from above.
+	 */
+
+	/* --- xmin checks --- */
+
+	if (xmin_status == EPOCH_XID_FROZEN)
+		goto check_xmax;
+
+	if (xmin_status == EPOCH_XID_ABORTED)
+		return EPOCH_MVCC_INVISIBLE;
+
+	if (xmin_status == EPOCH_XID_IN_PROGRESS)
+	{
+		if (TransactionIdIsCurrentTransactionId(xmin_xid))
+		{
+			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid)
+				return EPOCH_MVCC_INVISIBLE;	/* inserted after scan started */
+			goto check_xmax;
+		}
+		return EPOCH_MVCC_INVISIBLE;	/* other xact's uncommitted insert */
+	}
+
+	/* xmin committed: snapshot check uses epoch-reconstructed xmin */
+	Assert(xmin_status == EPOCH_XID_COMMITTED);
+
+	if (XidInMVCCSnapshot(xmin_xid, snapshot))
+		return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
+
+check_xmax:
+
+	if (xmax_status == EPOCH_XID_INVALID_UNSET ||
+		xmax_status == EPOCH_XID_ABORTED ||
+		xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
+		return EPOCH_MVCC_VISIBLE;
+
+	if (xmax_status == EPOCH_XID_IN_PROGRESS)
+	{
+		if (TransactionIdIsCurrentTransactionId(xmax_xid))
+		{
+			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+				return EPOCH_MVCC_VISIBLE;	/* deleted after scan started */
+			return EPOCH_MVCC_INVISIBLE;	/* deleted before scan started */
+		}
+		return EPOCH_MVCC_VISIBLE;	/* other xact's uncommitted delete */
+	}
+
+	/* xmax committed: snapshot check uses epoch-reconstructed xmax */
+	Assert(xmax_status == EPOCH_XID_COMMITTED);
+
+	if (XidInMVCCSnapshot(xmax_xid, snapshot))
+		return EPOCH_MVCC_VISIBLE;	/* deleter committed after snapshot */
+
+	return EPOCH_MVCC_INVISIBLE;	/* deleter committed, visible in snapshot */
 }
 
 
@@ -1732,7 +1921,7 @@ epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
 
 		/* Phase 5: snapshot-relative visibility using effective xmax */
 		EpochDeriveVisibility(htup, xmin_xid, effective_xmax,
-							  xmin_status, xmax_status,
+							  xmin_status, xmax_status, GetActiveSnapshot(),
 							  &vis_verdict, &vis_reason);
 	}
 
@@ -2334,4 +2523,43 @@ epoch_xid_resolve_multixact(PG_FUNCTION_ARGS)
 	UnlockReleaseBuffer(buf);
 	table_close(rel, RowExclusiveLock);
 	PG_RETURN_BOOL(resolved);
+}
+
+
+/*
+ * epoch_xid_mvcc_last_path() -> text
+ *
+ * TEST-ONLY function.  Returns the internal path taken by the last call to
+ * EpochHeapTupleSatisfiesMVCC from heap_fetch's epoch branch.
+ *
+ * Returns:
+ *   'materialized'    - epoch branch used slot-backed materialized data
+ *   'default_fallback' - epoch branch executed but slot was absent (PageIsNew etc.)
+ *   'cannot_determine' - epoch branch returned CANNOT_DETERMINE
+ *   'not_called'       - EpochHeapTupleSatisfiesMVCC has not been called yet
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_mvcc_last_path);
+
+Datum
+epoch_xid_mvcc_last_path(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_mvcc_last_path)
+	{
+		case 'm':
+			result = "materialized";
+			break;
+		case 'd':
+			result = "default_fallback";
+			break;
+		case 'u':
+			result = "cannot_determine";
+			break;
+		default:
+			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
 }

@@ -1300,3 +1300,107 @@ SELECT epoch_xid_block_status('epoch_sp_crossseg'::regclass, 100);
 SELECT epoch_xid_page_state('epoch_sp_crossseg'::regclass, 100);
 
 DROP TABLE epoch_sp_crossseg;
+
+-- ======================================================
+-- Test: Patch 10 — heap_fetch epoch visibility consumer
+-- ======================================================
+-- These tests prove that heap_fetch's epoch branch genuinely
+-- consumes epoch-fork metadata via Phase 3 (EpochInterpretTuple).
+--
+-- The chain is:
+--   epoch slot written by INSERT → Phase 3 reads slot → reconstructs
+--   full 64-bit XID → MVCC logic uses reconstructed XID → TID scan
+--   returns correct result through heap_fetch's epoch branch.
+--
+-- Tests verify BOTH:
+--   (a) epoch slot data is present (via epoch_xid_inspect)
+--   (b) the TID scan produces correct results through heap_fetch
+
+-- R1: TID scan on live committed tuple (materialized relation)
+CREATE TABLE epoch_visfetch (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch VALUES (1, 'live');
+
+-- Confirm materialized (epoch path will be active in heap_fetch)
+SELECT epoch_xid_relation_mode('epoch_visfetch'::regclass);
+
+-- Verify epoch slot was written: EPOCH_FLAG_XMIN_SET (1) must be present.
+-- This is the data that EpochInterpretTuple consumes in the heap_fetch
+-- epoch branch to reconstruct the full 64-bit xmin.
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_visfetch'::regclass, 0) WHERE offnum = 1;
+
+-- Verify Phase 3 interprets this as 'materialized' (not 'implicit_default'),
+-- proving the epoch slot data is authoritative.
+SELECT xmin_interp, full_xmin > 0 AS has_full_xmin FROM epoch_xid_tuple_visibility_info('epoch_visfetch'::regclass, '(0,1)'::tid);
+
+-- TID scan: goes through heap_fetch → epoch branch → Phase 3 reads the
+-- same epoch slot shown above → reconstructs full xmin → MVCC → VISIBLE
+SELECT * FROM epoch_visfetch WHERE ctid = '(0,1)';
+
+-- R2: TID scan on dead tuple (deleted, committed)
+DELETE FROM epoch_visfetch WHERE id = 1;
+
+-- After DELETE, epoch slot should have both XMIN_SET + XMAX_SET (flags=3).
+-- The heap_fetch epoch branch consumes both for full xmin + xmax reconstruction.
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_visfetch'::regclass, 0) WHERE offnum = 1;
+
+-- TID scan: dead tuple must not be visible (epoch path → INVISIBLE)
+SELECT * FROM epoch_visfetch WHERE ctid = '(0,1)';
+
+-- R3: TID scan after UPDATE — new version visible, old invisible
+INSERT INTO epoch_visfetch VALUES (2, 'original');
+UPDATE epoch_visfetch SET val = 'updated' WHERE id = 2;
+SELECT val FROM epoch_visfetch WHERE id = 2;
+
+DROP TABLE epoch_visfetch;
+
+-- R4: Prove heap_fetch epoch branch behavior DEPENDS on epoch page state
+--
+-- Strategy: create a materialized relation, verify Phase 3 produces
+-- 'materialized' interpretation, then RESET the epoch page to PageIsNew
+-- (all-zero) using the existing test helper.  After reset, Phase 3 must
+-- produce 'implicit_default' instead — proving the heap_fetch epoch
+-- branch's Phase 3 consumption genuinely reads and depends on the epoch
+-- page/slot state, not just on whether the fork file exists.
+--
+-- The TID scan still returns the correct result in both states (epoch 0
+-- = default 0), but the INTERPRETATION observably changes, proving the
+-- epoch branch reacted to the epoch page state change.
+
+CREATE TABLE epoch_visfetch_dep (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch_dep VALUES (1, 'test_dep');
+
+-- Step 1: Confirm materialized, slot present, interpretation = 'materialized'
+SELECT epoch_xid_relation_mode('epoch_visfetch_dep'::regclass);
+SELECT offnum, epoch_flags FROM epoch_xid_inspect('epoch_visfetch_dep'::regclass, 0) WHERE offnum = 1;
+SELECT xmin_interp FROM epoch_xid_tuple_visibility_info('epoch_visfetch_dep'::regclass, '(0,1)'::tid);
+
+-- TID scan: triggers heap_fetch → epoch branch with materialized slot data
+SELECT * FROM epoch_visfetch_dep WHERE ctid = '(0,1)';
+
+-- Direct proof: the instrumentation hook shows the epoch branch used
+-- slot-backed materialized data ('materialized'), not the fallback path.
+SELECT epoch_xid_mvcc_last_path();
+
+-- Step 2: Reset epoch page 0 to PageIsNew (all-zero) using test helper.
+-- The relation STAYS materialized (fork file still exists), but the epoch
+-- page for block 0 is now all-zero.  This changes what Phase 3 sees:
+-- the slot becomes NULL (PageIsNew → no slot data).
+SELECT epoch_xid_reset_page('epoch_visfetch_dep'::regclass, 0);
+
+-- Step 3: Verify the epoch page is now PageIsNew
+SELECT epoch_xid_page_state('epoch_visfetch_dep'::regclass, 0);
+
+-- Step 4: TID scan again.  The epoch branch still executes (relation IS
+-- materialized), but Phase 3 now sees PageIsNew → slot = NULL → falls
+-- back to default epoch instead of using materialized slot data.
+SELECT * FROM epoch_visfetch_dep WHERE ctid = '(0,1)';
+
+-- Direct proof: the instrumentation hook now shows 'default_fallback'
+-- instead of 'materialized'.  This proves the heap_fetch epoch branch
+-- changed its internal path in response to the epoch page state change.
+SELECT epoch_xid_mvcc_last_path();
+
+-- Step 5: epoch_xid_inspect confirms epoch data is truly gone
+SELECT count(*) FROM epoch_xid_inspect('epoch_visfetch_dep'::regclass, 0);
+
+DROP TABLE epoch_visfetch_dep;

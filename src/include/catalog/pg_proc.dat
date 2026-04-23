@@ -12863,4 +12863,10 @@
   proname => 'epoch_xid_resolve_multixact', provolatile => 'v',
   prorettype => 'bool', proargtypes => 'regclass tid',
   prosrc => 'epoch_xid_resolve_multixact' },
+
+{ oid => '9917',
+  descr => 'TEST-ONLY: report last internal path taken by epoch MVCC in heap_fetch',
+  proname => 'epoch_xid_mvcc_last_path', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_mvcc_last_path' },
 ]

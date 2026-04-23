@@ -1,0 +1,10 @@
+Parsed test spec with 2 sessions
+
+starting permutation: insert1 tid_scan release1
+step insert1: BEGIN; INSERT INTO epoch_fetch_inprog_ins VALUES (1, 'uncommitted');
+step tid_scan: SELECT * FROM epoch_fetch_inprog_ins WHERE ctid = '(0,1)';
+id|val
+--+---
+(0 rows)
+
+step release1: ROLLBACK;

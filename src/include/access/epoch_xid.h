@@ -43,6 +43,7 @@
 #include "storage/buf.h"
 #include "storage/bufpage.h"
 #include "utils/relcache.h"
+#include "utils/snapshot.h"
 
 /* ---------- Constants ---------- */
 
@@ -359,5 +360,34 @@ typedef enum EpochVerdictReason
 
 extern const char *EpochVisibilityVerdictString(EpochVisibilityVerdict v);
 extern const char *EpochVerdictReasonString(EpochVerdictReason r);
+
+/* ---------- Real heap visibility consumer (Patch 10) ---------- */
+
+/*
+ * EpochMVCCResult -- tri-state result from EpochHeapTupleSatisfiesMVCC.
+ *
+ * VISIBLE/INVISIBLE: definitive answer, matches HeapTupleSatisfiesMVCC.
+ * CANNOT_DETERMINE: epoch path cannot classify (e.g., unresolvable
+ *     MultiXact); caller must fall back to native visibility path.
+ */
+typedef enum EpochMVCCResult
+{
+	EPOCH_MVCC_VISIBLE,
+	EPOCH_MVCC_INVISIBLE,
+	EPOCH_MVCC_CANNOT_DETERMINE
+} EpochMVCCResult;
+
+/*
+ * EpochHeapTupleSatisfiesMVCC -- real MVCC visibility using epoch fork.
+ *
+ * Called from heap_fetch() for materialized relations with MVCC snapshots.
+ * Reuses Phase 4 classification (hint bits + CLOG) and implements complete
+ * MVCC logic with CID checks matching HeapTupleSatisfiesMVCC behavior.
+ *
+ * Read-only: does not set hint bits, does not modify any page.
+ */
+extern EpochMVCCResult
+EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
+							Snapshot snapshot, Buffer heapbuf);
 
 #endif							/* EPOCH_XID_H */
