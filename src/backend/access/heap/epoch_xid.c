@@ -60,6 +60,17 @@ static char epoch_mvcc_last_path = 'n';
  */
 static bool epoch_stage1_force_disabled = false;
 
+/*
+ * Test-only instrumentation: records which active-transaction membership
+ * function was last used by EpochClassifyXidStatus.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   '6' = 64-bit FullTransactionIdIsInProgress was used
+ *   '3' = 32-bit TransactionIdIsInProgress was used (guard off or no full xid)
+ */
+static char epoch_classify_last_membership = 'n';
+
 
 /* ----------------------------------------------------------------
  *	Segment-aware sparse-file helpers
@@ -954,12 +965,18 @@ EpochTupleStateString(EpochTupleState state)
  * EpochClassifyXidStatus -- classify transaction state of one xid.
  * Uses hint bits first, then CLOG lookup.  Read-only: does not set hint bits.
  *
+ * full_xid: when valid, the 64-bit-aware FullTransactionIdIsInProgress is used
+ * for the active-transaction membership check instead of the 32-bit
+ * TransactionIdIsInProgress.  Pass InvalidFullTransactionId to use the 32-bit
+ * path (e.g., from debug functions that lack the epoch-0 guard context).
+ *
  * effective_xid_out: for MultiXact xmax with a resolvable updater, set to the
  * updater's TransactionId; otherwise set to the input xid.  Callers that need
  * the effective xid for Phase 5 snapshot checks must pass a non-NULL pointer.
  */
 static EpochXidStatus
-EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin,
+EpochClassifyXidStatus(TransactionId xid, FullTransactionId full_xid,
+					   HeapTupleHeader htup, bool is_xmin,
 					   TransactionId *effective_xid_out)
 {
 	if (effective_xid_out)
@@ -988,8 +1005,29 @@ EpochClassifyXidStatus(TransactionId xid, HeapTupleHeader htup, bool is_xmin,
 		return EPOCH_XID_INVALID_UNSET;
 	if (TransactionIdIsCurrentTransactionId(xid))
 		return EPOCH_XID_IN_PROGRESS;
-	if (TransactionIdIsInProgress(xid))
-		return EPOCH_XID_IN_PROGRESS;
+
+	/*
+	 * Active-transaction membership check: use the 64-bit-aware function
+	 * when a full XID is available (Patch 12), fall back to 32-bit otherwise.
+	 */
+	{
+		bool		in_progress;
+
+		if (FullTransactionIdIsValid(full_xid))
+		{
+			epoch_classify_last_membership = '6';
+			in_progress = FullTransactionIdIsInProgress(full_xid);
+		}
+		else
+		{
+			epoch_classify_last_membership = '3';
+			in_progress = TransactionIdIsInProgress(xid);
+		}
+
+		if (in_progress)
+			return EPOCH_XID_IN_PROGRESS;
+	}
+
 	if (TransactionIdDidCommit(xid))
 		return EPOCH_XID_COMMITTED;
 
@@ -1412,12 +1450,43 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	xmin_xid = XidFromFullTransactionId(interp.full_xmin);
 
 	/*
+	 * Stage 1 bounded guard (Patch 11, unchanged by Patch 12): determine
+	 * whether the 64-bit epoch-aware paths are available.  This gates both
+	 * the Phase 4 membership check (Patch 12) and the Phase 5 snapshot
+	 * comparison (Patch 11).  It requires:
+	 *
+	 * (1) A valid epoch_anchor in the snapshot (set by GetSnapshotData).
+	 *     Imported/special snapshots may have epoch_anchor = 0; for those
+	 *     we fall back to 32-bit comparison.
+	 *
+	 * (2) The anchor must be in epoch 0 (pre-wrap).  Stage 1 is validated
+	 *     ONLY for pre-wrap / epoch-0 operation.  Once the system crosses
+	 *     into epoch 1+, the fallback-to-native path is no longer safe for
+	 *     CANNOT_DETERMINE cases and other non-epoch-wired visibility paths.
+	 *     Cross-epoch safety requires further ProcArray/horizon work.
+	 *
+	 * This is a real code boundary, not just a comment.
+	 */
+	use_64bit_snapshot = !epoch_stage1_force_disabled &&
+		FullTransactionIdIsValid(snapshot->epoch_anchor) &&
+		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+
+	/*
 	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
 	 * For xmax, also obtain the effective updater XID for MultiXact cases.
+	 *
+	 * When the Stage 1 guard passes, pass the full 64-bit XIDs so Phase 4
+	 * uses FullTransactionIdIsInProgress for the membership check.  When the
+	 * guard is off, pass InvalidFullTransactionId so Phase 4 falls back to
+	 * the 32-bit TransactionIdIsInProgress.
 	 */
-	xmin_status = EpochClassifyXidStatus(xmin_xid, tuple, true, NULL);
+	xmin_status = EpochClassifyXidStatus(xmin_xid,
+					use_64bit_snapshot ? interp.full_xmin : InvalidFullTransactionId,
+					tuple, true, NULL);
 	xmax_status = EpochClassifyXidStatus(
-					HeapTupleHeaderGetRawXmax(tuple), tuple, false,
+					HeapTupleHeaderGetRawXmax(tuple),
+					use_64bit_snapshot ? interp.full_xmax : InvalidFullTransactionId,
+					tuple, false,
 					&effective_xmax);
 
 	/* Unresolvable MultiXact: fall back to native path */
@@ -1436,26 +1505,6 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		xmax_xid = effective_xmax;
 	else
 		xmax_xid = XidFromFullTransactionId(interp.full_xmax);
-
-	/*
-	 * Stage 1 snapshot bridge (Patch 11): determine whether the 64-bit
-	 * snapshot comparison path is available.  It requires:
-	 *
-	 * (1) A valid epoch_anchor in the snapshot (set by GetSnapshotData).
-	 *     Imported/special snapshots may have epoch_anchor = 0; for those
-	 *     we fall back to 32-bit comparison.
-	 *
-	 * (2) The anchor must be in epoch 0 (pre-wrap).  Stage 1 is validated
-	 *     ONLY for pre-wrap / epoch-0 operation.  Once the system crosses
-	 *     into epoch 1+, the fallback-to-native path is no longer safe for
-	 *     CANNOT_DETERMINE cases and other non-epoch-wired visibility paths.
-	 *     Cross-epoch safety requires Stages 2-3 (ProcArray/horizon work).
-	 *
-	 * This is a real code boundary, not just a comment.
-	 */
-	use_64bit_snapshot = !epoch_stage1_force_disabled &&
-		FullTransactionIdIsValid(snapshot->epoch_anchor) &&
-		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
 
 	/* Test-only: record which internal path was taken */
 	if (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
@@ -1958,8 +2007,8 @@ epoch_xid_tuple_txn_state_info(PG_FUNCTION_ARGS)
 	/* Phase 4: classify transaction status */
 	xmin_xid = HeapTupleHeaderGetRawXmin(htup);
 	xmax_xid = HeapTupleHeaderGetRawXmax(htup);
-	xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true, NULL);
-	xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false, NULL);
+	xmin_status = EpochClassifyXidStatus(xmin_xid, InvalidFullTransactionId, htup, true, NULL);
+	xmax_status = EpochClassifyXidStatus(xmax_xid, InvalidFullTransactionId, htup, false, NULL);
 	tuple_state = EpochDeriveTupleState(xmin_status, xmax_status);
 
 	if (BufferIsValid(epochbuf))
@@ -2090,8 +2139,8 @@ epoch_xid_tuple_current_visibility_info(PG_FUNCTION_ARGS)
 	{
 		TransactionId effective_xmax;
 
-		xmin_status = EpochClassifyXidStatus(xmin_xid, htup, true, NULL);
-		xmax_status = EpochClassifyXidStatus(xmax_xid, htup, false, &effective_xmax);
+		xmin_status = EpochClassifyXidStatus(xmin_xid, InvalidFullTransactionId, htup, true, NULL);
+		xmax_status = EpochClassifyXidStatus(xmax_xid, InvalidFullTransactionId, htup, false, &effective_xmax);
 
 		/* Phase 5: snapshot-relative visibility using effective xmax */
 		EpochDeriveVisibility(htup, xmin_xid, effective_xmax,
@@ -2733,6 +2782,43 @@ epoch_xid_mvcc_last_path(PG_FUNCTION_ARGS)
 			break;
 		case 'u':
 			result = "cannot_determine";
+			break;
+		default:
+			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_classify_last_membership() -> text
+ *
+ * TEST-ONLY function.  Returns which active-transaction membership function
+ * was last used by EpochClassifyXidStatus during Phase 4 classification.
+ *
+ * Returns:
+ *   '64bit_membership' - FullTransactionIdIsInProgress was used (Stage 1 guard passed)
+ *   '32bit_membership' - TransactionIdIsInProgress was used (guard off or no full xid)
+ *   'not_called'       - EpochClassifyXidStatus has not reached the membership check yet
+ *
+ * This makes the Patch 12 64-bit membership improvement observable in tests.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_classify_last_membership);
+
+Datum
+epoch_xid_classify_last_membership(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_classify_last_membership)
+	{
+		case '6':
+			result = "64bit_membership";
+			break;
+		case '3':
+			result = "32bit_membership";
 			break;
 		default:
 			result = "not_called";

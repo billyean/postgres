@@ -1,0 +1,45 @@
+Parsed test spec with 2 sessions
+
+starting permutation: insert1 tid_scan_64 check_membership_64 check_path_64 disable_guard tid_scan_32 check_membership_32 restore_guard release1
+step insert1: BEGIN; INSERT INTO epoch_p12_inprog VALUES (1, 'uncommitted');
+step tid_scan_64: SELECT * FROM epoch_p12_inprog WHERE ctid = '(0,1)';
+id|val
+--+---
+(0 rows)
+
+step check_membership_64: SELECT epoch_xid_classify_last_membership();
+epoch_xid_classify_last_membership
+----------------------------------
+64bit_membership                  
+(1 row)
+
+step check_path_64: SELECT epoch_xid_mvcc_last_path();
+epoch_xid_mvcc_last_path
+------------------------
+snapshot_bridge         
+(1 row)
+
+step disable_guard: SELECT epoch_xid_stage1_force_disable(true);
+epoch_xid_stage1_force_disable
+------------------------------
+                              
+(1 row)
+
+step tid_scan_32: SELECT * FROM epoch_p12_inprog WHERE ctid = '(0,1)';
+id|val
+--+---
+(0 rows)
+
+step check_membership_32: SELECT epoch_xid_classify_last_membership();
+epoch_xid_classify_last_membership
+----------------------------------
+32bit_membership                  
+(1 row)
+
+step restore_guard: SELECT epoch_xid_stage1_force_disable(false);
+epoch_xid_stage1_force_disable
+------------------------------
+                              
+(1 row)
+
+step release1: ROLLBACK;

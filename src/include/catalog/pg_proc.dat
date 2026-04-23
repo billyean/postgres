@@ -12881,4 +12881,10 @@
   proname => 'epoch_xid_stage1_force_disable', provolatile => 'v',
   prorettype => 'void', proargtypes => 'bool',
   prosrc => 'epoch_xid_stage1_force_disable' },
+
+{ oid => '9920',
+  descr => 'TEST-ONLY: report which membership function was last used by Phase 4 classification',
+  proname => 'epoch_xid_classify_last_membership', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_classify_last_membership' },
 ]

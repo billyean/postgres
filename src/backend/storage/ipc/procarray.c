@@ -4389,6 +4389,225 @@ FullXidRelativeTo(FullTransactionId rel, TransactionId xid)
 }
 
 
+/*
+ * FullTransactionIdIsInProgress -- 64-bit-aware active transaction membership
+ *
+ * Like TransactionIdIsInProgress, but takes a full 64-bit XID and
+ * disambiguates 32-bit collisions across epochs by reconstructing each
+ * candidate's full XID via FullXidRelativeTo.  Within epoch 0 this produces
+ * results identical to TransactionIdIsInProgress (parity invariant).
+ *
+ * This is the first ProcArray-side 64-bit-aware step.  The existing
+ * TransactionIdIsInProgress is not modified; all non-epoch callers
+ * continue to use the 32-bit function.
+ */
+bool
+FullTransactionIdIsInProgress(FullTransactionId fxid)
+{
+	static TransactionId *xids = NULL;
+	int			nxids = 0;
+	ProcArrayStruct *arrayP = procArray;
+	TransactionId xid;
+	FullTransactionId latestCompletedFxid;
+	TransactionId *other_xids;
+	XidCacheStatus *other_subxidstates;
+	int			mypgxactoff;
+	int			numProcs;
+
+	xid = XidFromFullTransactionId(fxid);
+
+	/*
+	 * Don't bother checking a transaction older than RecentXmin; it could not
+	 * possibly still be running.  (Note: in particular, this guarantees that
+	 * we reject InvalidTransactionId, FrozenTransactionId, etc as not
+	 * running.)
+	 */
+	if (TransactionIdPrecedes(xid, RecentXmin))
+		return false;
+
+	/*
+	 * Also, we can handle our own transaction (and subtransactions) without
+	 * any access to shared memory.
+	 */
+	if (TransactionIdIsCurrentTransactionId(xid))
+		return true;
+
+	/*
+	 * If first time through, get workspace to remember main XIDs in. We
+	 * malloc it permanently to avoid repeated palloc/pfree overhead.
+	 */
+	if (xids == NULL)
+	{
+		int			maxxids = RecoveryInProgress() ? TOTAL_MAX_CACHED_SUBXIDS : arrayP->maxProcs;
+
+		xids = (TransactionId *) malloc(maxxids * sizeof(TransactionId));
+		if (xids == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+	}
+
+	other_xids = ProcGlobal->xids;
+	other_subxidstates = ProcGlobal->subxidStates;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	/*
+	 * Now that we have the lock, we can check latestCompletedXid; if the
+	 * target full XID is after that, it's surely still running.
+	 */
+	latestCompletedFxid = TransamVariables->latestCompletedXid;
+	if (FullTransactionIdFollows(fxid, latestCompletedFxid))
+	{
+		LWLockRelease(ProcArrayLock);
+		return true;
+	}
+
+	/* Scan ProcArray for the target XID */
+	mypgxactoff = MyProc->pgxactoff;
+	numProcs = arrayP->numProcs;
+	for (int pgxactoff = 0; pgxactoff < numProcs; pgxactoff++)
+	{
+		int			pgprocno;
+		PGPROC	   *proc;
+		TransactionId pxid;
+		int			pxids;
+
+		/* Ignore ourselves --- dealt with it above */
+		if (pgxactoff == mypgxactoff)
+			continue;
+
+		/* Fetch xid just once - see GetNewTransactionId */
+		pxid = UINT32_ACCESS_ONCE(other_xids[pgxactoff]);
+
+		if (!TransactionIdIsValid(pxid))
+			continue;
+
+		/*
+		 * Step 1: check the main Xid.  On 32-bit match, reconstruct the
+		 * backend's full XID and verify epoch agreement.
+		 */
+		if (TransactionIdEquals(pxid, xid))
+		{
+			FullTransactionId backend_fxid =
+				FullXidRelativeTo(latestCompletedFxid, pxid);
+
+			if (FullTransactionIdEquals(backend_fxid, fxid))
+			{
+				LWLockRelease(ProcArrayLock);
+				return true;
+			}
+			/* 32-bit collision from a different epoch */
+			continue;
+		}
+
+		/*
+		 * We can ignore main Xids that are younger than the target Xid, since
+		 * the target could not possibly be their child.
+		 */
+		if (TransactionIdPrecedes(xid, pxid))
+			continue;
+
+		/*
+		 * Step 2: check the cached child-Xid arrays.  On 32-bit match,
+		 * reconstruct and verify epoch.
+		 */
+		pxids = other_subxidstates[pgxactoff].count;
+		pg_read_barrier();		/* pairs with barrier in GetNewTransactionId() */
+		pgprocno = arrayP->pgprocnos[pgxactoff];
+		proc = &allProcs[pgprocno];
+		for (int j = pxids - 1; j >= 0; j--)
+		{
+			/* Fetch xid just once - see GetNewTransactionId */
+			TransactionId cxid = UINT32_ACCESS_ONCE(proc->subxids.xids[j]);
+
+			if (TransactionIdEquals(cxid, xid))
+			{
+				FullTransactionId sub_fxid =
+					FullXidRelativeTo(latestCompletedFxid, cxid);
+
+				if (FullTransactionIdEquals(sub_fxid, fxid))
+				{
+					LWLockRelease(ProcArrayLock);
+					return true;
+				}
+			}
+		}
+
+		/*
+		 * Save the main Xid for step 4.  We only need to remember main Xids
+		 * that have uncached children.
+		 */
+		if (other_subxidstates[pgxactoff].overflowed)
+			xids[nxids++] = pxid;
+	}
+
+	/*
+	 * Step 3: in hot standby mode, check the known-assigned-xids list.  XIDs
+	 * in the list must be treated as running.  Within epoch 0, the 32-bit
+	 * check is correct.
+	 */
+	if (RecoveryInProgress())
+	{
+		/* none of the PGPROC entries should have XIDs in hot standby mode */
+		Assert(nxids == 0);
+
+		if (KnownAssignedXidExists(xid))
+		{
+			LWLockRelease(ProcArrayLock);
+			return true;
+		}
+
+		if (TransactionIdPrecedesOrEquals(xid, procArray->lastOverflowedXid))
+			nxids = KnownAssignedXidsGet(xids, xid);
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	/*
+	 * If none of the relevant caches overflowed, we know the Xid is not
+	 * running without even looking at pg_subtrans.
+	 */
+	if (nxids == 0)
+		return false;
+
+	/*
+	 * Step 4: have to check pg_subtrans.
+	 *
+	 * At this point, we know it's either a subtransaction of one of the Xids
+	 * in xids[], or it's not running.  If it's an already-failed
+	 * subtransaction, we want to say "not running" even though its parent may
+	 * still be running.  So first, check pg_xact to see if it's been aborted.
+	 */
+	if (TransactionIdDidAbort(xid))
+		return false;
+
+	/*
+	 * It isn't aborted, so check whether the transaction tree it belongs to
+	 * is still running.  Reconstruct the parent's full XID and verify its
+	 * epoch matches the target's epoch.  Within epoch 0, this epoch check is
+	 * trivially true, but it is structurally correct for future cross-epoch use.
+	 */
+	{
+		TransactionId topxid = SubTransGetTopmostTransaction(xid);
+
+		Assert(TransactionIdIsValid(topxid));
+		if (!TransactionIdEquals(topxid, xid) &&
+			pg_lfind32(topxid, xids, nxids))
+		{
+			FullTransactionId top_fxid =
+				FullXidRelativeTo(latestCompletedFxid, topxid);
+
+			if (EpochFromFullTransactionId(top_fxid) ==
+				EpochFromFullTransactionId(fxid))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+
 /* ----------------------------------------------
  *		KnownAssignedTransactionIds sub-module
  * ----------------------------------------------

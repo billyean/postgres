@@ -1459,3 +1459,88 @@ SELECT * FROM epoch_visfetch_guard WHERE ctid = '(0,1)';
 SELECT epoch_xid_mvcc_last_path();
 
 DROP TABLE epoch_visfetch_guard;
+
+-- ======================================================
+-- Patch 12: 64-bit active-transaction membership check
+-- ======================================================
+--
+-- These tests prove that Patch 12's FullTransactionIdIsInProgress is
+-- exercised by the epoch-aware Phase 4 classification path, and that
+-- Patch 11's Stage 1 operational guard remains unchanged.
+
+-- P12_a: 64-bit membership helper is exercised in the epoch-aware path
+--
+-- A committed tuple's xmin is classified by EpochClassifyXidStatus.
+-- With the Stage 1 guard active, Phase 4 must use the 64-bit
+-- FullTransactionIdIsInProgress for the membership check.
+
+CREATE TABLE epoch_visfetch_p12 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch_p12 VALUES (1, 'p12_test');
+
+-- Confirm preconditions: materialized relation with Stage 1 guard active
+SELECT epoch_xid_relation_mode('epoch_visfetch_p12'::regclass);
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan triggers: heap_fetch → epoch branch → Phase 4 classification
+SELECT * FROM epoch_visfetch_p12 WHERE ctid = '(0,1)';
+
+-- Proof 1: the epoch path used the 64-bit snapshot bridge
+SELECT epoch_xid_mvcc_last_path();
+
+-- Proof 2: Phase 4 used the 64-bit membership function
+SELECT epoch_xid_classify_last_membership();
+
+-- P12_b: Same-epoch parity — 64-bit and 32-bit paths produce identical
+-- visibility results within the bounded epoch-0 operating region.
+--
+-- With bridge enabled: 64-bit membership, tuple visible
+-- With bridge disabled: 32-bit membership, tuple visible (same result)
+-- This proves parity.
+
+-- 64-bit path: tuple is visible, membership was 64-bit
+SELECT * FROM epoch_visfetch_p12 WHERE ctid = '(0,1)';
+SELECT epoch_xid_classify_last_membership();
+
+-- Force guard off → 32-bit path
+SELECT epoch_xid_stage1_force_disable(true);
+SELECT * FROM epoch_visfetch_p12 WHERE ctid = '(0,1)';
+SELECT epoch_xid_classify_last_membership();
+
+-- Both returned the same row: parity confirmed.
+-- Restore
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P12_c: Guard controls membership path selection (negative proof)
+--
+-- When the Stage 1 guard is OFF, the 64-bit membership helper must NOT
+-- be used.  This proves the guard is a real boundary that controls the
+-- Patch 12 improvement, not just the Patch 11 snapshot comparison.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+-- Guard is off
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan: falls back to 32-bit membership
+SELECT * FROM epoch_visfetch_p12 WHERE ctid = '(0,1)';
+
+-- Must be '32bit_membership' — proves guard blocked the 64-bit path
+SELECT epoch_xid_classify_last_membership();
+
+-- Must NOT be 'snapshot_bridge'
+SELECT epoch_xid_mvcc_last_path();
+
+-- Restore
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P12_d: Guard re-enabled — 64-bit membership resumes
+--
+-- After restoring the guard, the 64-bit membership path must be used
+-- again.  This proves the guard is the sole control for the 64-bit path.
+
+SELECT epoch_xid_stage1_bridge_enabled();
+SELECT * FROM epoch_visfetch_p12 WHERE ctid = '(0,1)';
+SELECT epoch_xid_classify_last_membership();
+SELECT epoch_xid_mvcc_last_path();
+
+DROP TABLE epoch_visfetch_p12;
