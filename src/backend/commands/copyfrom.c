@@ -76,6 +76,8 @@
  */
 #define MAX_PARTITION_BUFFERS	32
 
+typedef struct CopyBufferedFlushState CopyBufferedFlushState;
+
 /* Stores multi-insert data related to a single relation in CopyFrom. */
 typedef struct CopyMultiInsertBuffer
 {
@@ -83,6 +85,9 @@ typedef struct CopyMultiInsertBuffer
 	ResultRelInfo *resultRelInfo;	/* ResultRelInfo for 'relid' */
 	BulkInsertState bistate;	/* BulkInsertState for this rel if plain
 								 * table; NULL if foreign table */
+	TableBufferedInsertState buffered_state;	/* AM-owned buffered-insert
+												 * state, or NULL */
+	CopyBufferedFlushState *flush_ctx;	/* flush callback context, or NULL */
 	int			nused;			/* number of 'slots' containing tuples */
 	uint64		linenos[MAX_BUFFERED_TUPLES];	/* Line # of tuple in copy
 												 * stream */
@@ -102,7 +107,23 @@ typedef struct CopyMultiInsertInfo
 	EState	   *estate;			/* Executor state used for COPY */
 	CommandId	mycid;			/* Command Id used for COPY */
 	uint32		ti_options;		/* table insert options */
+	int64	   *processed;		/* pointer to CopyFrom's row counter */
 } CopyMultiInsertInfo;
+
+/*
+ * Context for the buffered-insert flush callback used by COPY.  Carries the
+ * state needed to perform per-tuple post-insert work (index updates, AFTER
+ * ROW INSERT triggers, error context, progress tracking).
+ */
+typedef struct CopyBufferedFlushState
+{
+	CopyFromState cstate;
+	EState	   *estate;
+	ResultRelInfo *resultRelInfo;
+	int64	   *processed;		/* pointer to CopyFrom's processed counter */
+} CopyBufferedFlushState;
+
+static void CopyBufferedFlushCallback(void *context, TupleTableSlot *slot);
 
 
 /* non-export function prototypes */
@@ -362,15 +383,57 @@ CopyLimitPrintoutLength(const char *str)
  * ResultRelInfo.
  */
 static CopyMultiInsertBuffer *
-CopyMultiInsertBufferInit(ResultRelInfo *rri)
+CopyMultiInsertBufferInit(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri)
 {
 	CopyMultiInsertBuffer *buffer;
 
 	buffer = palloc_object(CopyMultiInsertBuffer);
 	memset(buffer->slots, 0, sizeof(TupleTableSlot *) * MAX_BUFFERED_TUPLES);
 	buffer->resultRelInfo = rri;
-	buffer->bistate = (rri->ri_FdwRoutine == NULL) ? GetBulkInsertState() : NULL;
 	buffer->nused = 0;
+	buffer->buffered_state = NULL;
+	buffer->flush_ctx = NULL;
+
+	if (rri->ri_FdwRoutine == NULL)
+	{
+		/*
+		 * Non-FDW table: try the AM-owned buffered-insert path.  The flush
+		 * callback handles index updates and AFTER ROW INSERT triggers.
+		 */
+		CopyBufferedFlushState *flush_ctx;
+
+		flush_ctx = palloc_object(CopyBufferedFlushState);
+		flush_ctx->cstate = miinfo->cstate;
+		flush_ctx->estate = miinfo->estate;
+		flush_ctx->resultRelInfo = rri;
+		flush_ctx->processed = miinfo->processed;
+
+		buffer->buffered_state =
+			table_buffered_insert_begin(rri->ri_RelationDesc,
+										miinfo->mycid,
+										miinfo->ti_options |
+										TABLE_INSERT_BAS_BULKWRITE,
+										CopyBufferedFlushCallback,
+										flush_ctx);
+
+		if (buffer->buffered_state != NULL)
+		{
+			/* AM-owned buffering active; no COPY-side bistate needed */
+			buffer->bistate = NULL;
+			buffer->flush_ctx = flush_ctx;
+		}
+		else
+		{
+			/* AM does not support buffered inserts; fall back */
+			pfree(flush_ctx);
+			buffer->bistate = GetBulkInsertState();
+		}
+	}
+	else
+	{
+		/* FDW table: no buffered-insert, no bistate */
+		buffer->bistate = NULL;
+	}
 
 	return buffer;
 }
@@ -384,7 +447,7 @@ CopyMultiInsertInfoSetupBuffer(CopyMultiInsertInfo *miinfo,
 {
 	CopyMultiInsertBuffer *buffer;
 
-	buffer = CopyMultiInsertBufferInit(rri);
+	buffer = CopyMultiInsertBufferInit(miinfo, rri);
 
 	/* Setup back-link so we can easily find this buffer again */
 	rri->ri_CopyMultiInsertBuffer = buffer;
@@ -401,7 +464,7 @@ CopyMultiInsertInfoSetupBuffer(CopyMultiInsertInfo *miinfo,
 static void
 CopyMultiInsertInfoInit(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri,
 						CopyFromState cstate, EState *estate, CommandId mycid,
-						uint32 ti_options)
+						uint32 ti_options, int64 *processed)
 {
 	miinfo->multiInsertBuffers = NIL;
 	miinfo->bufferedTuples = 0;
@@ -410,6 +473,7 @@ CopyMultiInsertInfoInit(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri,
 	miinfo->estate = estate;
 	miinfo->mycid = mycid;
 	miinfo->ti_options = ti_options;
+	miinfo->processed = processed;
 
 	/*
 	 * Only setup the buffer when not dealing with a partitioned table.
@@ -532,6 +596,32 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 		/* reset relname_only */
 		cstate->relname_only = false;
 	}
+	else if (buffer->buffered_state != NULL)
+	{
+		bool		line_buf_valid = cstate->line_buf_valid;
+		uint64		save_cur_lineno = cstate->cur_lineno;
+
+		/*
+		 * AM-owned buffered path: tuples were submitted via put() and are
+		 * inside the AM already.  Flush triggers the batch write and invokes
+		 * the flush callback once per written tuple for index updates,
+		 * trigger firing, and progress tracking.
+		 */
+		cstate->line_buf_valid = false;
+
+		table_buffered_insert_flush(buffer->buffered_state);
+
+		/* Clear slots that were used for staging before put() */
+		for (i = 0; i < nused; i++)
+		{
+			if (slots[i] != NULL)
+				ExecClearTuple(slots[i]);
+		}
+
+		/* reset cur_lineno and line_buf_valid to what they were */
+		cstate->line_buf_valid = line_buf_valid;
+		cstate->cur_lineno = save_cur_lineno;
+	}
 	else
 	{
 		CommandId	mycid = miinfo->mycid;
@@ -631,10 +721,20 @@ CopyMultiInsertBufferCleanup(CopyMultiInsertInfo *miinfo,
 	/* Remove back-link to ourself */
 	resultRelInfo->ri_CopyMultiInsertBuffer = NULL;
 
-	if (resultRelInfo->ri_FdwRoutine == NULL)
+	if (buffer->buffered_state != NULL)
+	{
+		/* end() flushes remaining tuples and subsumes finish_bulk_insert */
+		table_buffered_insert_end(buffer->buffered_state);
+		buffer->buffered_state = NULL;
+		if (buffer->flush_ctx != NULL)
+			pfree(buffer->flush_ctx);
+	}
+	else if (resultRelInfo->ri_FdwRoutine == NULL)
 	{
 		Assert(buffer->bistate != NULL);
 		FreeBulkInsertState(buffer->bistate);
+		table_finish_bulk_insert(resultRelInfo->ri_RelationDesc,
+								 miinfo->ti_options);
 	}
 	else
 		Assert(buffer->bistate == NULL);
@@ -642,10 +742,6 @@ CopyMultiInsertBufferCleanup(CopyMultiInsertInfo *miinfo,
 	/* Since we only create slots on demand, just drop the non-null ones. */
 	for (i = 0; i < MAX_BUFFERED_TUPLES && buffer->slots[i] != NULL; i++)
 		ExecDropSingleTupleTableSlot(buffer->slots[i]);
-
-	if (resultRelInfo->ri_FdwRoutine == NULL)
-		table_finish_bulk_insert(resultRelInfo->ri_RelationDesc,
-								 miinfo->ti_options);
 
 	pfree(buffer);
 }
@@ -761,17 +857,80 @@ CopyMultiInsertInfoStore(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri,
 	CopyMultiInsertBuffer *buffer = rri->ri_CopyMultiInsertBuffer;
 
 	Assert(buffer != NULL);
-	Assert(slot == buffer->slots[buffer->nused]);
 
-	/* Store the line number so we can properly report any errors later */
+	/* Store the line number for error context during flush */
 	buffer->linenos[buffer->nused] = lineno;
 
-	/* Record this slot as being used */
+	if (buffer->buffered_state != NULL)
+	{
+		/*
+		 * AM-owned buffered path: submit the tuple directly to the AM.
+		 * The AM captures the data internally; the caller retains slot
+		 * ownership and may reuse it.  The AM may auto-flush during put(),
+		 * which fires the flush callback for already-buffered tuples.
+		 */
+		table_buffered_insert_put(buffer->buffered_state, slot);
+	}
+	else
+	{
+		/* Legacy path: slot was already placed into buffer->slots by caller */
+		Assert(slot == buffer->slots[buffer->nused]);
+	}
+
 	buffer->nused++;
 
 	/* Update how many tuples are stored and their size */
 	miinfo->bufferedTuples++;
 	miinfo->bufferedBytes += tuplen;
+}
+
+/*
+ * Flush callback for the AM-owned buffered-insert path.
+ *
+ * Invoked once per flushed tuple, in insertion order.  The slot is an
+ * AM-owned scratch object with TID set; it is valid only for the duration
+ * of this callback.
+ */
+static void
+CopyBufferedFlushCallback(void *context, TupleTableSlot *slot)
+{
+	CopyBufferedFlushState *ctx = (CopyBufferedFlushState *) context;
+	ResultRelInfo *resultRelInfo = ctx->resultRelInfo;
+	EState	   *estate = ctx->estate;
+
+	/*
+	 * cstate->cur_lineno is not restored per-tuple here.  During auto-flush
+	 * (triggered inside put()), it reflects the line being stored, which is
+	 * the best available context.  During explicit flush, the caller has
+	 * already set line_buf_valid = false, so only the relation name appears
+	 * in error context — matching the legacy multi-insert path.
+	 */
+
+	if (resultRelInfo->ri_NumIndices > 0)
+	{
+		List	   *recheckIndexes;
+
+		recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
+											   estate, 0, slot,
+											   NIL, NULL);
+		ExecARInsertTriggers(estate, resultRelInfo,
+							 slot, recheckIndexes,
+							 ctx->cstate->transition_capture);
+		list_free(recheckIndexes);
+	}
+	else if (resultRelInfo->ri_TrigDesc != NULL &&
+			 (resultRelInfo->ri_TrigDesc->trig_insert_after_row ||
+			  resultRelInfo->ri_TrigDesc->trig_insert_new_table))
+	{
+		ExecARInsertTriggers(estate, resultRelInfo,
+							 slot, NIL,
+							 ctx->cstate->transition_capture);
+	}
+
+	/* Update row counter and progress */
+	(*ctx->processed)++;
+	pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+								 *ctx->processed);
 }
 
 /*
@@ -1073,7 +1232,7 @@ CopyFrom(CopyFromState cstate)
 			insertMethod = CIM_MULTI;
 
 		CopyMultiInsertInfoInit(&multiInsertInfo, resultRelInfo, cstate,
-								estate, mycid, ti_options);
+								estate, mycid, ti_options, &processed);
 	}
 
 	/*

@@ -535,3 +535,105 @@ CREATE TABLE pp_510 PARTITION OF pp_2 FOR VALUES FROM (5) TO (10);
 INSERT INTO pp SELECT g, 10 + g FROM generate_series(1,6) g;
 COPY pp TO stdout(header);
 DROP TABLE PP;
+
+--
+-- Tests for COPY FROM with buffered-insert path.
+--
+-- These validate correctness of COPY FROM under the AM-owned buffered path.
+-- Path selection is not directly observable in SQL output.
+--
+
+-- Basic COPY: small row count
+CREATE TABLE copy_buffered_basic (a int, b text);
+COPY copy_buffered_basic FROM stdin;
+1	hello
+2	world
+3	foo
+\.
+SELECT count(*) FROM copy_buffered_basic;
+SELECT * FROM copy_buffered_basic ORDER BY a;
+DROP TABLE copy_buffered_basic;
+
+-- Bulk COPY: exercise buffered path with enough rows for auto-flush.
+-- Generate data in a source table, COPY TO a file, then COPY FROM that file.
+CREATE TABLE copy_bulk_src (a int, b text);
+INSERT INTO copy_bulk_src SELECT g, 'row-' || g FROM generate_series(1, 2500) g;
+CREATE TABLE copy_bulk_dst (a int, b text);
+COPY copy_bulk_src TO '/tmp/copy_buffered_bulk_test.csv' CSV;
+COPY copy_bulk_dst FROM '/tmp/copy_buffered_bulk_test.csv' CSV;
+SELECT count(*) FROM copy_bulk_dst;
+SELECT min(a), max(a) FROM copy_bulk_dst;
+-- Verify data integrity
+SELECT count(*) FROM copy_bulk_dst d JOIN copy_bulk_src s ON d.a = s.a AND d.b = s.b;
+DROP TABLE copy_bulk_src;
+DROP TABLE copy_bulk_dst;
+
+-- COPY into indexed table: verify index maintenance via flush callback
+CREATE TABLE copy_indexed (a int PRIMARY KEY, b text);
+COPY copy_indexed FROM stdin;
+1	alpha
+2	beta
+3	gamma
+4	delta
+5	epsilon
+\.
+SELECT count(*) FROM copy_indexed;
+SELECT * FROM copy_indexed ORDER BY a;
+-- Verify index is usable
+SET enable_seqscan = off;
+SELECT a FROM copy_indexed WHERE a = 3;
+RESET enable_seqscan;
+DROP TABLE copy_indexed;
+
+-- COPY with AFTER ROW INSERT trigger: verify trigger fires via flush callback
+CREATE TABLE copy_trigger_tgt (a int, b text);
+CREATE TABLE copy_trigger_log (a int, b text);
+CREATE FUNCTION copy_trigger_fn() RETURNS trigger AS $$
+BEGIN
+  INSERT INTO copy_trigger_log(a, b) VALUES (NEW.a, NEW.b);
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER copy_after_ins
+  AFTER INSERT ON copy_trigger_tgt
+  FOR EACH ROW EXECUTE FUNCTION copy_trigger_fn();
+COPY copy_trigger_tgt FROM stdin;
+10	first
+20	second
+30	third
+\.
+SELECT count(*) FROM copy_trigger_tgt;
+SELECT a, b FROM copy_trigger_tgt ORDER BY a;
+-- Verify trigger fired for each row
+SELECT count(*) FROM copy_trigger_log;
+SELECT a, b FROM copy_trigger_log ORDER BY a;
+DROP TABLE copy_trigger_tgt CASCADE;
+DROP TABLE copy_trigger_log;
+DROP FUNCTION copy_trigger_fn;
+
+-- Partitioned COPY: verify correctness under partition routing with buffered path
+CREATE TABLE copy_part_routed (
+    id int,
+    val text
+) PARTITION BY RANGE (id);
+CREATE TABLE copy_part_routed_p1 PARTITION OF copy_part_routed
+    FOR VALUES FROM (1) TO (100);
+CREATE TABLE copy_part_routed_p2 PARTITION OF copy_part_routed
+    FOR VALUES FROM (100) TO (200);
+COPY copy_part_routed FROM stdin;
+1	alpha
+50	bravo
+99	charlie
+100	delta
+150	echo
+199	foxtrot
+\.
+-- Total row count
+SELECT count(*) FROM copy_part_routed;
+-- Per-partition row counts
+SELECT tableoid::regclass, count(*)
+FROM copy_part_routed
+GROUP BY tableoid ORDER BY tableoid::regclass::name;
+-- Content correctness
+SELECT * FROM copy_part_routed ORDER BY id;
+DROP TABLE copy_part_routed;
