@@ -2447,6 +2447,28 @@ GetSnapshotData(Snapshot snapshot)
 	/* XID64 EPOCH FORK: capture epoch anchor for 64-bit XID reconstruction */
 	snapshot->epoch_anchor = latest_completed;
 
+	/*
+	 * XID64 EPOCH FORK (Patch 15): pre-compute 64-bit snapshot boundaries.
+	 *
+	 * These are the 64-bit forms of snapshot->xmin and snapshot->xmax,
+	 * derived from the same latestCompletedXid anchor.  Pre-computing them
+	 * here eliminates per-tuple reconstruction in the epoch-aware
+	 * visibility path (EpochHeapTupleSatisfiesMVCC, FullXidInMVCCSnapshot).
+	 *
+	 * Populated whenever epoch_anchor is valid.  The consumer-side Stage 1
+	 * guard controls whether these fields are actually used.
+	 */
+	if (FullTransactionIdIsValid(snapshot->epoch_anchor))
+	{
+		snapshot->epoch_full_xmin = FullXidRelativeTo(latest_completed, xmin);
+		snapshot->epoch_full_xmax = FullXidRelativeTo(latest_completed, xmax);
+	}
+	else
+	{
+		snapshot->epoch_full_xmin = InvalidFullTransactionId;
+		snapshot->epoch_full_xmax = InvalidFullTransactionId;
+	}
+
 	snapshot->curcid = GetCurrentCommandId(false);
 
 	/*

@@ -1620,3 +1620,152 @@ SELECT epoch_xid_mvcc_last_path();
 COMMIT;
 
 DROP TABLE epoch_visfetch_p14;
+
+-- ======================================================
+-- Patch 15: acquisition-time 64-bit snapshot boundary bridge
+-- ======================================================
+--
+-- These tests prove that Patch 15's pre-computed epoch_full_xmin and
+-- epoch_full_xmax are populated at snapshot acquisition time and
+-- consumed by the epoch-aware heap_fetch() path.
+
+-- P15_a: Bridge state is populated at acquisition time
+--
+-- epoch_xid_snapshot_bridge_info() exposes the pre-computed fields.
+-- Both full_xmin and full_xmax must be non-zero for a normal MVCC
+-- snapshot in epoch 0.  guard_active must be true.
+
+BEGIN;
+
+SELECT anchor_valid, (full_xmin > 0) AS xmin_valid,
+       (full_xmax > 0) AS xmax_valid, guard_active
+  FROM epoch_xid_snapshot_bridge_info();
+
+COMMIT;
+
+-- P15_b: Horizon fast-reject still works with acquisition-time bridge
+--
+-- A committed tuple older than the snapshot's xmin must still trigger
+-- the horizon fast-reject (Patch 14), now sourced from the pre-computed
+-- epoch_full_xmin field instead of per-tuple reconstruction.
+
+CREATE TABLE epoch_visfetch_p15 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch_p15 VALUES (1, 'p15_test');
+
+BEGIN;
+
+SELECT epoch_xid_relation_mode('epoch_visfetch_p15'::regclass);
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan: heap_fetch → epoch branch → Phase 4 horizon from epoch_full_xmin
+SELECT * FROM epoch_visfetch_p15 WHERE ctid = '(0,1)';
+
+-- Proof: horizon fast-reject fired using the acquisition-time value
+SELECT epoch_xid_classify_last_horizon();
+
+-- Proof: epoch path used the 64-bit snapshot bridge
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+-- P15_c: Guard-off disables consumption of bridge state
+--
+-- With the Stage 1 guard force-disabled, the epoch path does not read
+-- the pre-computed fields.  Bridge state is populated but not consumed.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+-- Bridge state is still populated (anchor valid) but guard is off
+SELECT anchor_valid, guard_active
+  FROM epoch_xid_snapshot_bridge_info();
+
+SELECT * FROM epoch_visfetch_p15 WHERE ctid = '(0,1)';
+
+-- Must be 'not_used' — guard off means no epoch path
+SELECT epoch_xid_classify_last_horizon();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P15_d: Guard restored — bridge state consumption resumes
+
+BEGIN;
+
+SELECT guard_active FROM epoch_xid_snapshot_bridge_info();
+
+SELECT * FROM epoch_visfetch_p15 WHERE ctid = '(0,1)';
+SELECT epoch_xid_classify_last_horizon();
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+DROP TABLE epoch_visfetch_p15;
+
+-- P15_e: Source proof — consumer uses pre-computed bridge state
+--
+-- This is the key Patch 15 proof: the narrow epoch-aware path must
+-- consume the acquisition-time bridge state (precomputed), not the
+-- old per-consumer reconstruction — for BOTH the Phase 5 boundary
+-- comparisons AND the Phase 4 horizon fast-reject.
+
+CREATE TABLE epoch_visfetch_p15src (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch_p15src VALUES (1, 'source_test');
+
+BEGIN;
+
+SELECT * FROM epoch_visfetch_p15src WHERE ctid = '(0,1)';
+
+-- Phase 5 boundaries: must be 'precomputed'
+SELECT epoch_xid_bridge_last_source();
+
+-- Phase 4 horizon: must be 'precomputed'
+SELECT epoch_xid_horizon_last_source();
+
+-- Horizon fast-reject must still fire
+SELECT epoch_xid_classify_last_horizon();
+
+COMMIT;
+
+-- P15_f: Fallback proof — reconstruction path still works for both consumers
+--
+-- Force both consumers to ignore the pre-computed fields and reconstruct
+-- boundaries ad hoc.  Prove the same visibility result and that both
+-- sources change to 'reconstructed'.
+
+SELECT epoch_xid_force_bridge_reconstruct(true);
+
+BEGIN;
+
+SELECT * FROM epoch_visfetch_p15src WHERE ctid = '(0,1)';
+
+-- Phase 5 boundaries: must be 'reconstructed'
+SELECT epoch_xid_bridge_last_source();
+
+-- Phase 4 horizon: must be 'reconstructed'
+SELECT epoch_xid_horizon_last_source();
+
+-- Horizon fast-reject must still fire (same value, different source)
+SELECT epoch_xid_classify_last_horizon();
+
+COMMIT;
+
+SELECT epoch_xid_force_bridge_reconstruct(false);
+
+-- P15_g: Parity — both sources produce identical visibility results
+--
+-- After restoring normal mode, the precomputed path resumes.
+
+BEGIN;
+
+SELECT * FROM epoch_visfetch_p15src WHERE ctid = '(0,1)';
+
+-- Both must report 'precomputed' again
+SELECT epoch_xid_bridge_last_source();
+SELECT epoch_xid_horizon_last_source();
+
+COMMIT;
+
+DROP TABLE epoch_visfetch_p15src;

@@ -87,6 +87,44 @@ static char epoch_classify_last_membership = 'n';
  */
 static char epoch_classify_last_horizon = 'n';
 
+/*
+ * Test-only instrumentation: records the source of the 64-bit snapshot
+ * boundary values used by the last EpochHeapTupleSatisfiesMVCC invocation.
+ *
+ * Values:
+ *   'n' = not reached (initial, or epoch path not entered)
+ *   'p' = precomputed: boundaries read from snapshot->epoch_full_xmin/xmax
+ *         (populated at acquisition time by GetSnapshotData, Patch 15)
+ *   'r' = reconstructed: boundaries derived ad hoc via EpochFullXidRelativeTo
+ *         (fallback for snapshots not filled by GetSnapshotData)
+ *
+ * This proves the key Patch 15 claim: that the consumer path actually uses
+ * the acquisition-time bridge state rather than the old per-consumer
+ * reconstruction.
+ */
+static char epoch_bridge_last_source = 'n';
+
+/*
+ * Test-only override: when true, forces the 64-bit snapshot boundary
+ * consumers to ignore the pre-computed epoch_full_xmin/epoch_full_xmax
+ * fields and use the per-consumer reconstruction fallback instead.
+ * This enables tests to prove both the precomputed and reconstructed
+ * paths are exercised and produce identical results.
+ */
+static bool epoch_bridge_force_reconstruct = false;
+
+/*
+ * Test-only instrumentation: records the source of the epoch_horizon value
+ * used by the last EpochHeapTupleSatisfiesMVCC invocation for the Phase 4
+ * horizon fast-reject.
+ *
+ * Values:
+ *   'n' = not reached (initial, or guard off, epoch path not entered)
+ *   'p' = precomputed: horizon read from snapshot->epoch_full_xmin
+ *   'r' = reconstructed: horizon derived via EpochFullXidRelativeTo
+ */
+static char epoch_horizon_last_source = 'n';
+
 /* Forward declaration: defined in the Phase 5 section, needed by Phase 4 */
 static inline FullTransactionId
 EpochFullXidRelativeTo(FullTransactionId ref, TransactionId xid);
@@ -1380,9 +1418,30 @@ FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
 
 	Assert(FullTransactionIdIsValid(anchor));
 
-	/* Reconstruct 64-bit boundaries from anchor + 32-bit fields */
-	full_xmin = EpochFullXidRelativeTo(anchor, snapshot->xmin);
-	full_xmax = EpochFullXidRelativeTo(anchor, snapshot->xmax);
+	/*
+	 * Read pre-computed 64-bit boundaries from snapshot (Patch 15).
+	 * These were derived at acquisition time in GetSnapshotData from the
+	 * same epoch_anchor and xmin/xmax that produced the 32-bit fields.
+	 * This eliminates the per-call EpochFullXidRelativeTo reconstruction
+	 * that was previously done here.
+	 *
+	 * Fallback: if the pre-computed fields are not yet populated (e.g.,
+	 * bootstrap snapshots created before GetSnapshotData runs), reconstruct
+	 * from anchor + 32-bit fields as before.
+	 */
+	if (!epoch_bridge_force_reconstruct &&
+		FullTransactionIdIsValid(snapshot->epoch_full_xmin))
+	{
+		full_xmin = snapshot->epoch_full_xmin;
+		full_xmax = snapshot->epoch_full_xmax;
+		epoch_bridge_last_source = 'p';
+	}
+	else
+	{
+		full_xmin = EpochFullXidRelativeTo(anchor, snapshot->xmin);
+		full_xmax = EpochFullXidRelativeTo(anchor, snapshot->xmax);
+		epoch_bridge_last_source = 'r';
+	}
 
 	/* Quick range checks using 64-bit comparison */
 	if (FullTransactionIdPrecedes(fxid, full_xmin))
@@ -1495,6 +1554,8 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 
 	/* Reset per-invocation instrumentation */
 	epoch_classify_last_horizon = 'n';
+	epoch_bridge_last_source = 'n';
+	epoch_horizon_last_source = 'n';
 
 	/* Read epoch slot data (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
@@ -1563,12 +1624,13 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	 *
 	 * When the Stage 1 guard passes, pass the full 64-bit XIDs so Phase 4
 	 * uses FullTransactionIdIsInProgress for the membership check (Patch 13),
-	 * and derive a 64-bit snapshot horizon for the fast-reject (Patch 14).
+	 * and supply the pre-computed 64-bit snapshot horizon for the fast-reject
+	 * (Patch 14).
 	 *
-	 * epoch_horizon is the 64-bit form of snapshot->xmin: any XID preceding
-	 * it had already completed before the snapshot was created, so the
-	 * ProcArray membership scan can be skipped.  This is justified directly
-	 * by snapshot semantics; it does not depend on RecentXmin.
+	 * epoch_horizon is now read directly from snapshot->epoch_full_xmin
+	 * (Patch 15), which was pre-computed at acquisition time in
+	 * GetSnapshotData.  This eliminates the per-tuple EpochFullXidRelativeTo
+	 * reconstruction that Patch 14 performed here.
 	 *
 	 * When the guard is off, pass InvalidFullTransactionId for both full_xid
 	 * and epoch_horizon so Phase 4 falls back to the 32-bit path.
@@ -1577,8 +1639,20 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		FullTransactionId epoch_horizon = InvalidFullTransactionId;
 
 		if (use_64bit_snapshot)
-			epoch_horizon = EpochFullXidRelativeTo(snapshot->epoch_anchor,
-												   snapshot->xmin);
+		{
+			if (!epoch_bridge_force_reconstruct &&
+				FullTransactionIdIsValid(snapshot->epoch_full_xmin))
+			{
+				epoch_horizon = snapshot->epoch_full_xmin;
+				epoch_horizon_last_source = 'p';
+			}
+			else
+			{
+				epoch_horizon = EpochFullXidRelativeTo(snapshot->epoch_anchor,
+													   snapshot->xmin);
+				epoch_horizon_last_source = 'r';
+			}
+		}
 
 		xmin_status = EpochClassifyXidStatus(xmin_xid,
 						use_64bit_snapshot ? interp.full_xmin : InvalidFullTransactionId,
@@ -3016,4 +3090,160 @@ epoch_xid_stage1_force_disable(PG_FUNCTION_ARGS)
 {
 	epoch_stage1_force_disabled = PG_GETARG_BOOL(0);
 	PG_RETURN_VOID();
+}
+
+
+/*
+ * epoch_xid_snapshot_bridge_info() -> record
+ *
+ * TEST-ONLY function.  Exposes the acquisition-time 64-bit snapshot bridge
+ * state (Patch 15) for the current active snapshot.
+ *
+ * Returns:
+ *   anchor_valid  : whether epoch_anchor is valid
+ *   full_xmin     : epoch_full_xmin as int8 (0 if invalid)
+ *   full_xmax     : epoch_full_xmax as int8 (0 if invalid)
+ *   guard_active  : whether the Stage 1 guard would pass
+ *
+ * This makes the acquisition-time bridge state directly observable in tests,
+ * proving that GetSnapshotData populated the pre-computed boundaries.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_snapshot_bridge_info);
+
+Datum
+epoch_xid_snapshot_bridge_info(PG_FUNCTION_ARGS)
+{
+	Snapshot	snapshot = GetActiveSnapshot();
+	TupleDesc	tupdesc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	bool		anchor_valid;
+	bool		guard_active;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context that cannot accept type record")));
+
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	if (snapshot == NULL)
+	{
+		memset(nulls, true, sizeof(nulls));
+		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+	}
+
+	anchor_valid = FullTransactionIdIsValid(snapshot->epoch_anchor);
+	guard_active = !epoch_stage1_force_disabled &&
+		anchor_valid &&
+		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+
+	values[0] = BoolGetDatum(anchor_valid);
+	values[1] = Int64GetDatum(anchor_valid ?
+		(int64) U64FromFullTransactionId(snapshot->epoch_full_xmin) : 0);
+	values[2] = Int64GetDatum(anchor_valid ?
+		(int64) U64FromFullTransactionId(snapshot->epoch_full_xmax) : 0);
+	values[3] = BoolGetDatum(guard_active);
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+
+/*
+ * epoch_xid_bridge_last_source() -> text
+ *
+ * TEST-ONLY function.  Returns which source provided the 64-bit snapshot
+ * boundaries in the last EpochHeapTupleSatisfiesMVCC invocation.
+ *
+ * Returns:
+ *   'precomputed'  - boundaries read from snapshot->epoch_full_xmin/xmax
+ *                    (populated at acquisition time by GetSnapshotData)
+ *   'reconstructed' - boundaries derived ad hoc via EpochFullXidRelativeTo
+ *                    (fallback for snapshots without pre-computed fields)
+ *   'not_used'      - the bridge path was not reached (epoch path not entered,
+ *                    or classification resolved via hint bits before Phase 5)
+ *
+ * This is the key observability hook for Patch 15: it proves whether the
+ * consumer actually used the acquisition-time bridge state.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_last_source);
+
+Datum
+epoch_xid_bridge_last_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_bridge_last_source)
+	{
+		case 'p':
+			result = "precomputed";
+			break;
+		case 'r':
+			result = "reconstructed";
+			break;
+		default:
+			result = "not_used";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_force_bridge_reconstruct(bool) -> void
+ *
+ * TEST-ONLY function.  When set to true, forces the 64-bit snapshot boundary
+ * consumers to ignore the pre-computed epoch_full_xmin/epoch_full_xmax fields
+ * and derive the boundaries ad hoc via EpochFullXidRelativeTo.  This enables
+ * tests to exercise and compare the reconstructed fallback path against the
+ * precomputed path, proving both produce identical results.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_force_bridge_reconstruct);
+
+Datum
+epoch_xid_force_bridge_reconstruct(PG_FUNCTION_ARGS)
+{
+	epoch_bridge_force_reconstruct = PG_GETARG_BOOL(0);
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * epoch_xid_horizon_last_source() -> text
+ *
+ * TEST-ONLY function.  Returns which source provided the epoch_horizon value
+ * (the 64-bit form of snapshot->xmin) for the Phase 4 horizon fast-reject
+ * in the last EpochHeapTupleSatisfiesMVCC invocation.
+ *
+ * Returns:
+ *   'precomputed'   - horizon read from snapshot->epoch_full_xmin
+ *   'reconstructed' - horizon derived via EpochFullXidRelativeTo
+ *   'not_used'      - horizon path not reached (guard off, or epoch path
+ *                     not entered for this invocation)
+ *
+ * This directly proves whether the Patch 15 acquisition-time bridge state
+ * was consumed by the horizon fast-reject path.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_horizon_last_source);
+
+Datum
+epoch_xid_horizon_last_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_horizon_last_source)
+	{
+		case 'p':
+			result = "precomputed";
+			break;
+		case 'r':
+			result = "reconstructed";
+			break;
+		default:
+			result = "not_used";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
 }

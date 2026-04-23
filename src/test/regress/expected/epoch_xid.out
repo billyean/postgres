@@ -1400,3 +1400,163 @@ BEGIN
 
 COMMIT
 DROP TABLE
+BEGIN
+ anchor_valid | xmin_valid | xmax_valid | guard_active 
+--------------+------------+------------+--------------
+ t            | t          | t          | t
+(1 row)
+
+COMMIT
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ epoch_xid_relation_mode 
+-------------------------
+ materialized
+(1 row)
+
+ epoch_xid_stage1_bridge_enabled 
+---------------------------------
+ t
+(1 row)
+
+ id |   val    
+----+----------
+  1 | p15_test
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+COMMIT
+ epoch_xid_stage1_force_disable 
+--------------------------------
+ 
+(1 row)
+
+BEGIN
+ anchor_valid | guard_active 
+--------------+--------------
+ t            | f
+(1 row)
+
+ id |   val    
+----+----------
+  1 | p15_test
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ not_used
+(1 row)
+
+COMMIT
+ epoch_xid_stage1_force_disable 
+--------------------------------
+ 
+(1 row)
+
+BEGIN
+ guard_active 
+--------------
+ t
+(1 row)
+
+ id |   val    
+----+----------
+  1 | p15_test
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+COMMIT
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ id |     val     
+----+-------------
+  1 | source_test
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_horizon_last_source 
+-------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+COMMIT
+ epoch_xid_force_bridge_reconstruct 
+------------------------------------
+ 
+(1 row)
+
+BEGIN
+ id |     val     
+----+-------------
+  1 | source_test
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ reconstructed
+(1 row)
+
+ epoch_xid_horizon_last_source 
+-------------------------------
+ reconstructed
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+COMMIT
+ epoch_xid_force_bridge_reconstruct 
+------------------------------------
+ 
+(1 row)
+
+BEGIN
+ id |     val     
+----+-------------
+  1 | source_test
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_horizon_last_source 
+-------------------------------
+ precomputed
+(1 row)
+
+COMMIT
+DROP TABLE

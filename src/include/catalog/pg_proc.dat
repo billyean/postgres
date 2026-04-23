@@ -12893,4 +12893,31 @@
   proname => 'epoch_xid_classify_last_horizon', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_classify_last_horizon' },
+
+{ oid => '9922',
+  descr => 'TEST-ONLY: expose acquisition-time 64-bit snapshot bridge state',
+  proname => 'epoch_xid_snapshot_bridge_info', provolatile => 'v',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{bool,int8,int8,bool}',
+  proargmodes => '{o,o,o,o}',
+  proargnames => '{anchor_valid,full_xmin,full_xmax,guard_active}',
+  prosrc => 'epoch_xid_snapshot_bridge_info' },
+
+{ oid => '9923',
+  descr => 'TEST-ONLY: report source of 64-bit snapshot boundaries (precomputed vs reconstructed)',
+  proname => 'epoch_xid_bridge_last_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_last_source' },
+
+{ oid => '9924',
+  descr => 'TEST-ONLY: force snapshot boundary consumers to use reconstruction fallback',
+  proname => 'epoch_xid_force_bridge_reconstruct', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'bool',
+  prosrc => 'epoch_xid_force_bridge_reconstruct' },
+
+{ oid => '9925',
+  descr => 'TEST-ONLY: report source of horizon value (precomputed vs reconstructed)',
+  proname => 'epoch_xid_horizon_last_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_horizon_last_source' },
 ]

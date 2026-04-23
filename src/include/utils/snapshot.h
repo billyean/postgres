@@ -227,6 +227,30 @@ typedef struct SnapshotData
 	 * path must check for this and fall back to native comparison.
 	 */
 	FullTransactionId epoch_anchor;
+
+	/*
+	 * XID64 EPOCH FORK (Patch 15): pre-computed 64-bit snapshot boundaries.
+	 *
+	 * Derived from epoch_anchor at snapshot acquisition time inside
+	 * GetSnapshotData, eliminating per-tuple reconstruction in the
+	 * epoch-aware visibility path.
+	 *
+	 * epoch_full_xmin = FullXidRelativeTo(latestCompletedXid, xmin):
+	 *   64-bit lower boundary.  Any XID preceding this was completed
+	 *   before the snapshot.  Serves as the Phase 4 horizon (Patch 13)
+	 *   and the Phase 5 lower bound (Patch 11) without ad hoc
+	 *   per-consumer reconstruction.
+	 *
+	 * epoch_full_xmax = FullXidRelativeTo(latestCompletedXid, xmax):
+	 *   64-bit upper boundary.  Any XID at or following this started
+	 *   after the snapshot.
+	 *
+	 * Zero/invalid when epoch_anchor is invalid (imported/special
+	 * snapshots).  The epoch-aware path checks the Stage 1 guard before
+	 * consuming these fields.
+	 */
+	FullTransactionId epoch_full_xmin;
+	FullTransactionId epoch_full_xmax;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */
