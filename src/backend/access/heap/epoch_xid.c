@@ -24,6 +24,7 @@
 #include "access/epoch_xid.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/storage_xlog.h"
@@ -46,9 +47,18 @@
  *   'n' = not yet called (initial)
  *   'm' = epoch branch, slot-backed materialized epoch data used
  *   'd' = epoch branch, no-slot fallback (PageIsNew / absent / beyond HWM)
+ *   's' = epoch branch, slot-backed data + 64-bit snapshot bridge (Stage 1)
  *   'u' = epoch branch, returned CANNOT_DETERMINE (unresolvable)
  */
 static char epoch_mvcc_last_path = 'n';
+
+/*
+ * Test-only override: when true, forces the Stage 1 bridge guard to false,
+ * simulating a post-epoch-0 state without requiring an actual epoch wrap.
+ * Used by epoch_xid_stage1_force_disable() to prove the negative side of
+ * the Stage 1 boundary: that when the guard is off, the bridge is not used.
+ */
+static bool epoch_stage1_force_disabled = false;
 
 
 /* ----------------------------------------------------------------
@@ -1197,6 +1207,123 @@ EpochDeriveVisibility(HeapTupleHeader htup,
 
 
 /* ----------------------------------------------------------------
+ *	Stage 1 snapshot bridge (Patch 11)
+ *
+ *	FullXidInMVCCSnapshot -- 64-bit-aware snapshot membership check.
+ *
+ *	Given a full 64-bit XID (from epoch-fork Phase 3 reconstruction) and
+ *	an MVCC snapshot with an epoch_anchor, determines whether the XID is
+ *	"in the snapshot" (i.e., was in-progress when the snapshot was taken).
+ *
+ *	Uses the snapshot's epoch_anchor to reconstruct 64-bit boundaries from
+ *	the existing 32-bit xmin/xmax/xip arrays via signed 32-bit arithmetic.
+ *	This is safe because PostgreSQL's VACUUM wraparound protection guarantees
+ *	the active XID range stays within 2^31.
+ *
+ *	Operational boundary: Stage 1 is validated for pre-wrap / epoch-0
+ *	operation.  Cross-epoch safety requires Stages 2-3 (ProcArray/horizon
+ *	64-bit awareness).  Fallback to native XidInMVCCSnapshot is safe only
+ *	within epoch 0.
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Reconstruct a FullTransactionId from a 32-bit XID relative to a reference
+ * FullTransactionId.  Same logic as procarray.c's FullXidRelativeTo (which
+ * is static inline there).
+ */
+static inline FullTransactionId
+EpochFullXidRelativeTo(FullTransactionId ref, TransactionId xid)
+{
+	TransactionId ref_xid = XidFromFullTransactionId(ref);
+
+	return FullTransactionIdFromU64(
+		U64FromFullTransactionId(ref) + (int32) (xid - ref_xid));
+}
+
+/*
+ * FullXidInMVCCSnapshot -- 64-bit XID snapshot membership check.
+ *
+ * Returns true if fxid is "in the snapshot" (in-progress at snapshot time).
+ * Returns false if fxid committed before the snapshot.
+ *
+ * Mirrors XidInMVCCSnapshot logic but with 64-bit comparisons.
+ */
+static bool
+FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
+{
+	FullTransactionId anchor = snapshot->epoch_anchor;
+	FullTransactionId full_xmin;
+	FullTransactionId full_xmax;
+	uint32		i;
+
+	Assert(FullTransactionIdIsValid(anchor));
+
+	/* Reconstruct 64-bit boundaries from anchor + 32-bit fields */
+	full_xmin = EpochFullXidRelativeTo(anchor, snapshot->xmin);
+	full_xmax = EpochFullXidRelativeTo(anchor, snapshot->xmax);
+
+	/* Quick range checks using 64-bit comparison */
+	if (FullTransactionIdPrecedes(fxid, full_xmin))
+		return false;		/* committed before snapshot */
+	if (FullTransactionIdFollowsOrEquals(fxid, full_xmax))
+		return true;		/* started after snapshot */
+
+	/*
+	 * Check subxip array (if not overflowed).
+	 * Promote each 32-bit entry to 64-bit via the anchor.
+	 */
+	if (!snapshot->suboverflowed)
+	{
+		int32		j;
+
+		for (j = 0; j < snapshot->subxcnt; j++)
+		{
+			FullTransactionId full_subxid =
+				EpochFullXidRelativeTo(anchor, snapshot->subxip[j]);
+
+			if (FullTransactionIdEquals(full_subxid, fxid))
+				return true;
+		}
+		/* fxid is not a known-running subtransaction in this range */
+	}
+
+	/* Check main xip array */
+	for (i = 0; i < snapshot->xcnt; i++)
+	{
+		FullTransactionId full_xip =
+			EpochFullXidRelativeTo(anchor, snapshot->xip[i]);
+
+		if (FullTransactionIdEquals(full_xip, fxid))
+			return true;
+	}
+
+	/*
+	 * If subxip overflowed, check whether fxid's toplevel parent is in xip.
+	 * SubTransGetTopmostTransaction uses 32-bit XID, which is correct for
+	 * Stage 1 (epoch-0 operation).
+	 */
+	if (snapshot->suboverflowed)
+	{
+		TransactionId xid32 = XidFromFullTransactionId(fxid);
+		TransactionId parentXid = SubTransGetTopmostTransaction(xid32);
+		FullTransactionId full_parent = EpochFullXidRelativeTo(anchor, parentXid);
+
+		for (i = 0; i < snapshot->xcnt; i++)
+		{
+			FullTransactionId full_xip =
+				EpochFullXidRelativeTo(anchor, snapshot->xip[i]);
+
+			if (FullTransactionIdEquals(full_xip, full_parent))
+				return true;
+		}
+	}
+
+	return false;	/* not in snapshot: committed before snapshot boundary */
+}
+
+
+/* ----------------------------------------------------------------
  *	Real heap visibility consumer (Patch 10)
  *
  *	EpochHeapTupleSatisfiesMVCC -- MVCC visibility using epoch fork.
@@ -1240,6 +1367,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	TransactionId xmin_xid,
 				xmax_xid,
 				effective_xmax;
+	bool		use_64bit_snapshot;
 
 	Assert(snapshot != NULL);
 	Assert(snapshot->snapshot_type == SNAPSHOT_MVCC);
@@ -1271,10 +1399,6 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	 * here depend on the epoch slot's xmin_epoch / xmax_epoch / epoch_flags.
 	 */
 	interp = EpochInterpretTuple(tuple, slot, is_materialized);
-
-	/* Test-only: record which internal path Phase 3 took */
-	epoch_mvcc_last_path = (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
-		? 'm' : 'd';
 
 	/* Release epoch buffer now that Phase 3 has consumed the slot */
 	if (BufferIsValid(epochbuf))
@@ -1314,6 +1438,32 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		xmax_xid = XidFromFullTransactionId(interp.full_xmax);
 
 	/*
+	 * Stage 1 snapshot bridge (Patch 11): determine whether the 64-bit
+	 * snapshot comparison path is available.  It requires:
+	 *
+	 * (1) A valid epoch_anchor in the snapshot (set by GetSnapshotData).
+	 *     Imported/special snapshots may have epoch_anchor = 0; for those
+	 *     we fall back to 32-bit comparison.
+	 *
+	 * (2) The anchor must be in epoch 0 (pre-wrap).  Stage 1 is validated
+	 *     ONLY for pre-wrap / epoch-0 operation.  Once the system crosses
+	 *     into epoch 1+, the fallback-to-native path is no longer safe for
+	 *     CANNOT_DETERMINE cases and other non-epoch-wired visibility paths.
+	 *     Cross-epoch safety requires Stages 2-3 (ProcArray/horizon work).
+	 *
+	 * This is a real code boundary, not just a comment.
+	 */
+	use_64bit_snapshot = !epoch_stage1_force_disabled &&
+		FullTransactionIdIsValid(snapshot->epoch_anchor) &&
+		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+
+	/* Test-only: record which internal path was taken */
+	if (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
+		epoch_mvcc_last_path = use_64bit_snapshot ? 's' : 'm';
+	else
+		epoch_mvcc_last_path = 'd';
+
+	/*
 	 * MVCC visibility logic with complete CID checks.
 	 * Uses epoch-reconstructed xmin_xid and xmax_xid from above.
 	 */
@@ -1337,10 +1487,12 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		return EPOCH_MVCC_INVISIBLE;	/* other xact's uncommitted insert */
 	}
 
-	/* xmin committed: snapshot check uses epoch-reconstructed xmin */
+	/* xmin committed: snapshot check uses 64-bit bridge when available */
 	Assert(xmin_status == EPOCH_XID_COMMITTED);
 
-	if (XidInMVCCSnapshot(xmin_xid, snapshot))
+	if (use_64bit_snapshot
+		? FullXidInMVCCSnapshot(interp.full_xmin, snapshot)
+		: XidInMVCCSnapshot(xmin_xid, snapshot))
 		return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
 
 check_xmax:
@@ -1361,11 +1513,33 @@ check_xmax:
 		return EPOCH_MVCC_VISIBLE;	/* other xact's uncommitted delete */
 	}
 
-	/* xmax committed: snapshot check uses epoch-reconstructed xmax */
+	/* xmax committed: snapshot check uses 64-bit bridge when available */
 	Assert(xmax_status == EPOCH_XID_COMMITTED);
 
-	if (XidInMVCCSnapshot(xmax_xid, snapshot))
-		return EPOCH_MVCC_VISIBLE;	/* deleter committed after snapshot */
+	{
+		bool		xmax_in_snapshot;
+
+		if (use_64bit_snapshot)
+		{
+			FullTransactionId full_xmax_for_snap;
+
+			if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
+				full_xmax_for_snap = EpochFullXidRelativeTo(
+					snapshot->epoch_anchor, effective_xmax);
+			else
+				full_xmax_for_snap = interp.full_xmax;
+
+			xmax_in_snapshot = FullXidInMVCCSnapshot(full_xmax_for_snap,
+													 snapshot);
+		}
+		else
+		{
+			xmax_in_snapshot = XidInMVCCSnapshot(xmax_xid, snapshot);
+		}
+
+		if (xmax_in_snapshot)
+			return EPOCH_MVCC_VISIBLE;	/* deleter committed after snapshot */
+	}
 
 	return EPOCH_MVCC_INVISIBLE;	/* deleter committed, visible in snapshot */
 }
@@ -2533,7 +2707,8 @@ epoch_xid_resolve_multixact(PG_FUNCTION_ARGS)
  * EpochHeapTupleSatisfiesMVCC from heap_fetch's epoch branch.
  *
  * Returns:
- *   'materialized'    - epoch branch used slot-backed materialized data
+ *   'materialized'     - epoch branch used slot-backed data, 32-bit snapshot
+ *   'snapshot_bridge'  - epoch branch used slot-backed data + 64-bit snapshot bridge
  *   'default_fallback' - epoch branch executed but slot was absent (PageIsNew etc.)
  *   'cannot_determine' - epoch branch returned CANNOT_DETERMINE
  *   'not_called'       - EpochHeapTupleSatisfiesMVCC has not been called yet
@@ -2550,6 +2725,9 @@ epoch_xid_mvcc_last_path(PG_FUNCTION_ARGS)
 		case 'm':
 			result = "materialized";
 			break;
+		case 's':
+			result = "snapshot_bridge";
+			break;
 		case 'd':
 			result = "default_fallback";
 			break;
@@ -2562,4 +2740,53 @@ epoch_xid_mvcc_last_path(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_stage1_bridge_enabled() -> bool
+ *
+ * TEST-ONLY function.  Returns true if the Stage 1 snapshot bridge guard
+ * would pass for the current active snapshot: epoch_anchor is valid AND
+ * the anchor's epoch is 0 (pre-wrap).
+ *
+ * Returns false if no active snapshot, epoch_anchor is invalid, or
+ * epoch_anchor has epoch > 0 (system crossed into epoch 1+).
+ *
+ * This makes the Stage 1 operational boundary observable in tests.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_stage1_bridge_enabled);
+
+Datum
+epoch_xid_stage1_bridge_enabled(PG_FUNCTION_ARGS)
+{
+	Snapshot	snapshot = GetActiveSnapshot();
+	bool		enabled;
+
+	if (snapshot == NULL)
+		PG_RETURN_BOOL(false);
+
+	enabled = !epoch_stage1_force_disabled &&
+		FullTransactionIdIsValid(snapshot->epoch_anchor) &&
+		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+
+	PG_RETURN_BOOL(enabled);
+}
+
+
+/*
+ * epoch_xid_stage1_force_disable(bool) -> void
+ *
+ * TEST-ONLY function.  Sets or clears the test-only override that forces
+ * the Stage 1 bridge guard to false, simulating a post-epoch-0 state.
+ * When set to true, the bridge is disabled even though the real epoch
+ * anchor is valid and in epoch 0.  Pass false to re-enable.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_stage1_force_disable);
+
+Datum
+epoch_xid_stage1_force_disable(PG_FUNCTION_ARGS)
+{
+	epoch_stage1_force_disabled = PG_GETARG_BOOL(0);
+	PG_RETURN_VOID();
 }

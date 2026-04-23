@@ -13,6 +13,7 @@
 #ifndef SNAPSHOT_H
 #define SNAPSHOT_H
 
+#include "access/transam.h"
 #include "lib/pairingheap.h"
 
 
@@ -207,6 +208,25 @@ typedef struct SnapshotData
 	 * transactions completed since the last GetSnapshotData().
 	 */
 	uint64		snapXactCompletionCount;
+
+	/*
+	 * XID64 EPOCH FORK (Patch 11 Stage 1): epoch anchor for 64-bit XID
+	 * reconstruction from this snapshot's 32-bit xip/subxip arrays.
+	 *
+	 * Captured from TransamVariables->latestCompletedXid in the same
+	 * ProcArrayLock critical section where xmin/xmax/xip are filled.
+	 * Enables FullXidInMVCCSnapshot() to promote 32-bit XIDs to 64-bit
+	 * using signed arithmetic relative to this anchor.
+	 *
+	 * Stage 1 operational boundary: this mechanism is validated for
+	 * pre-wrap / epoch-0 operation only.  Cross-epoch safety requires
+	 * Stages 2-3 (ProcArray/horizon 64-bit awareness).
+	 *
+	 * Zero/invalid if the snapshot was not filled by GetSnapshotData
+	 * (e.g., imported snapshots, special snapshots).  The epoch-aware
+	 * path must check for this and fall back to native comparison.
+	 */
+	FullTransactionId epoch_anchor;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

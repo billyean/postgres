@@ -12869,4 +12869,16 @@
   proname => 'epoch_xid_mvcc_last_path', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_mvcc_last_path' },
+
+{ oid => '9918',
+  descr => 'TEST-ONLY: report whether Stage 1 snapshot bridge guard passes for active snapshot',
+  proname => 'epoch_xid_stage1_bridge_enabled', provolatile => 'v',
+  prorettype => 'bool', proargtypes => '',
+  prosrc => 'epoch_xid_stage1_bridge_enabled' },
+
+{ oid => '9919',
+  descr => 'TEST-ONLY: force Stage 1 bridge guard off (true=disable, false=restore)',
+  proname => 'epoch_xid_stage1_force_disable', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'bool',
+  prosrc => 'epoch_xid_stage1_force_disable' },
 ]

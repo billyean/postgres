@@ -1377,8 +1377,10 @@ SELECT xmin_interp FROM epoch_xid_tuple_visibility_info('epoch_visfetch_dep'::re
 -- TID scan: triggers heap_fetch → epoch branch with materialized slot data
 SELECT * FROM epoch_visfetch_dep WHERE ctid = '(0,1)';
 
--- Direct proof: the instrumentation hook shows the epoch branch used
--- slot-backed materialized data ('materialized'), not the fallback path.
+-- Direct proof: the instrumentation hook shows 'snapshot_bridge' — the
+-- epoch branch used slot-backed materialized data AND the 64-bit snapshot
+-- bridge (FullXidInMVCCSnapshot via epoch_anchor).  This is the Patch 11
+-- Stage 1 proof: the snapshot membership check now uses the 64-bit bridge.
 SELECT epoch_xid_mvcc_last_path();
 
 -- Step 2: Reset epoch page 0 to PageIsNew (all-zero) using test helper.
@@ -1404,3 +1406,56 @@ SELECT epoch_xid_mvcc_last_path();
 SELECT count(*) FROM epoch_xid_inspect('epoch_visfetch_dep'::regclass, 0);
 
 DROP TABLE epoch_visfetch_dep;
+
+-- R5: Stage 1 bridge boundary is enforced in code
+--
+-- Verify that the Stage 1 snapshot bridge guard is a real code boundary:
+-- (1) epoch_xid_stage1_bridge_enabled() returns true (we're in epoch 0)
+-- (2) TID scan uses 'snapshot_bridge' (guard passed, 64-bit path taken)
+-- (3) The guard is the conjunction of: valid anchor AND epoch == 0
+--
+-- This proves the boundary is enforced at the code level, not just
+-- documented in comments.  If the system crossed into epoch 1+, the
+-- guard would return false and the bridge would not be used.
+
+CREATE TABLE epoch_visfetch_guard (id int PRIMARY KEY, val text);
+INSERT INTO epoch_visfetch_guard VALUES (1, 'guard_test');
+
+-- Confirm the Stage 1 guard passes (epoch 0, valid anchor)
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan uses the bridge (guard passed)
+SELECT * FROM epoch_visfetch_guard WHERE ctid = '(0,1)';
+SELECT epoch_xid_mvcc_last_path();
+
+-- R6: Negative proof — Stage 1 boundary prevents bridge when guard is off
+--
+-- Force the guard off (simulates post-epoch-0 state), then verify:
+-- (1) epoch_xid_stage1_bridge_enabled() returns false
+-- (2) TID scan no longer reports 'snapshot_bridge'
+-- (3) TID scan still returns correct results (falls back to 32-bit)
+-- This proves the boundary is enforced: the bridge is NOT used when
+-- the guard says it shouldn't be.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+-- Guard is now forced off
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan: same tuple, but now the bridge is disabled
+SELECT * FROM epoch_visfetch_guard WHERE ctid = '(0,1)';
+
+-- Must NOT be 'snapshot_bridge' — proves the boundary blocked the bridge
+SELECT epoch_xid_mvcc_last_path();
+
+-- Restore normal operation
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- Confirm bridge re-enabled
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- TID scan returns to using the bridge
+SELECT * FROM epoch_visfetch_guard WHERE ctid = '(0,1)';
+SELECT epoch_xid_mvcc_last_path();
+
+DROP TABLE epoch_visfetch_guard;

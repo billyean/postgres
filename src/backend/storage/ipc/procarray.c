@@ -2444,6 +2444,9 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->suboverflowed = suboverflowed;
 	snapshot->snapXactCompletionCount = curXactCompletionCount;
 
+	/* XID64 EPOCH FORK: capture epoch anchor for 64-bit XID reconstruction */
+	snapshot->epoch_anchor = latest_completed;
+
 	snapshot->curcid = GetCurrentCommandId(false);
 
 	/*
