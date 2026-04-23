@@ -220,3 +220,101 @@ NOTICE:  relation "ctas_ine_tbl" already exists, skipping
 (0 rows)
 
 DROP TABLE ctas_ine_tbl;
+--
+-- Tests for CTAS with buffered-insert path.
+--
+-- These tests verify correctness of CTAS results under both the buffered
+-- path (no volatile functions) and the fallback single-row path (volatile
+-- functions present, or EXECUTE).  Path selection is not directly observable
+-- in SQL output; these tests validate that results are correct regardless.
+--
+-- Buffered path: small row count, verify contents.
+CREATE TABLE ctas_buffered_1 AS SELECT g AS a, g * 10 AS b FROM generate_series(1, 5) g;
+SELECT count(*) FROM ctas_buffered_1;
+ count 
+-------
+     5
+(1 row)
+
+SELECT * FROM ctas_buffered_1 ORDER BY a;
+ a | b  
+---+----
+ 1 | 10
+ 2 | 20
+ 3 | 30
+ 4 | 40
+ 5 | 50
+(5 rows)
+
+DROP TABLE ctas_buffered_1;
+-- Buffered path: enough rows to trigger auto-flush (>1000 slot threshold).
+CREATE TABLE ctas_buffered_2 AS SELECT g AS a FROM generate_series(1, 2500) g;
+SELECT count(*) FROM ctas_buffered_2;
+ count 
+-------
+  2500
+(1 row)
+
+SELECT min(a), max(a) FROM ctas_buffered_2;
+ min | max  
+-----+------
+   1 | 2500
+(1 row)
+
+DROP TABLE ctas_buffered_2;
+-- Buffered path: wide tuples to exercise byte-threshold flushing.
+CREATE TABLE ctas_buffered_wide AS
+  SELECT g AS id,
+         repeat('x', 200) AS col1,
+         repeat('y', 200) AS col2,
+         repeat('z', 200) AS col3
+  FROM generate_series(1, 100) g;
+SELECT count(*) FROM ctas_buffered_wide;
+ count 
+-------
+   100
+(1 row)
+
+SELECT id, length(col1), length(col2), length(col3) FROM ctas_buffered_wide WHERE id IN (1, 50, 100) ORDER BY id;
+ id  | length | length | length 
+-----+--------+--------+--------
+   1 |    200 |    200 |    200
+  50 |    200 |    200 |    200
+ 100 |    200 |    200 |    200
+(3 rows)
+
+DROP TABLE ctas_buffered_wide;
+-- Fallback path: random() triggers the conservative volatile-function guard.
+-- Result must still be correct through the single-row insertion path.
+CREATE TABLE ctas_volatile AS SELECT g AS a, random() AS r FROM generate_series(1, 10) g;
+SELECT count(*) FROM ctas_volatile;
+ count 
+-------
+    10
+(1 row)
+
+SELECT a FROM ctas_volatile ORDER BY a;
+ a  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+DROP TABLE ctas_volatile;
+-- WITH NO DATA: no insertion path exercised; verify unchanged behavior.
+CREATE TABLE ctas_nodata AS SELECT 1 AS a WITH NO DATA;
+SELECT count(*) FROM ctas_nodata;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE ctas_nodata;
