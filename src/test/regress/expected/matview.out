@@ -699,3 +699,155 @@ NOTICE:  relation "matview_ine_tab" already exists, skipping
 (0 rows)
 
 DROP MATERIALIZED VIEW matview_ine_tab;
+--
+-- Tests for CMV/RMV with buffered-insert path.
+--
+-- These tests verify correctness under both the buffered path (no volatile
+-- functions) and the fallback single-row path (volatile functions present).
+-- Path selection is not directly observable in SQL output.
+--
+-- CMV: basic correctness
+CREATE MATERIALIZED VIEW mv_buffered_1 AS
+  SELECT g AS a, g * 10 AS b FROM generate_series(1, 5) g;
+SELECT count(*) FROM mv_buffered_1;
+ count 
+-------
+     5
+(1 row)
+
+SELECT * FROM mv_buffered_1 ORDER BY a;
+ a | b  
+---+----
+ 1 | 10
+ 2 | 20
+ 3 | 30
+ 4 | 40
+ 5 | 50
+(5 rows)
+
+-- RMV: refresh repopulates correctly
+REFRESH MATERIALIZED VIEW mv_buffered_1;
+SELECT count(*) FROM mv_buffered_1;
+ count 
+-------
+     5
+(1 row)
+
+SELECT * FROM mv_buffered_1 ORDER BY a;
+ a | b  
+---+----
+ 1 | 10
+ 2 | 20
+ 3 | 30
+ 4 | 40
+ 5 | 50
+(5 rows)
+
+DROP MATERIALIZED VIEW mv_buffered_1;
+-- CMV + RMV: bulk case to exercise auto-flush (>1000 rows)
+CREATE MATERIALIZED VIEW mv_buffered_bulk AS
+  SELECT g AS a FROM generate_series(1, 2500) g;
+SELECT count(*) FROM mv_buffered_bulk;
+ count 
+-------
+  2500
+(1 row)
+
+SELECT min(a), max(a) FROM mv_buffered_bulk;
+ min | max  
+-----+------
+   1 | 2500
+(1 row)
+
+REFRESH MATERIALIZED VIEW mv_buffered_bulk;
+SELECT count(*) FROM mv_buffered_bulk;
+ count 
+-------
+  2500
+(1 row)
+
+SELECT min(a), max(a) FROM mv_buffered_bulk;
+ min | max  
+-----+------
+   1 | 2500
+(1 row)
+
+DROP MATERIALIZED VIEW mv_buffered_bulk;
+-- Wide tuples: verify no regression
+CREATE MATERIALIZED VIEW mv_buffered_wide AS
+  SELECT g AS id,
+         repeat('x', 200) AS col1,
+         repeat('y', 200) AS col2,
+         repeat('z', 200) AS col3
+  FROM generate_series(1, 100) g;
+SELECT count(*) FROM mv_buffered_wide;
+ count 
+-------
+   100
+(1 row)
+
+SELECT id, length(col1), length(col2), length(col3)
+  FROM mv_buffered_wide WHERE id IN (1, 50, 100) ORDER BY id;
+ id  | length | length | length 
+-----+--------+--------+--------
+   1 |    200 |    200 |    200
+  50 |    200 |    200 |    200
+ 100 |    200 |    200 |    200
+(3 rows)
+
+DROP MATERIALIZED VIEW mv_buffered_wide;
+-- Volatile-function fallback: random() triggers conservative guard.
+-- Result must still be correct through the single-row path.
+CREATE MATERIALIZED VIEW mv_volatile AS
+  SELECT g AS a, random() AS r FROM generate_series(1, 10) g;
+SELECT count(*) FROM mv_volatile;
+ count 
+-------
+    10
+(1 row)
+
+SELECT a FROM mv_volatile ORDER BY a;
+ a  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+REFRESH MATERIALIZED VIEW mv_volatile;
+SELECT count(*) FROM mv_volatile;
+ count 
+-------
+    10
+(1 row)
+
+SELECT a FROM mv_volatile ORDER BY a;
+ a  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+DROP MATERIALIZED VIEW mv_volatile;
+-- WITH NO DATA: unchanged behavior
+CREATE MATERIALIZED VIEW mv_nodata AS SELECT 1 AS a WITH NO DATA;
+SELECT count(*) FROM mv_nodata;  -- error: not populated
+ERROR:  materialized view "mv_nodata" has not been populated
+HINT:  Use the REFRESH MATERIALIZED VIEW command.
+REFRESH MATERIALIZED VIEW mv_nodata WITH NO DATA;
+DROP MATERIALIZED VIEW mv_nodata;
