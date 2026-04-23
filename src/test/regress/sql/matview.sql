@@ -318,3 +318,62 @@ EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF)
   CREATE MATERIALIZED VIEW IF NOT EXISTS matview_ine_tab AS
     SELECT 1 / 0 WITH NO DATA; -- ok
 DROP MATERIALIZED VIEW matview_ine_tab;
+
+--
+-- Tests for CMV/RMV with buffered-insert path.
+--
+-- These tests verify correctness under both the buffered path (no volatile
+-- functions) and the fallback single-row path (volatile functions present).
+-- Path selection is not directly observable in SQL output.
+--
+
+-- CMV: basic correctness
+CREATE MATERIALIZED VIEW mv_buffered_1 AS
+  SELECT g AS a, g * 10 AS b FROM generate_series(1, 5) g;
+SELECT count(*) FROM mv_buffered_1;
+SELECT * FROM mv_buffered_1 ORDER BY a;
+
+-- RMV: refresh repopulates correctly
+REFRESH MATERIALIZED VIEW mv_buffered_1;
+SELECT count(*) FROM mv_buffered_1;
+SELECT * FROM mv_buffered_1 ORDER BY a;
+DROP MATERIALIZED VIEW mv_buffered_1;
+
+-- CMV + RMV: bulk case to exercise auto-flush (>1000 rows)
+CREATE MATERIALIZED VIEW mv_buffered_bulk AS
+  SELECT g AS a FROM generate_series(1, 2500) g;
+SELECT count(*) FROM mv_buffered_bulk;
+SELECT min(a), max(a) FROM mv_buffered_bulk;
+REFRESH MATERIALIZED VIEW mv_buffered_bulk;
+SELECT count(*) FROM mv_buffered_bulk;
+SELECT min(a), max(a) FROM mv_buffered_bulk;
+DROP MATERIALIZED VIEW mv_buffered_bulk;
+
+-- Wide tuples: verify no regression
+CREATE MATERIALIZED VIEW mv_buffered_wide AS
+  SELECT g AS id,
+         repeat('x', 200) AS col1,
+         repeat('y', 200) AS col2,
+         repeat('z', 200) AS col3
+  FROM generate_series(1, 100) g;
+SELECT count(*) FROM mv_buffered_wide;
+SELECT id, length(col1), length(col2), length(col3)
+  FROM mv_buffered_wide WHERE id IN (1, 50, 100) ORDER BY id;
+DROP MATERIALIZED VIEW mv_buffered_wide;
+
+-- Volatile-function fallback: random() triggers conservative guard.
+-- Result must still be correct through the single-row path.
+CREATE MATERIALIZED VIEW mv_volatile AS
+  SELECT g AS a, random() AS r FROM generate_series(1, 10) g;
+SELECT count(*) FROM mv_volatile;
+SELECT a FROM mv_volatile ORDER BY a;
+REFRESH MATERIALIZED VIEW mv_volatile;
+SELECT count(*) FROM mv_volatile;
+SELECT a FROM mv_volatile ORDER BY a;
+DROP MATERIALIZED VIEW mv_volatile;
+
+-- WITH NO DATA: unchanged behavior
+CREATE MATERIALIZED VIEW mv_nodata AS SELECT 1 AS a WITH NO DATA;
+SELECT count(*) FROM mv_nodata;  -- error: not populated
+REFRESH MATERIALIZED VIEW mv_nodata WITH NO DATA;
+DROP MATERIALIZED VIEW mv_nodata;

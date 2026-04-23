@@ -31,6 +31,7 @@
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
@@ -50,7 +51,9 @@ typedef struct
 	Relation	transientrel;	/* relation to write to */
 	CommandId	output_cid;		/* cmin to insert in output tuples */
 	uint32		ti_options;		/* table_tuple_insert performance options */
-	BulkInsertState bistate;	/* bulk insert state */
+	BulkInsertState bistate;	/* bulk insert state (fallback path only) */
+	TableBufferedInsertState buffered_state;	/* buffered-insert state, or NULL */
+	bool		use_buffered_insert;	/* true if buffered path is eligible */
 } DR_transientrel;
 
 static int	matview_maintenance_depth = 0;
@@ -428,6 +431,24 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
 
 	/*
+	 * Conservative implementation choice: disable the buffered-insert path
+	 * if the planned target list contains volatile functions.
+	 *
+	 * The buffered-insert API contract does not require this check — the
+	 * matview's defining query was parsed at creation time and cannot
+	 * reference the transient target table.  This guard is retained for the
+	 * initial patch series as a caller-local conservatism and can be relaxed
+	 * after validation without any API change.
+	 */
+	{
+		DR_transientrel *myState = (DR_transientrel *) dest;
+
+		myState->use_buffered_insert =
+			!contain_volatile_functions_after_planning(
+				(Expr *) plan->planTree->targetlist);
+	}
+
+	/*
 	 * Use a snapshot with an updated command ID to ensure this query sees
 	 * results of any previously executed queries.  (This could only matter if
 	 * the planner executed an allegedly-stable function that changed the
@@ -492,7 +513,41 @@ transientrel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	myState->transientrel = transientrel;
 	myState->output_cid = GetCurrentCommandId(true);
 	myState->ti_options = TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN;
-	myState->bistate = GetBulkInsertState();
+
+	if (myState->use_buffered_insert &&
+		transientrel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		/*
+		 * Try the buffered-insert path.  Pass NULL flush callback — the
+		 * transient table has no indexes, triggers, or per-tuple post-insert
+		 * work during the datafill phase.
+		 */
+		myState->ti_options |= TABLE_INSERT_BAS_BULKWRITE;
+		myState->buffered_state =
+			table_buffered_insert_begin(transientrel,
+										myState->output_cid,
+										myState->ti_options,
+										NULL, NULL);
+
+		if (myState->buffered_state != NULL)
+		{
+			myState->bistate = NULL;
+		}
+		else
+		{
+			/* AM does not support buffered inserts; fall back */
+			myState->bistate = GetBulkInsertState();
+		}
+	}
+	else
+	{
+		/*
+		 * Buffered insertion not selected for this datafill.  Reached when the
+		 * volatile-function guard fires or for partitioned targets.
+		 */
+		myState->buffered_state = NULL;
+		myState->bistate = GetBulkInsertState();
+	}
 
 	/*
 	 * Valid smgr_targblock implies something already wrote to the relation.
@@ -509,20 +564,19 @@ transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
 {
 	DR_transientrel *myState = (DR_transientrel *) self;
 
-	/*
-	 * Note that the input slot might not be of the type of the target
-	 * relation. That's supported by table_tuple_insert(), but slightly less
-	 * efficient than inserting with the right slot - but the alternative
-	 * would be to copy into a slot of the right type, which would not be
-	 * cheap either. This also doesn't allow accessing per-AM data (say a
-	 * tuple's xmin), but since we don't do that here...
-	 */
-
-	table_tuple_insert(myState->transientrel,
-					   slot,
-					   myState->output_cid,
-					   myState->ti_options,
-					   myState->bistate);
+	/* Both paths accept the caller-provided slot directly. */
+	if (myState->buffered_state != NULL)
+	{
+		table_buffered_insert_put(myState->buffered_state, slot);
+	}
+	else
+	{
+		table_tuple_insert(myState->transientrel,
+						   slot,
+						   myState->output_cid,
+						   myState->ti_options,
+						   myState->bistate);
+	}
 
 	/* We know this is a newly created relation, so there are no indexes */
 
@@ -537,9 +591,17 @@ transientrel_shutdown(DestReceiver *self)
 {
 	DR_transientrel *myState = (DR_transientrel *) self;
 
-	FreeBulkInsertState(myState->bistate);
-
-	table_finish_bulk_insert(myState->transientrel, myState->ti_options);
+	if (myState->buffered_state != NULL)
+	{
+		/* end() flushes remaining tuples and subsumes finish_bulk_insert */
+		table_buffered_insert_end(myState->buffered_state);
+		myState->buffered_state = NULL;
+	}
+	else
+	{
+		FreeBulkInsertState(myState->bistate);
+		table_finish_bulk_insert(myState->transientrel, myState->ti_options);
+	}
 
 	/* close transientrel, but keep lock until commit */
 	table_close(myState->transientrel, NoLock);
