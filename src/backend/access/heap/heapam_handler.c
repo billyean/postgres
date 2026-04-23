@@ -2697,7 +2697,12 @@ static const TableAmRoutine heapam_methods = {
 
 	.scan_bitmap_next_tuple = heapam_scan_bitmap_next_tuple,
 	.scan_sample_next_block = heapam_scan_sample_next_block,
-	.scan_sample_next_tuple = heapam_scan_sample_next_tuple
+	.scan_sample_next_tuple = heapam_scan_sample_next_tuple,
+
+	.buffered_insert_begin = heap_buffered_insert_begin,
+	.buffered_insert_put = heap_buffered_insert_put,
+	.buffered_insert_flush = heap_buffered_insert_flush,
+	.buffered_insert_end = heap_buffered_insert_end,
 };
 
 

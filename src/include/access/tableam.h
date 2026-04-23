@@ -284,6 +284,7 @@ typedef struct TM_IndexDeleteOp
 #define TABLE_INSERT_SKIP_FSM		0x0002
 #define TABLE_INSERT_FROZEN			0x0004
 #define TABLE_INSERT_NO_LOGICAL		0x0008
+#define TABLE_INSERT_BAS_BULKWRITE	0x0020
 
 /* "options" flag bits for table_tuple_delete */
 #define TABLE_DELETE_CHANGING_PARTITION			(1 << 0)
@@ -306,6 +307,40 @@ typedef void (*IndexBuildCallback) (Relation index,
 									bool *isnull,
 									bool tupleIsAlive,
 									void *state);
+
+/*
+ * State for a buffered-insert session.  AMs embed this as the first field of
+ * their private state struct.  The base struct is minimal: only the target
+ * relation is exposed, which is needed for AM dispatch via the inline wrapper
+ * functions.
+ *
+ * AMs that do not support buffered inserts leave the buffered_insert_begin
+ * callback NULL; callers detect this via table_buffered_insert_begin()
+ * returning NULL.
+ */
+typedef struct TableBufferedInsertStateData
+{
+	Relation	rel;			/* target relation -- needed for AM dispatch */
+} TableBufferedInsertStateData;
+
+typedef TableBufferedInsertStateData *TableBufferedInsertState;
+
+/*
+ * Callback invoked once per flushed tuple, in insertion order, after the AM
+ * writes a batch of buffered tuples to storage.
+ *
+ * The slot is an AM-owned scratch object used solely as a handoff vehicle.
+ * It contains the stored tuple with TID (or AM-equivalent locator) set.
+ * It is valid only for the duration of this callback invocation; the AM may
+ * reuse the same scratch slot across successive invocations within a single
+ * flush.  If the caller needs data beyond the callback, it must copy within
+ * the callback body.
+ *
+ * The AM must not assume the callback is cheap, side-effect-free, or
+ * non-throwing.
+ */
+typedef void (*TableBufferedInsertFlushCb)(void *context,
+										   TupleTableSlot *slot);
 
 /*
  * API struct for a table AM.  Note this must be allocated in a
@@ -612,6 +647,64 @@ typedef struct TableAmRoutine
 	 * Optional callback.
 	 */
 	void		(*finish_bulk_insert) (Relation rel, uint32 options);
+
+
+	/* ------------------------------------------------------------------------
+	 * Buffered-insert lifecycle callbacks.
+	 *
+	 * Optional optimization for batch inserts.  All four callbacks must be
+	 * either NULL together (AM does not support buffered inserts) or non-NULL
+	 * together (validated at AM registration time).  No partially populated
+	 * groups are allowed.
+	 * ------------------------------------------------------------------------
+	 */
+
+	/*
+	 * Begin a buffered-insert session.  Returns an opaque state handle whose
+	 * first bytes are a TableBufferedInsertStateData with rel set.  The AM
+	 * stores cid, options, flush_cb, and flush_ctx in its private extension
+	 * of the state struct.
+	 *
+	 * flush_cb may be NULL, in which case the AM skips per-tuple notification
+	 * after flushing.
+	 *
+	 * Optional callback -- NULL means the AM does not support buffered inserts.
+	 */
+	TableBufferedInsertState (*buffered_insert_begin)(
+		Relation rel,
+		CommandId cid,
+		int options,
+		TableBufferedInsertFlushCb flush_cb,
+		void *flush_ctx);
+
+	/*
+	 * Submit one tuple for buffered insertion.  The AM reads the tuple data
+	 * from the slot and captures it internally before returning.  The caller
+	 * retains ownership of the slot and may reuse it immediately.
+	 *
+	 * The AM may auto-flush during this call if its internal buffer is full;
+	 * the caller must be prepared for the flush callback to fire during put().
+	 */
+	void		(*buffered_insert_put)(
+		TableBufferedInsertState state,
+		TupleTableSlot *slot);
+
+	/*
+	 * Force-flush all buffered tuples to storage.  Invokes the flush callback
+	 * (if non-NULL) once per flushed tuple, in insertion order, using an
+	 * AM-owned scratch slot.  After return, the internal buffer is empty.
+	 */
+	void		(*buffered_insert_flush)(
+		TableBufferedInsertState state);
+
+	/*
+	 * Flush remaining buffered tuples, perform finish-bulk-insert cleanup
+	 * (e.g. FSM update for heap), and release all resources owned by the
+	 * state.  The state pointer is invalid after this call.  Callers must
+	 * not separately call table_finish_bulk_insert() -- end() subsumes it.
+	 */
+	void		(*buffered_insert_end)(
+		TableBufferedInsertState state);
 
 
 	/* ------------------------------------------------------------------------
@@ -1663,6 +1756,72 @@ table_finish_bulk_insert(Relation rel, uint32 options)
 	/* optional callback */
 	if (rel->rd_tableam && rel->rd_tableam->finish_bulk_insert)
 		rel->rd_tableam->finish_bulk_insert(rel, options);
+}
+
+
+/* ----------------------------------------------------------------------------
+ * Buffered-insert lifecycle functions.
+ * ----------------------------------------------------------------------------
+ */
+
+/*
+ * Begin a buffered-insert session for the given relation.
+ *
+ * Returns NULL if the relation's AM does not support buffered inserts, in
+ * which case the caller should fall back to the single-row insert path.
+ *
+ * flush_cb may be NULL when no per-tuple post-insert work is needed (e.g.
+ * CTAS/CMV/RMV).  When non-NULL, it is invoked once per flushed tuple in
+ * insertion order, using an AM-owned scratch slot valid only for the duration
+ * of each callback invocation.
+ */
+static inline TableBufferedInsertState
+table_buffered_insert_begin(Relation rel, CommandId cid, int options,
+							TableBufferedInsertFlushCb flush_cb,
+							void *flush_ctx)
+{
+	if (rel->rd_tableam->buffered_insert_begin == NULL)
+		return NULL;
+	return rel->rd_tableam->buffered_insert_begin(rel, cid, options,
+												   flush_cb, flush_ctx);
+}
+
+/*
+ * Submit one tuple for buffered insertion.  The AM reads from the slot and
+ * captures the data internally; the caller retains slot ownership and may
+ * reuse it immediately after this call returns.
+ *
+ * The AM may auto-flush during put() if its buffer is full; the flush
+ * callback (if any) may fire during this call.
+ */
+static inline void
+table_buffered_insert_put(TableBufferedInsertState state,
+						  TupleTableSlot *slot)
+{
+	state->rel->rd_tableam->buffered_insert_put(state, slot);
+}
+
+/*
+ * Force-flush all buffered tuples to storage.  The flush callback (if
+ * non-NULL) fires once per flushed tuple in insertion order.  After return
+ * the buffer is empty.
+ */
+static inline void
+table_buffered_insert_flush(TableBufferedInsertState state)
+{
+	state->rel->rd_tableam->buffered_insert_flush(state);
+}
+
+/*
+ * Flush remaining buffered tuples, perform finish-bulk-insert cleanup
+ * (e.g. FSM update for heap), and release all resources.  The state pointer
+ * is invalid after this call.  Do not separately call
+ * table_finish_bulk_insert() -- end() subsumes it.
+ */
+static inline void
+table_buffered_insert_end(TableBufferedInsertState state)
+{
+	state->rel->rd_tableam->buffered_insert_end(state);
 }
 
 

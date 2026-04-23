@@ -1,0 +1,4 @@
+comment = 'Test code for Table AM buffered-insert lifecycle'
+default_version = '1.0'
+module_pathname = '$libdir/test_buffered_insert'
+relocatable = true

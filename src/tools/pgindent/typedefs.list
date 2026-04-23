@@ -1255,6 +1255,7 @@ HeadlineWordEntry
 HeapCheckContext
 HeapCheckReadStreamData
 HeapPageFreeze
+HeapBufferedInsertState
 HeapScanDesc
 HeapScanDescData
 HeapTuple
@@ -3123,6 +3124,9 @@ T_Action
 T_WorkerStatus
 TableAmRoutine
 TableAttachInfo
+TableBufferedInsertFlushCb
+TableBufferedInsertState
+TableBufferedInsertStateData
 TableDataInfo
 TableFunc
 TableFuncRoutine
