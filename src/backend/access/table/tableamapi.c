@@ -93,6 +93,18 @@ GetTableAmRoutine(Oid amhandler)
 	Assert(routine->scan_sample_next_block != NULL);
 	Assert(routine->scan_sample_next_tuple != NULL);
 
+	/*
+	 * Buffered-insert callbacks: either all four are NULL (AM does not
+	 * support buffered inserts), or all four are non-NULL.  No partially
+	 * populated groups are allowed.
+	 */
+	Assert((routine->buffered_insert_begin == NULL) ==
+		   (routine->buffered_insert_put == NULL));
+	Assert((routine->buffered_insert_begin == NULL) ==
+		   (routine->buffered_insert_flush == NULL));
+	Assert((routine->buffered_insert_begin == NULL) ==
+		   (routine->buffered_insert_end == NULL));
+
 	return routine;
 }
 

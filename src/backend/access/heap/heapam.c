@@ -53,6 +53,7 @@
 #include "utils/datum.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
+#include "utils/memutils.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 
@@ -1982,6 +1983,296 @@ ReleaseBulkInsertStatePin(BulkInsertState bistate)
 }
 
 
+/* ------------------------------------------------------------------------
+ * Heap buffered-insert lifecycle implementation.
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * Private state for the heap buffered-insert session.
+ *
+ * Memory-context hierarchy (all destroyed by MemoryContextDelete(state_ctx)):
+ *
+ *   state_ctx ("HeapBufferedInsert")        -- long-lived, owns stable state
+ *     ├── batch_ctx ("HeapBufInsBatch")     -- per-batch HeapTuples
+ *     └── mi_ctx ("HeapBufInsFlush")        -- per-flush transient allocations
+ *            └── heap_multi_insert scratch + toasted tuple copies
+ *
+ * state_ctx owns: this struct, the HeapTuple pointer array, bistate,
+ *   scratch_slot (callback-only).
+ * batch_ctx owns: HeapTuples produced by ExecCopySlotHeapTuple() during
+ *   put().  It is reset (not deleted) after each flush, which bulk-frees all
+ *   per-batch allocations.
+ * mi_ctx owns: heap_multi_insert's transient allocations (including any
+ *   toasted-tuple copies produced by heap_prepare_insert).  It is reset after
+ *   each flush once the flush callback (if any) has finished reading the
+ *   post-prepare tuples.
+ */
+typedef struct HeapBufferedInsertState
+{
+	TableBufferedInsertStateData base;
+	CommandId	cid;
+	int			options;
+	BulkInsertState bistate;
+	TableBufferedInsertFlushCb flush_cb;
+	void	   *flush_ctx;
+	HeapTuple  *tuples;			/* buffered HeapTuples (in batch_ctx) */
+	int			ntuples;
+	int			max_tuples;
+	Size		buffered_bytes;	/* sum of tuples[i]->t_len */
+	TupleTableSlot *scratch_slot;	/* callback-only; HeapTuple-backed */
+	MemoryContext batch_ctx;		/* per-batch HeapTuples; reset after flush */
+	MemoryContext mi_ctx;			/* reset after each heap_multi_insert */
+	MemoryContext state_ctx;		/* long-lived; owns stable state */
+} HeapBufferedInsertState;
+
+#define HEAP_BUFFERED_INSERT_MAX_TUPLES	1000
+#define HEAP_BUFFERED_INSERT_MAX_BYTES	65535
+
+static void heap_buffered_insert_do_flush(HeapBufferedInsertState *hstate);
+static void heap_buffered_insert_finish_bulkinsert(HeapBufferedInsertState *hstate);
+
+/* heap_multi_insert core, takes HeapTuples directly (defined near heap_multi_insert) */
+static void heap_multi_insert_raw(Relation relation, HeapTuple *heaptuples,
+								  int ntuples, CommandId cid, uint32 options,
+								  BulkInsertState bistate);
+
+TableBufferedInsertState
+heap_buffered_insert_begin(Relation rel, CommandId cid, int options,
+						   TableBufferedInsertFlushCb flush_cb,
+						   void *flush_ctx)
+{
+	HeapBufferedInsertState *hstate;
+	MemoryContext state_ctx;
+	MemoryContext old_ctx;
+
+	state_ctx = AllocSetContextCreate(CurrentMemoryContext,
+									  "HeapBufferedInsert",
+									  ALLOCSET_DEFAULT_SIZES);
+	old_ctx = MemoryContextSwitchTo(state_ctx);
+
+	hstate = palloc0(sizeof(HeapBufferedInsertState));
+	hstate->base.rel = rel;
+	hstate->cid = cid;
+	hstate->options = options;
+	hstate->flush_cb = flush_cb;
+	hstate->flush_ctx = flush_ctx;
+	hstate->state_ctx = state_ctx;
+
+	hstate->max_tuples = HEAP_BUFFERED_INSERT_MAX_TUPLES;
+	hstate->tuples = palloc_array(HeapTuple, hstate->max_tuples);
+	hstate->ntuples = 0;
+	hstate->buffered_bytes = 0;
+
+	if (options & TABLE_INSERT_BAS_BULKWRITE)
+		hstate->bistate = GetBulkInsertState();
+	else
+		hstate->bistate = NULL;
+
+	hstate->batch_ctx = AllocSetContextCreate(state_ctx,
+											  "HeapBufInsBatch",
+											  ALLOCSET_DEFAULT_SIZES);
+
+	hstate->mi_ctx = AllocSetContextCreate(state_ctx,
+										   "HeapBufInsFlush",
+										   ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Allocate the scratch slot only when a flush callback is present.
+	 * No-callback callers (CTAS, CMV, RMV) pay zero slot overhead.
+	 */
+	if (flush_cb != NULL)
+		hstate->scratch_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+														&TTSOpsHeapTuple);
+	else
+		hstate->scratch_slot = NULL;
+
+	MemoryContextSwitchTo(old_ctx);
+
+	return &hstate->base;
+}
+
+void
+heap_buffered_insert_put(TableBufferedInsertState state, TupleTableSlot *slot)
+{
+	HeapBufferedInsertState *hstate = (HeapBufferedInsertState *) state;
+	MemoryContext old_ctx;
+	HeapTuple	htup;
+
+	/* Auto-flush if tuple count is at capacity. */
+	if (hstate->ntuples >= hstate->max_tuples)
+		heap_buffered_insert_do_flush(hstate);
+
+	/*
+	 * Produce a self-contained HeapTuple in batch_ctx.
+	 *
+	 * HeapTuple-backed slots (not buffer-pinned): transfer ownership when
+	 * the slot owns the tuple, otherwise copy.  All other slot types use
+	 * ExecCopySlotHeapTuple which invokes the slot's copy_heap_tuple method.
+	 */
+	old_ctx = MemoryContextSwitchTo(hstate->batch_ctx);
+
+	if (TTS_IS_HEAPTUPLE(slot) && !TTS_IS_BUFFERTUPLE(slot))
+	{
+		HeapTuple	src = ExecFetchSlotHeapTuple(slot, false, NULL);
+
+		if (src != NULL && TTS_SHOULDFREE(slot))
+		{
+			/* Transfer ownership — zero copy. */
+			htup = src;
+			slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+			((HeapTupleTableSlot *) slot)->tuple = NULL;
+		}
+		else if (src != NULL)
+		{
+			/* Slot does not own the tuple; copy needed. */
+			htup = heap_copytuple(src);
+		}
+		else
+		{
+			htup = ExecCopySlotHeapTuple(slot);
+		}
+	}
+	else
+	{
+		/* Virtual, MinimalTuple, BufferHeapTuple, etc. */
+		htup = ExecCopySlotHeapTuple(slot);
+	}
+
+	MemoryContextSwitchTo(old_ctx);
+
+	hstate->tuples[hstate->ntuples++] = htup;
+	hstate->buffered_bytes += htup->t_len;
+
+	/* Byte-threshold flush: exact tracking from the HeapTuple t_len. */
+	if (hstate->buffered_bytes > HEAP_BUFFERED_INSERT_MAX_BYTES)
+		heap_buffered_insert_do_flush(hstate);
+}
+
+void
+heap_buffered_insert_flush(TableBufferedInsertState state)
+{
+	HeapBufferedInsertState *hstate = (HeapBufferedInsertState *) state;
+
+	if (hstate->ntuples > 0)
+		heap_buffered_insert_do_flush(hstate);
+}
+
+void
+heap_buffered_insert_end(TableBufferedInsertState state)
+{
+	HeapBufferedInsertState *hstate = (HeapBufferedInsertState *) state;
+
+	/* Flush any remaining tuples */
+	if (hstate->ntuples > 0)
+		heap_buffered_insert_do_flush(hstate);
+
+	/* Clean up the scratch slot used for flush callback */
+	if (hstate->scratch_slot != NULL)
+		ExecDropSingleTupleTableSlot(hstate->scratch_slot);
+
+	/* Perform finish-bulk-insert cleanup (subsumes table_finish_bulk_insert) */
+	heap_buffered_insert_finish_bulkinsert(hstate);
+
+	/*
+	 * Release all memory owned by the state, including batch_ctx and mi_ctx
+	 * (both are children of state_ctx).
+	 */
+	MemoryContextDelete(hstate->state_ctx);
+}
+
+/*
+ * Internal: flush all buffered HeapTuples via heap_multi_insert_raw, then
+ * invoke the flush callback (if any) once per written tuple.  Resets both
+ * per-batch and per-flush contexts so no payload survives across cycles.
+ *
+ * Callback-path isolation: the scratch_slot and tuple-to-slot conversion
+ * only execute when flush_cb is non-NULL, so no-callback callers (CTAS,
+ * CMV, RMV) pay zero callback overhead per tuple.
+ */
+static void
+heap_buffered_insert_do_flush(HeapBufferedInsertState *hstate)
+{
+	MemoryContext old_ctx;
+	int			ntuples = hstate->ntuples;
+
+	Assert(ntuples > 0);
+
+	/*
+	 * Switch to the per-flush memory context.  heap_multi_insert_raw's
+	 * transient allocations (including any toasted-tuple copies from
+	 * heap_prepare_insert) land here and are bulk-freed after the callback.
+	 */
+	old_ctx = MemoryContextSwitchTo(hstate->mi_ctx);
+
+	heap_multi_insert_raw(hstate->base.rel,
+						  hstate->tuples,
+						  ntuples,
+						  hstate->cid,
+						  hstate->options,
+						  hstate->bistate);
+
+	MemoryContextSwitchTo(old_ctx);
+
+	/*
+	 * Invoke the flush callback once per flushed tuple, in insertion order.
+	 * After heap_multi_insert_raw, each tuples[i]->t_self holds the stored
+	 * TID, and tuples[i] points to the post-prepare (possibly toasted) tuple
+	 * in mi_ctx (if toasted) or the original in batch_ctx (if not).  Both
+	 * contexts are still alive here.
+	 */
+	if (hstate->flush_cb != NULL)
+	{
+		for (int i = 0; i < ntuples; i++)
+		{
+			ExecStoreHeapTuple(hstate->tuples[i], hstate->scratch_slot, false);
+			hstate->scratch_slot->tts_tid = hstate->tuples[i]->t_self;
+			hstate->scratch_slot->tts_tableOid = hstate->tuples[i]->t_tableOid;
+			hstate->flush_cb(hstate->flush_ctx, hstate->scratch_slot);
+		}
+
+		/*
+		 * ExecStoreHeapTuple already clears the previous contents at the
+		 * start of each iteration, so a per-iteration ExecClearTuple is
+		 * redundant.  Clear once after the loop to leave the scratch slot
+		 * in a safe empty state before the contexts are reset below.
+		 */
+		ExecClearTuple(hstate->scratch_slot);
+	}
+
+	/* Reset both contexts now that the callback is done. */
+	MemoryContextReset(hstate->mi_ctx);
+	MemoryContextReset(hstate->batch_ctx);
+
+	hstate->ntuples = 0;
+	hstate->buffered_bytes = 0;
+}
+
+/*
+ * Perform heap-specific finish-bulk-insert cleanup.
+ *
+ * This is the buffered-insert equivalent of what callers of the non-buffered
+ * path achieve by calling FreeBulkInsertState() + table_finish_bulk_insert()
+ * at teardown.  end() must subsume both.
+ *
+ * For the current in-tree heap AM, the cleanup consists of:
+ *
+ * 1. Release the BulkInsertState (buffer pin + bulk-write access strategy).
+ *
+ * 2. Any action that heap's finish_bulk_insert AM callback would perform.
+ *    Heap does not currently register that callback (the slot in
+ *    heapam_methods is NULL), so no additional action is required.
+ */
+static void
+heap_buffered_insert_finish_bulkinsert(HeapBufferedInsertState *hstate)
+{
+	if (hstate->bistate != NULL)
+		FreeBulkInsertState(hstate->bistate);
+
+	/* Heap does not currently register a finish_bulk_insert AM callback. */
+}
+
+
 /*
  *	heap_insert		- insert tuple into a heap
  *
@@ -2268,22 +2559,24 @@ heap_multi_insert_pages(HeapTuple *heaptuples, int done, int ntuples, Size saveF
 }
 
 /*
- *	heap_multi_insert	- insert multiple tuples into a heap
+ *	heap_multi_insert_raw	- core multi-insert for a HeapTuple array
  *
- * This is like heap_insert(), but inserts multiple tuples in one operation.
- * That's faster than calling heap_insert() in a loop, because when multiple
- * tuples can be inserted on a single page, we can write just a single WAL
- * record covering all of them, and only need to lock/unlock the page once.
+ * Takes an array of pre-formed HeapTuples, runs heap_prepare_insert on each
+ * (toast + header setup), and inserts them into heap pages.  The heaptuples
+ * array is updated in-place: after return, each entry points to the prepared
+ * (possibly toasted) tuple with t_self set to the stored TID.
+ *
+ * This is the shared core for heap_multi_insert (slot-based callers) and
+ * heap_buffered_insert_do_flush (HeapTuple-based callers).
  *
  * Note: this leaks memory into the current memory context. You can create a
  * temporary context before calling this, if that's a problem.
  */
-void
-heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
-				  CommandId cid, uint32 options, BulkInsertState bistate)
+static void
+heap_multi_insert_raw(Relation relation, HeapTuple *heaptuples, int ntuples,
+					  CommandId cid, uint32 options, BulkInsertState bistate)
 {
 	TransactionId xid = GetCurrentTransactionId();
-	HeapTuple  *heaptuples;
 	int			i;
 	int			ndone;
 	PGAlignedBlock scratch;
@@ -2306,16 +2599,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	saveFreeSpace = RelationGetTargetPageFreeSpace(relation,
 												   HEAP_DEFAULT_FILLFACTOR);
 
-	/* Toast and set header data in all the slots */
-	heaptuples = palloc(ntuples * sizeof(HeapTuple));
+	/* Toast and set header data in all the tuples */
 	for (i = 0; i < ntuples; i++)
 	{
-		HeapTuple	tuple;
-
-		tuple = ExecFetchSlotHeapTuple(slots[i], true, NULL);
-		slots[i]->tts_tableOid = RelationGetRelid(relation);
-		tuple->t_tableOid = slots[i]->tts_tableOid;
-		heaptuples[i] = heap_prepare_insert(relation, tuple, xid, cid,
+		heaptuples[i]->t_tableOid = RelationGetRelid(relation);
+		heaptuples[i] = heap_prepare_insert(relation, heaptuples[i], xid, cid,
 											options);
 	}
 
@@ -2639,11 +2927,41 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			CacheInvalidateHeapTuple(relation, heaptuples[i], NULL);
 	}
 
+	pgstat_count_heap_insert(relation, ntuples);
+}
+
+/*
+ *	heap_multi_insert	- insert multiple tuples into a heap
+ *
+ * This is like heap_insert(), but inserts multiple tuples in one operation.
+ * That's faster than calling heap_insert() in a loop, because when multiple
+ * tuples can be inserted on a single page, we can write just a single WAL
+ * record covering all of them, and only need to lock/unlock the page once.
+ *
+ * Note: this leaks memory into the current memory context. You can create a
+ * temporary context before calling this, if that's a problem.
+ */
+void
+heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
+				  CommandId cid, uint32 options, BulkInsertState bistate)
+{
+	HeapTuple  *heaptuples;
+	int			i;
+
+	heaptuples = palloc(ntuples * sizeof(HeapTuple));
+	for (i = 0; i < ntuples; i++)
+	{
+		heaptuples[i] = ExecFetchSlotHeapTuple(slots[i], true, NULL);
+		slots[i]->tts_tableOid = RelationGetRelid(relation);
+	}
+
+	heap_multi_insert_raw(relation, heaptuples, ntuples, cid, options, bistate);
+
 	/* copy t_self fields back to the caller's slots */
 	for (i = 0; i < ntuples; i++)
 		slots[i]->tts_tid = heaptuples[i]->t_self;
 
-	pgstat_count_heap_insert(relation, ntuples);
+	pfree(heaptuples);
 }
 
 /*

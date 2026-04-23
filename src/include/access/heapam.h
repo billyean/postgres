@@ -379,6 +379,18 @@ extern void heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 extern void heap_multi_insert(Relation relation, TupleTableSlot **slots,
 							  int ntuples, CommandId cid, uint32 options,
 							  BulkInsertState bistate);
+
+/* heap buffered-insert lifecycle */
+extern TableBufferedInsertState heap_buffered_insert_begin(Relation rel,
+														   CommandId cid,
+														   int options,
+														   TableBufferedInsertFlushCb flush_cb,
+														   void *flush_ctx);
+extern void heap_buffered_insert_put(TableBufferedInsertState state,
+									 TupleTableSlot *slot);
+extern void heap_buffered_insert_flush(TableBufferedInsertState state);
+extern void heap_buffered_insert_end(TableBufferedInsertState state);
+
 extern TM_Result heap_delete(Relation relation, const ItemPointerData *tid,
 							 CommandId cid, uint32 options, Snapshot crosscheck,
 							 bool wait, TM_FailureData *tmfd);
