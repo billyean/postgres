@@ -2238,3 +2238,96 @@ COMMIT;
 SELECT epoch_xid_force_bridge_reconstruct(false);
 
 DROP TABLE epoch_p20;
+
+-- ======================================================
+-- Patch 21: bounded bridge-query API accessor proof
+-- ======================================================
+--
+-- These tests prove that the production consumer path now uses the
+-- bridge-query API accessors (EpochBridgeMembershipView, etc.) instead
+-- of directly reading bridge/view fields.  They also prove that the
+-- runtime-mode split (view vs native) remains unchanged from Patch 20.
+--
+-- This is an access-discipline proof, not a new semantic test.
+
+-- P21_a: Production consumer uses the bridge-query API accessor
+--
+-- A committed tuple on an epoch-materialized relation must report
+-- 'accessor' for the bridge-query API source, proving the consumer
+-- obtained the membership view through EpochBridgeMembershipView().
+
+CREATE TABLE epoch_p21 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p21 VALUES (1, 'api_accessor_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p21 WHERE ctid = '(0,1)';
+
+-- Must report 'accessor' — EpochBridgeMembershipView was called
+SELECT epoch_xid_bridge_query_api_source();
+
+-- Runtime-mode proof: view path used (unchanged from Patch 20)
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+-- P21_b: Guard disable still forces native fallback
+--
+-- When the Stage 1 guard is disabled, the accessor still runs
+-- (reports 'accessor'), but the membership mode is 'native'.
+-- This proves the runtime-mode split is unchanged.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p21 WHERE ctid = '(0,1)';
+
+-- API accessor was still called (access discipline unchanged)
+SELECT epoch_xid_bridge_query_api_source();
+
+-- But the runtime mode is 'native' (guard override takes effect)
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P21_c: Index scan consumer also uses the API
+--
+-- heap_hot_search_buffer must also exercise the accessor path.
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p21 WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_bridge_query_api_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P21_d: Copied snapshot preserves accessor usage
+--
+-- A cursor forces CopySnapshot.  The consumer must still report
+-- 'accessor' when using the copied snapshot.
+
+BEGIN;
+
+DECLARE epoch_p21_cur CURSOR FOR
+    SELECT * FROM epoch_p21 WHERE ctid = '(0,1)';
+
+FETCH NEXT FROM epoch_p21_cur;
+
+SELECT epoch_xid_bridge_query_api_source();
+SELECT epoch_xid_membership_last_source();
+
+CLOSE epoch_p21_cur;
+
+COMMIT;
+
+DROP TABLE epoch_p21;

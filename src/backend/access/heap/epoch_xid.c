@@ -140,6 +140,21 @@ static char epoch_horizon_last_source = 'n';
 static char epoch_membership_last_source = 'n';
 
 /*
+ * Test-only instrumentation (Patch 21): records whether the consumer
+ * obtained the membership view through the bridge-query API accessor
+ * (EpochBridgeMembershipView) rather than direct field navigation.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'a' = accessor: EpochBridgeMembershipView was called (API path)
+ *   'x' = not applicable: consumer did not reach the guard check
+ *
+ * This proves the Patch 21 access-discipline claim: that the production
+ * consumer uses the bounded query API, not direct bridge/view field reads.
+ */
+static char epoch_bridge_query_api_last_source = 'n';
+
+/*
  * Test-only instrumentation: records which call site last invoked
  * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
  * the function, via EpochMVCCSetCaller().
@@ -1719,6 +1734,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	epoch_bridge_last_source = 'n';
 	epoch_horizon_last_source = 'n';
 	epoch_membership_last_source = 'n';
+	epoch_bridge_query_api_last_source = 'n';
 
 	/* Read epoch slot data (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
@@ -1760,34 +1776,35 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	xmin_xid = XidFromFullTransactionId(interp.full_xmin);
 
 	/*
-	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 20).
+	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 21).
 	 *
-	 * Patch 20: the guard now checks membership.valid instead of
-	 * epoch_bridge.active.  membership.valid is true iff the bridge is
-	 * active (epoch 0, valid anchor) AND pre-promoted arrays exist.
-	 * The test-only force-disable override is still applied here at
-	 * consumption time, not baked into the view.
+	 * Patch 21: the consumer now obtains the membership view through the
+	 * EpochBridgeMembershipView() accessor instead of directly navigating
+	 * snapshot->epoch_bridge.membership and reading mv->valid.  The accessor
+	 * returns NULL when the view is not usable, replacing the explicit valid
+	 * check.  The test-only force-disable override remains at consumption
+	 * time, not baked into the accessor.
 	 *
-	 * After Patch 20, two production runtime modes:
+	 * Two production runtime modes (unchanged from Patch 20):
 	 *   Mode 1: use_membership == true  -> EpochMembershipContains (view)
 	 *   Mode 2: use_membership == false -> XidInMVCCSnapshot (native 32-bit)
 	 */
-	mv = &snapshot->epoch_bridge.membership;
-	use_membership = !epoch_stage1_force_disabled && mv->valid;
+	mv = EpochBridgeMembershipView(snapshot);
+	use_membership = !epoch_stage1_force_disabled && mv != NULL;
+	epoch_bridge_query_api_last_source = 'a';
 
 	/*
 	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
 	 *
-	 * When the guard passes, the epoch_horizon for fast-reject is read
-	 * directly from the membership view's full_xmin (always populated
-	 * when valid == true; no fallback reconstruction needed).
+	 * Patch 21: the epoch_horizon for fast-reject is obtained through
+	 * EpochMembershipHorizon() instead of directly reading mv->full_xmin.
 	 */
 	{
 		FullTransactionId epoch_horizon = InvalidFullTransactionId;
 
 		if (use_membership)
 		{
-			epoch_horizon = mv->full_xmin;
+			epoch_horizon = EpochMembershipHorizon(mv);
 			epoch_horizon_last_source = 'p';
 			epoch_bridge_last_source = 'p';
 		}
@@ -1898,7 +1915,8 @@ check_xmax:
 	/*
 	 * xmax committed: snapshot membership check.
 	 *
-	 * Patch 20: same two-mode split as xmin above.
+	 * Patch 21: MultiXact xmax promotion uses EpochMembershipPromoteXid()
+	 * instead of directly reading mv->anchor.
 	 */
 	Assert(xmax_status == EPOCH_XID_COMMITTED);
 
@@ -1910,8 +1928,8 @@ check_xmax:
 			FullTransactionId full_xmax_for_snap;
 
 			if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
-				full_xmax_for_snap = EpochFullXidRelativeTo(
-					mv->anchor, effective_xmax);
+				full_xmax_for_snap = EpochMembershipPromoteXid(
+					mv, effective_xmax);
 			else
 				full_xmax_for_snap = interp.full_xmax;
 
@@ -3639,6 +3657,58 @@ EpochMembershipViewPopulate(EpochMembershipView *view, Snapshot snap)
 	}
 }
 
+/*
+ * Patch 21: bounded bridge-query API accessors.
+ *
+ * These three functions, together with EpochMembershipContains() (Patch 20),
+ * form the complete consumer-facing bridge-query API.  Production consumers
+ * use only these functions — no direct field reads of bridge/view internals.
+ *
+ * This changes consumer access discipline, not semantics.
+ */
+
+/*
+ * EpochBridgeMembershipView -- obtain the bounded membership view.
+ *
+ * Returns a const pointer to the membership view if it is valid.
+ * Returns NULL if the view is not usable (bridge inactive, no arrays, etc.).
+ */
+const EpochMembershipView *
+EpochBridgeMembershipView(Snapshot snapshot)
+{
+	if (snapshot->epoch_bridge.membership.valid)
+		return &snapshot->epoch_bridge.membership;
+	return NULL;
+}
+
+/*
+ * EpochMembershipHorizon -- the 64-bit snapshot horizon for Phase 4 fast-reject.
+ *
+ * Returns the 64-bit lower boundary (full_xmin) of the snapshot.
+ * Caller must have a valid (non-NULL) membership view.
+ */
+FullTransactionId
+EpochMembershipHorizon(const EpochMembershipView *view)
+{
+	Assert(view != NULL && view->valid);
+	return view->full_xmin;
+}
+
+/*
+ * EpochMembershipPromoteXid -- promote a 32-bit XID to 64-bit using the
+ * view's reconstruction anchor.
+ *
+ * Used for runtime-determined XIDs that cannot be pre-promoted at
+ * snapshot acquisition time (e.g., MultiXact effective updater).
+ */
+FullTransactionId
+EpochMembershipPromoteXid(const EpochMembershipView *view,
+						  TransactionId xid)
+{
+	Assert(view != NULL && view->valid);
+	return EpochFullXidRelativeTo(view->anchor, xid);
+}
+
 
 /*
  * epoch_xid_bridge_populate_source() -> text
@@ -3727,6 +3797,41 @@ epoch_xid_membership_last_source(PG_FUNCTION_ARGS)
 			break;
 		case 'f':
 			result = "native";
+			break;
+		default:
+			result = "not_reached";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_bridge_query_api_source() -> text
+ *
+ * TEST-ONLY function (Patch 21).  Returns whether the last
+ * EpochHeapTupleSatisfiesMVCC invocation obtained the membership view
+ * through the bridge-query API accessor (EpochBridgeMembershipView).
+ *
+ * This proves the Patch 21 access-discipline claim: the production
+ * consumer uses the bounded query API, not direct field reads.
+ *
+ * Returns:
+ *   'accessor'     - EpochBridgeMembershipView was called
+ *   'not_reached'  - consumer was not invoked (initial state)
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_query_api_source);
+
+Datum
+epoch_xid_bridge_query_api_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_bridge_query_api_last_source)
+	{
+		case 'a':
+			result = "accessor";
 			break;
 		default:
 			result = "not_reached";

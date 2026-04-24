@@ -12944,4 +12944,10 @@
   proname => 'epoch_xid_membership_last_source', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_membership_last_source' },
+
+{ oid => '9930',
+  descr => 'TEST-ONLY: report whether consumer used the bridge-query API accessor',
+  proname => 'epoch_xid_bridge_query_api_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_query_api_source' },
 ]

@@ -469,4 +469,53 @@ extern bool EpochMembershipContains(const EpochMembershipView *view,
 extern void EpochMembershipViewPopulate(EpochMembershipView *view,
 										Snapshot snap);
 
+/* ---------- Bounded bridge-query API (Patch 21) ---------- */
+
+/*
+ * Patch 21: consumer-facing query API layer.
+ *
+ * These accessors, together with EpochMembershipContains(), form the
+ * complete bounded bridge-query API.  Production consumers use only
+ * these functions to interact with the bridge/view — no direct field
+ * reads of EpochSnapshotBridge or EpochMembershipView internals.
+ *
+ * This changes consumer access discipline, not semantics.
+ * The bridge/view representation and runtime modes remain unchanged.
+ */
+
+/*
+ * EpochBridgeMembershipView — obtain the bounded membership view.
+ *
+ * Returns a const pointer to the membership view if it is valid
+ * (bridge active, pre-promoted arrays present).  Returns NULL otherwise.
+ *
+ * Replaces direct: &snapshot->epoch_bridge.membership + mv->valid check.
+ */
+extern const EpochMembershipView *
+EpochBridgeMembershipView(Snapshot snapshot);
+
+/*
+ * EpochMembershipHorizon — the 64-bit snapshot horizon for fast-reject.
+ *
+ * Returns the 64-bit lower boundary of the snapshot, used as the Phase 4
+ * horizon.  Caller must have a valid (non-NULL) membership view.
+ *
+ * Replaces direct: mv->full_xmin.
+ */
+extern FullTransactionId
+EpochMembershipHorizon(const EpochMembershipView *view);
+
+/*
+ * EpochMembershipPromoteXid — promote a 32-bit XID to 64-bit using the
+ * view's reconstruction anchor.
+ *
+ * Used for runtime-determined XIDs that cannot be pre-promoted (e.g.,
+ * the effective updater XID from MultiXact decomposition).
+ *
+ * Replaces direct: EpochFullXidRelativeTo(mv->anchor, xid).
+ */
+extern FullTransactionId
+EpochMembershipPromoteXid(const EpochMembershipView *view,
+						  TransactionId xid);
+
 #endif							/* EPOCH_XID_H */
