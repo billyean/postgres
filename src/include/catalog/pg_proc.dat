@@ -12950,4 +12950,10 @@
   proname => 'epoch_xid_bridge_query_api_source', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_bridge_query_api_source' },
+
+{ oid => '9931',
+  descr => 'TEST-ONLY: report whether consumer used the bridge context bundle',
+  proname => 'epoch_xid_bridge_context_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_context_source' },
 ]

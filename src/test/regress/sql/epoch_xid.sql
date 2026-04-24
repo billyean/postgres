@@ -2331,3 +2331,104 @@ CLOSE epoch_p21_cur;
 COMMIT;
 
 DROP TABLE epoch_p21;
+
+-- ======================================================
+-- Patch 22: bounded bridge context/bundle proof
+-- ======================================================
+--
+-- These tests prove that the production consumer now uses the bridge
+-- context bundle (EpochBridgeContext) instead of assembling behavior
+-- from separate accessors.  They also prove the runtime-mode split
+-- (view vs native) is unchanged from Patch 20/21.
+--
+-- This is a consumer-composition proof, not a new semantic test.
+
+-- P22_a: Production consumer uses the bridge context bundle
+--
+-- A committed tuple on an epoch-materialized relation must report
+-- 'context' for the bridge context source, proving the consumer
+-- used EpochBridgeContextInit.
+
+CREATE TABLE epoch_p22 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p22 VALUES (1, 'context_bundle_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p22 WHERE ctid = '(0,1)';
+
+-- Must report 'context' — EpochBridgeContextInit was called
+SELECT epoch_xid_bridge_context_source();
+
+-- Runtime-mode proof: view path used (unchanged from Patch 20/21)
+SELECT epoch_xid_membership_last_source();
+
+-- Accessor layer still called internally by context init
+SELECT epoch_xid_bridge_query_api_source();
+
+COMMIT;
+
+-- P22_b: Guard disable — context used, but mode is native
+--
+-- The context is always initialized (reports 'context'), but the
+-- runtime mode falls back to 'native' when the guard is disabled.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p22 WHERE ctid = '(0,1)';
+
+-- Context was used regardless of guard
+SELECT epoch_xid_bridge_context_source();
+
+-- But runtime mode is native (guard override takes effect)
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P22_c: View path restores after re-enabling guard
+
+BEGIN;
+
+SELECT * FROM epoch_p22 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+-- P22_d: Index scan consumer also uses the context bundle
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p22 WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P22_e: Copied snapshot preserves context usage
+
+BEGIN;
+
+DECLARE epoch_p22_cur CURSOR FOR
+    SELECT * FROM epoch_p22 WHERE ctid = '(0,1)';
+
+FETCH NEXT FROM epoch_p22_cur;
+
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+CLOSE epoch_p22_cur;
+
+COMMIT;
+
+DROP TABLE epoch_p22;

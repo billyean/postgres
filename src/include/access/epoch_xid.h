@@ -518,4 +518,48 @@ extern FullTransactionId
 EpochMembershipPromoteXid(const EpochMembershipView *view,
 						  TransactionId xid);
 
+/* ---------- Bounded bridge context/bundle (Patch 22) ---------- */
+
+/*
+ * EpochBridgeContext -- bounded snapshot-consumer bridge bundle.
+ *
+ * A stack-local struct that bundles everything a consumer needs for
+ * bridge-mediated snapshot queries.  Obtained once via
+ * EpochBridgeContextInit(), then queried through the five context
+ * functions below.  Consumers have zero direct reads of context fields.
+ *
+ * This changes consumer-side bridge composition, not semantics.
+ * The underlying bridge/view representation and runtime modes are
+ * unchanged from Patch 21.
+ */
+typedef struct EpochBridgeContext
+{
+	const EpochMembershipView *mv;	/* NULL if unavailable */
+	Snapshot	snapshot;			/* for native 32-bit fallback */
+	bool		use_64bit;			/* resolved guard decision */
+} EpochBridgeContext;
+
+/* Initialize the context from a snapshot. Resolves the guard once. */
+extern void EpochBridgeContextInit(EpochBridgeContext *ctx, Snapshot snapshot);
+
+/* Unified membership query: handles view path or native fallback internally. */
+extern bool EpochBridgeXidInSnapshot(const EpochBridgeContext *ctx,
+									 FullTransactionId fxid,
+									 TransactionId xid32);
+
+/* Horizon for Phase 4 fast-reject. Returns InvalidFullTransactionId
+   if the context is not using the 64-bit path. */
+extern FullTransactionId
+EpochBridgeContextHorizon(const EpochBridgeContext *ctx);
+
+/* Whether the context resolved to the 64-bit view path.
+   Consumers use this instead of directly reading ctx->use_64bit. */
+extern bool EpochBridgeContextUses64Bit(const EpochBridgeContext *ctx);
+
+/* Promote a 32-bit XID using the context's anchor.
+   Caller must ensure EpochBridgeContextUses64Bit(ctx) is true. */
+extern FullTransactionId
+EpochBridgeContextPromoteXid(const EpochBridgeContext *ctx,
+							 TransactionId xid);
+
 #endif							/* EPOCH_XID_H */

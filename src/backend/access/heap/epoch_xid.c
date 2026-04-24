@@ -155,6 +155,16 @@ static char epoch_membership_last_source = 'n';
 static char epoch_bridge_query_api_last_source = 'n';
 
 /*
+ * Test-only instrumentation (Patch 22): records whether the consumer
+ * obtained a bridge context via EpochBridgeContextInit.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'c' = context: EpochBridgeContextInit was called
+ */
+static char epoch_bridge_context_last_source = 'n';
+
+/*
  * Test-only instrumentation: records which call site last invoked
  * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
  * the function, via EpochMVCCSetCaller().
@@ -1723,8 +1733,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	TransactionId xmin_xid,
 				xmax_xid,
 				effective_xmax;
-	bool		use_membership;
-	const EpochMembershipView *mv;
+	EpochBridgeContext bctx;
 
 	Assert(snapshot != NULL);
 	Assert(snapshot->snapshot_type == SNAPSHOT_MVCC);
@@ -1735,6 +1744,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	epoch_horizon_last_source = 'n';
 	epoch_membership_last_source = 'n';
 	epoch_bridge_query_api_last_source = 'n';
+	epoch_bridge_context_last_source = 'n';
 
 	/* Read epoch slot data (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
@@ -1776,46 +1786,38 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	xmin_xid = XidFromFullTransactionId(interp.full_xmin);
 
 	/*
-	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 21).
+	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 22).
 	 *
-	 * Patch 21: the consumer now obtains the membership view through the
-	 * EpochBridgeMembershipView() accessor instead of directly navigating
-	 * snapshot->epoch_bridge.membership and reading mv->valid.  The accessor
-	 * returns NULL when the view is not usable, replacing the explicit valid
-	 * check.  The test-only force-disable override remains at consumption
-	 * time, not baked into the accessor.
+	 * Patch 22: the consumer now uses a bridge context bundle instead of
+	 * separate accessors.  EpochBridgeContextInit resolves the guard once.
+	 * The consumer never reads context fields directly — it uses the
+	 * five context functions (Init, XidInSnapshot, Horizon, Uses64Bit,
+	 * PromoteXid) exclusively.
 	 *
 	 * Two production runtime modes (unchanged from Patch 20):
-	 *   Mode 1: use_membership == true  -> EpochMembershipContains (view)
-	 *   Mode 2: use_membership == false -> XidInMVCCSnapshot (native 32-bit)
+	 *   Mode 1: EpochBridgeContextUses64Bit == true  -> view path
+	 *   Mode 2: EpochBridgeContextUses64Bit == false -> native 32-bit
 	 */
-	mv = EpochBridgeMembershipView(snapshot);
-	use_membership = !epoch_stage1_force_disabled && mv != NULL;
-	epoch_bridge_query_api_last_source = 'a';
+	EpochBridgeContextInit(&bctx, snapshot);
 
 	/*
 	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
 	 *
-	 * Patch 21: the epoch_horizon for fast-reject is obtained through
-	 * EpochMembershipHorizon() instead of directly reading mv->full_xmin.
+	 * Patch 22: the epoch_horizon for fast-reject is obtained through
+	 * EpochBridgeContextHorizon, which returns InvalidFullTransactionId
+	 * when the 64-bit path is not active (no consumer branching needed).
 	 */
 	{
-		FullTransactionId epoch_horizon = InvalidFullTransactionId;
-
-		if (use_membership)
-		{
-			epoch_horizon = EpochMembershipHorizon(mv);
-			epoch_horizon_last_source = 'p';
-			epoch_bridge_last_source = 'p';
-		}
+		FullTransactionId epoch_horizon = EpochBridgeContextHorizon(&bctx);
+		bool		use_64 = EpochBridgeContextUses64Bit(&bctx);
 
 		xmin_status = EpochClassifyXidStatus(xmin_xid,
-						use_membership ? interp.full_xmin : InvalidFullTransactionId,
+						use_64 ? interp.full_xmin : InvalidFullTransactionId,
 						epoch_horizon,
 						tuple, true, NULL);
 		xmax_status = EpochClassifyXidStatus(
 						HeapTupleHeaderGetRawXmax(tuple),
-						use_membership ? interp.full_xmax : InvalidFullTransactionId,
+						use_64 ? interp.full_xmax : InvalidFullTransactionId,
 						epoch_horizon,
 						tuple, false,
 						&effective_xmax);
@@ -1840,7 +1842,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 
 	/* Test-only: record which internal path was taken */
 	if (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
-		epoch_mvcc_last_path = use_membership ? 's' : 'm';
+		epoch_mvcc_last_path = EpochBridgeContextUses64Bit(&bctx) ? 's' : 'm';
 	else
 		epoch_mvcc_last_path = 'd';
 
@@ -1871,28 +1873,13 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	/*
 	 * xmin committed: snapshot membership check.
 	 *
-	 * Patch 20: production uses EpochMembershipContains (view path) or
-	 * XidInMVCCSnapshot (native 32-bit).  No other production mode.
+	 * Patch 22: unified via EpochBridgeXidInSnapshot, which handles
+	 * both the view path and native 32-bit path internally.
 	 */
 	Assert(xmin_status == EPOCH_XID_COMMITTED);
 
-	{
-		bool		xmin_in_snapshot;
-
-		if (use_membership)
-		{
-			xmin_in_snapshot = EpochMembershipContains(mv, interp.full_xmin);
-			epoch_membership_last_source = 'v';
-		}
-		else
-		{
-			xmin_in_snapshot = XidInMVCCSnapshot(xmin_xid, snapshot);
-			epoch_membership_last_source = 'f';
-		}
-
-		if (xmin_in_snapshot)
-			return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
-	}
+	if (EpochBridgeXidInSnapshot(&bctx, interp.full_xmin, xmin_xid))
+		return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
 
 check_xmax:
 
@@ -1915,34 +1902,24 @@ check_xmax:
 	/*
 	 * xmax committed: snapshot membership check.
 	 *
-	 * Patch 21: MultiXact xmax promotion uses EpochMembershipPromoteXid()
-	 * instead of directly reading mv->anchor.
+	 * Patch 22: unified via EpochBridgeXidInSnapshot, with MultiXact
+	 * xmax promotion handled through EpochBridgeContextPromoteXid.
 	 */
 	Assert(xmax_status == EPOCH_XID_COMMITTED);
 
 	{
-		bool		xmax_in_snapshot;
+		FullTransactionId full_xmax_for_snap = interp.full_xmax;
+		TransactionId xmax_xid32 = xmax_xid;
 
-		if (use_membership)
+		if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT &&
+			EpochBridgeContextUses64Bit(&bctx))
 		{
-			FullTransactionId full_xmax_for_snap;
-
-			if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
-				full_xmax_for_snap = EpochMembershipPromoteXid(
-					mv, effective_xmax);
-			else
-				full_xmax_for_snap = interp.full_xmax;
-
-			xmax_in_snapshot = EpochMembershipContains(mv, full_xmax_for_snap);
-			epoch_membership_last_source = 'v';
-		}
-		else
-		{
-			xmax_in_snapshot = XidInMVCCSnapshot(xmax_xid, snapshot);
-			epoch_membership_last_source = 'f';
+			full_xmax_for_snap = EpochBridgeContextPromoteXid(&bctx,
+															  effective_xmax);
+			xmax_xid32 = effective_xmax;
 		}
 
-		if (xmax_in_snapshot)
+		if (EpochBridgeXidInSnapshot(&bctx, full_xmax_for_snap, xmax_xid32))
 			return EPOCH_MVCC_VISIBLE;	/* deleter committed after snapshot */
 	}
 
@@ -3709,6 +3686,101 @@ EpochMembershipPromoteXid(const EpochMembershipView *view,
 	return EpochFullXidRelativeTo(view->anchor, xid);
 }
 
+/*
+ * Patch 22: bounded bridge context/bundle functions.
+ *
+ * These five functions, operating on EpochBridgeContext, form the
+ * consumer-facing bridge bundle API.  The context bundles the membership
+ * view, snapshot fallback, and guard decision into a single object.
+ * Consumers have zero direct reads of context struct fields.
+ *
+ * The Patch 21 accessor layer remains as the internal implementation
+ * beneath these context functions.
+ *
+ * This changes consumer-side bridge composition, not semantics.
+ */
+
+/*
+ * EpochBridgeContextInit -- initialize the bridge context from a snapshot.
+ *
+ * Resolves the Stage 1 guard once and stores the result.  After this
+ * call, all bridge queries go through the context functions.
+ */
+void
+EpochBridgeContextInit(EpochBridgeContext *ctx, Snapshot snapshot)
+{
+	ctx->snapshot = snapshot;
+	ctx->mv = EpochBridgeMembershipView(snapshot);
+	ctx->use_64bit = !epoch_stage1_force_disabled && ctx->mv != NULL;
+
+	epoch_bridge_query_api_last_source = 'a';
+	epoch_bridge_context_last_source = 'c';
+}
+
+/*
+ * EpochBridgeXidInSnapshot -- unified membership query.
+ *
+ * Handles both the 64-bit view path and the 32-bit native fallback
+ * internally.  The consumer never writes the dual-path branch itself.
+ */
+bool
+EpochBridgeXidInSnapshot(const EpochBridgeContext *ctx,
+						 FullTransactionId fxid, TransactionId xid32)
+{
+	if (ctx->use_64bit)
+	{
+		epoch_membership_last_source = 'v';
+		return EpochMembershipContains(ctx->mv, fxid);
+	}
+	else
+	{
+		epoch_membership_last_source = 'f';
+		return XidInMVCCSnapshot(xid32, ctx->snapshot);
+	}
+}
+
+/*
+ * EpochBridgeContextHorizon -- the 64-bit horizon for Phase 4 fast-reject.
+ *
+ * Returns InvalidFullTransactionId if the context is not using the
+ * 64-bit path, so callers can pass the result directly without branching.
+ */
+FullTransactionId
+EpochBridgeContextHorizon(const EpochBridgeContext *ctx)
+{
+	if (ctx->use_64bit)
+	{
+		epoch_horizon_last_source = 'p';
+		epoch_bridge_last_source = 'p';
+		return EpochMembershipHorizon(ctx->mv);
+	}
+	return InvalidFullTransactionId;
+}
+
+/*
+ * EpochBridgeContextUses64Bit -- whether the 64-bit view path is active.
+ *
+ * Consumers call this instead of reading ctx->use_64bit directly.
+ */
+bool
+EpochBridgeContextUses64Bit(const EpochBridgeContext *ctx)
+{
+	return ctx->use_64bit;
+}
+
+/*
+ * EpochBridgeContextPromoteXid -- promote a 32-bit XID via the anchor.
+ *
+ * Caller must ensure EpochBridgeContextUses64Bit(ctx) is true.
+ */
+FullTransactionId
+EpochBridgeContextPromoteXid(const EpochBridgeContext *ctx,
+							 TransactionId xid)
+{
+	Assert(ctx->use_64bit && ctx->mv != NULL);
+	return EpochMembershipPromoteXid(ctx->mv, xid);
+}
+
 
 /*
  * epoch_xid_bridge_populate_source() -> text
@@ -3832,6 +3904,38 @@ epoch_xid_bridge_query_api_source(PG_FUNCTION_ARGS)
 	{
 		case 'a':
 			result = "accessor";
+			break;
+		default:
+			result = "not_reached";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_bridge_context_source() -> text
+ *
+ * TEST-ONLY function (Patch 22).  Returns whether the last
+ * EpochHeapTupleSatisfiesMVCC invocation used the bridge context
+ * bundle (EpochBridgeContextInit was called).
+ *
+ * Returns:
+ *   'context'      - EpochBridgeContextInit was called
+ *   'not_reached'  - consumer was not invoked (initial state)
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_context_source);
+
+Datum
+epoch_xid_bridge_context_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_bridge_context_last_source)
+	{
+		case 'c':
+			result = "context";
 			break;
 		default:
 			result = "not_reached";
