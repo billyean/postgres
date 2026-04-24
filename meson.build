@@ -2522,6 +2522,39 @@ endif
 
 
 ###############################################################
+# Check for AVX2 intrinsics support for buffer usage-map scanning.
+# This tests the specific intrinsics used by buf_usage_scan_avx2.c,
+# not just the target-attribute mechanism.
+###############################################################
+
+if host_cpu == 'x86_64'
+
+  prog = '''
+#include <immintrin.h>
+
+__attribute__((target("avx2")))
+static int test(void)
+{
+    __m256i v = _mm256_setzero_si256();
+    __m256i c = _mm256_cmpeq_epi8(v, v);
+    __m256i s = _mm256_subs_epu8(c, _mm256_set1_epi8(1));
+    return _mm256_movemask_epi8(s);
+}
+
+int main(void)
+{
+    return test();
+}
+'''
+
+  if cc.links(prog, name: 'AVX2 buffer usage scan', args: test_c_args)
+    cdata.set('USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK', 1)
+  endif
+
+endif
+
+
+###############################################################
 # Check for the availability of AVX-512 popcount intrinsics.
 ###############################################################
 

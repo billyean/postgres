@@ -3,9 +3,9 @@
  * buf_usage_scan.h
  *	  Chunk-based scan and decrement helpers for BufferUsageMap.
  *
- *	  Patch 2: scalar-only implementations.
- *	  Patch 3 will add SIMD variants and swap the function pointers
- *	  at startup via InitUsageScanDispatch().
+ *	  Scalar reference implementations plus ISA-specific SIMD variants
+ *	  (SSE2, AVX2, NEON).  Dispatch is initialized lazily on first call;
+ *	  see InitUsageScanDispatch() in buf_usage_scan.c.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -21,8 +21,8 @@
 
 /*
  * Default chunk size for usage-map scanning.  Matches SSE2/NEON width (16
- * bytes).  Patch 3 may increase pg_usage_scan_chunk_size to 32 for AVX2
- * at runtime; this constant is the compile-time baseline.
+ * bytes).  pg_usage_scan_chunk_size is set to 32 for AVX2 at runtime;
+ * this constant is the compile-time baseline.
  */
 #define USAGE_SCAN_CHUNK_SIZE	16
 
@@ -40,13 +40,11 @@ typedef struct UsageScanResult
 
 /*
  * Function-pointer types for scan and decrement operations.
- * Patch 2 sets these to scalar implementations.
- * Patch 3 swaps them to SIMD at startup.
  */
 typedef UsageScanResult (*UsageScanFn)(const uint8_t *map, int count);
 typedef bool (*UsageDecrementFn)(uint8_t *map, int count);
 
-/* Global dispatch pointers — set once at startup, never changed after. */
+/* Global dispatch pointers — replaced from chooser stubs on first call. */
 extern PGDLLIMPORT UsageScanFn		pg_usage_scan;
 extern PGDLLIMPORT UsageDecrementFn	pg_usage_decrement;
 extern PGDLLIMPORT int				pg_usage_scan_chunk_size;

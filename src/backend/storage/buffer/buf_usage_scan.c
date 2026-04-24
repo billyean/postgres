@@ -1,10 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * buf_usage_scan.c
- *	  Scalar chunk-scan and chunk-decrement helpers for BufferUsageMap.
+ *	  Scalar chunk-scan and chunk-decrement helpers for BufferUsageMap,
+ *	  plus dispatch initialization and debug cross-check wrappers.
  *
- *	  Patch 2: scalar-only implementations and global dispatch pointers.
- *	  Patch 3 will add SIMD variants and swap these pointers at startup.
+ *	  The scalar implementations are the correctness reference.
+ *	  ISA-specific SIMD implementations live in separate source files
+ *	  (buf_usage_scan_sse2.c, buf_usage_scan_avx2.c, buf_usage_scan_neon.c).
+ *
+ *	  On first call, the chooser stubs invoke InitUsageScanDispatch() which
+ *	  detects CPU features and replaces the global function pointers with
+ *	  the best available implementation.  Subsequent calls go directly to
+ *	  the selected implementation with no dispatch overhead.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -16,11 +23,40 @@
  */
 #include "postgres.h"
 
+#include <string.h>
+
 #include "storage/buf_usage_scan.h"
 
-/* Global dispatch pointers — scalar in Patch 2, SIMD in Patch 3. */
-UsageScanFn		pg_usage_scan = usage_scan_scalar;
-UsageDecrementFn	pg_usage_decrement = usage_decrement_scalar;
+#ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
+#include "port/pg_cpu.h"
+#endif
+
+/*
+ * Forward declarations for ISA-specific implementations.
+ * These are defined in separate source files compiled conditionally.
+ */
+#ifdef USE_SSE2
+extern UsageScanResult usage_scan_sse2(const uint8_t *map, int count);
+extern bool usage_decrement_sse2(uint8_t *map, int count);
+#endif
+
+#ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
+extern UsageScanResult usage_scan_avx2(const uint8_t *map, int count);
+extern bool usage_decrement_avx2(uint8_t *map, int count);
+#endif
+
+#ifdef USE_NEON
+extern UsageScanResult usage_scan_neon(const uint8_t *map, int count);
+extern bool usage_decrement_neon(uint8_t *map, int count);
+#endif
+
+/* Chooser stubs — forward declarations */
+static UsageScanResult usage_scan_choose(const uint8_t *map, int count);
+static bool usage_decrement_choose(uint8_t *map, int count);
+
+/* Global dispatch pointers — chooser stubs until first call. */
+UsageScanFn		pg_usage_scan = usage_scan_choose;
+UsageDecrementFn	pg_usage_decrement = usage_decrement_choose;
 int				pg_usage_scan_chunk_size = USAGE_SCAN_CHUNK_SIZE;
 
 
@@ -30,7 +66,8 @@ int				pg_usage_scan_chunk_size = USAGE_SCAN_CHUNK_SIZE;
  * Scan 'count' bytes starting at 'map' and return a bitmask with bit i set
  * if map[i] == 0.  Bits beyond 'count' are guaranteed zero.
  *
- * This is the scalar reference implementation.  Patch 3 adds SIMD variants.
+ * This is the scalar reference implementation used as the correctness
+ * baseline and universal fallback.
  */
 UsageScanResult
 usage_scan_scalar(const uint8_t *map, int count)
@@ -78,4 +115,129 @@ usage_decrement_scalar(uint8_t *map, int count)
 	}
 
 	return decremented;
+}
+
+
+/* ----------------------------------------------------------------
+ *	Debug cross-check wrappers (assert-enabled builds only)
+ *
+ *	In debug builds, every SIMD scan/decrement call is verified against
+ *	the scalar reference.  The wrappers are installed by
+ *	InitUsageScanDispatch() and compiled out entirely in release builds.
+ * ----------------------------------------------------------------
+ */
+#ifdef USE_ASSERT_CHECKING
+
+static UsageScanFn		simd_scan_impl;
+static UsageDecrementFn	simd_decrement_impl;
+
+static UsageScanResult
+usage_scan_cross_check(const uint8_t *map, int count)
+{
+	UsageScanResult simd_result   = simd_scan_impl(map, count);
+	UsageScanResult scalar_result = usage_scan_scalar(map, count);
+
+	Assert(simd_result.zero_mask == scalar_result.zero_mask);
+	Assert(simd_result.count == scalar_result.count);
+
+	return simd_result;
+}
+
+static bool
+usage_decrement_cross_check(uint8_t *map, int count)
+{
+	uint8_t		simd_buf[32];
+	uint8_t		scalar_buf[32];
+	bool		simd_result;
+	bool		scalar_result;
+
+	/* Snapshot the live segment into two independent copies */
+	memcpy(simd_buf, map, count);
+	memcpy(scalar_buf, map, count);
+
+	/* Run both on local copies — immune to concurrent pinner races */
+	simd_result   = simd_decrement_impl(simd_buf, count);
+	scalar_result = usage_decrement_scalar(scalar_buf, count);
+
+	/* Validate: SIMD and scalar must agree on both output and return value */
+	Assert(simd_result == scalar_result);
+	Assert(memcmp(simd_buf, scalar_buf, count) == 0);
+
+	/* Apply the validated SIMD result to the live map */
+	if (simd_result)
+		memcpy(map, simd_buf, count);
+
+	return simd_result;
+}
+
+#endif							/* USE_ASSERT_CHECKING */
+
+
+/* ----------------------------------------------------------------
+ *	Dispatch initialization
+ * ----------------------------------------------------------------
+ */
+static void
+InitUsageScanDispatch(void)
+{
+	/* Default: scalar */
+	pg_usage_scan = usage_scan_scalar;
+	pg_usage_decrement = usage_decrement_scalar;
+	pg_usage_scan_chunk_size = USAGE_SCAN_CHUNK_SIZE;
+
+#if defined(__x86_64__) || defined(_M_AMD64)
+
+#ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
+	if (x86_feature_available(PG_AVX2))
+	{
+		pg_usage_scan = usage_scan_avx2;
+		pg_usage_decrement = usage_decrement_avx2;
+		pg_usage_scan_chunk_size = 32;
+	}
+	else
+#endif
+	{
+		pg_usage_scan = usage_scan_sse2;
+		pg_usage_decrement = usage_decrement_sse2;
+	}
+
+#elif defined(__aarch64__) || defined(_M_ARM64)
+
+	pg_usage_scan = usage_scan_neon;
+	pg_usage_decrement = usage_decrement_neon;
+
+#endif
+
+#ifdef USE_ASSERT_CHECKING
+	if (pg_usage_scan != usage_scan_scalar)
+	{
+		simd_scan_impl = pg_usage_scan;
+		simd_decrement_impl = pg_usage_decrement;
+		pg_usage_scan = usage_scan_cross_check;
+		pg_usage_decrement = usage_decrement_cross_check;
+	}
+#endif
+}
+
+
+/* ----------------------------------------------------------------
+ *	Chooser stubs
+ *
+ *	On first call, these trigger dispatch initialization and then
+ *	tail-call the selected implementation.  All subsequent calls go
+ *	directly to the selected function pointer.
+ * ----------------------------------------------------------------
+ */
+static UsageScanResult
+usage_scan_choose(const uint8_t *map, int count)
+{
+	InitUsageScanDispatch();
+	return pg_usage_scan(map, count);
+}
+
+static bool
+usage_decrement_choose(uint8_t *map, int count)
+{
+	InitUsageScanDispatch();
+	return pg_usage_decrement(map, count);
 }

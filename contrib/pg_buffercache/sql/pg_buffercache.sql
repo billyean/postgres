@@ -87,6 +87,28 @@ SELECT count(*) FROM churn_test;
 SELECT (SELECT sum(buffers) FROM pg_buffercache_usage_counts() WHERE usage_count > 0) > 0;
 DROP TABLE churn_test;
 
+-- Patch 3: SIMD kernel integration smoke test.
+-- When SIMD dispatch is active (SSE2, AVX2, or NEON), the scan and decrement
+-- kernels run through the SIMD fast paths on every victim search.  In assert
+-- builds, cross-check wrappers verify SIMD output matches scalar on every
+-- call.  This test forces enough eviction pressure to exercise multiple full
+-- sweeps of the buffer pool, including partial-chunk boundary handling.
+CREATE TABLE simd_eviction_test (id int, payload text);
+INSERT INTO simd_eviction_test
+    SELECT g, repeat('z', 500) FROM generate_series(1, 10000) g;
+-- Multiple scans force repeated victim search through SIMD scan/decrement
+SELECT count(*) FROM simd_eviction_test;
+SELECT count(*) FROM simd_eviction_test WHERE id % 3 = 0;
+-- Pool must remain consistent after heavy SIMD-path eviction
+SELECT count(*) = 0
+FROM pg_buffercache
+WHERE usagecount IS NOT NULL AND (usagecount < 0 OR usagecount > 5);
+SELECT sum(buffers) = (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers')
+FROM pg_buffercache_usage_counts();
+-- Usage distribution must not be degenerate after SIMD decrement sweeps
+SELECT (SELECT sum(buffers) FROM pg_buffercache_usage_counts() WHERE usage_count > 0) > 0;
+DROP TABLE simd_eviction_test;
+
 -- Check that the functions / views can't be accessed by default. To avoid
 -- having to create a dedicated user, use the pg_database_owner pseudo-role.
 SET ROLE pg_database_owner;
