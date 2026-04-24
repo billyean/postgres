@@ -12920,4 +12920,10 @@
   proname => 'epoch_xid_horizon_last_source', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_horizon_last_source' },
+
+{ oid => '9926',
+  descr => 'TEST-ONLY: report which call site last invoked the epoch MVCC visibility path',
+  proname => 'epoch_xid_mvcc_last_caller', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_mvcc_last_caller' },
 ]

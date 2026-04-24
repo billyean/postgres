@@ -1560,3 +1560,116 @@ BEGIN
 
 COMMIT
 DROP TABLE
+CREATE TABLE
+INSERT 0 1
+SET
+BEGIN
+ id |   val    
+----+----------
+  1 | p16_test
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+COMMIT
+RESET
+BEGIN
+ id |   val    
+----+----------
+  1 | p16_test
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_fetch
+(1 row)
+
+COMMIT
+SET
+BEGIN
+ id |   val    
+----+----------
+  1 | p16_test
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+ epoch_xid_horizon_last_source 
+-------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+COMMIT
+RESET
+ epoch_xid_stage1_force_disable 
+--------------------------------
+ 
+(1 row)
+
+SET
+BEGIN
+ id |   val    
+----+----------
+  1 | p16_test
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ materialized
+(1 row)
+
+COMMIT
+RESET
+ epoch_xid_stage1_force_disable 
+--------------------------------
+ 
+(1 row)
+
+INSERT 0 1
+UPDATE 1
+SET
+BEGIN
+   val   
+---------
+ updated
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+COMMIT
+RESET
+DROP TABLE

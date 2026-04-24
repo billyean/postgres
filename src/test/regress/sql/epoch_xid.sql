@@ -1769,3 +1769,110 @@ SELECT epoch_xid_horizon_last_source();
 COMMIT;
 
 DROP TABLE epoch_visfetch_p15src;
+
+-- ======================================================
+-- Patch 16: second real internal consumer — heap_hot_search_buffer()
+-- ======================================================
+--
+-- These tests prove that heap_hot_search_buffer() (index scan HOT chain
+-- traversal) is a second real consumer of the bounded epoch-aware bridge,
+-- distinct from the Patch 10 consumer (heap_fetch / TID scan).
+
+-- P16_a: Index scan uses heap_hot_search_buffer as epoch bridge consumer
+--
+-- Direct caller proof: epoch_xid_mvcc_last_caller() must report
+-- 'heap_hot_search_buffer' after an index scan on a materialized relation.
+
+CREATE TABLE epoch_p16 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p16 VALUES (1, 'p16_test');
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p16 WHERE id = 1;
+
+-- Direct proof: second consumer path
+SELECT epoch_xid_mvcc_last_caller();
+-- Epoch bridge was exercised
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P16_b: TID scan still uses heap_fetch — paths are distinct
+
+BEGIN;
+
+SELECT * FROM epoch_p16 WHERE ctid = '(0,1)';
+
+-- Must be 'heap_fetch' — proves the two consumers are distinguishable
+SELECT epoch_xid_mvcc_last_caller();
+
+COMMIT;
+
+-- P16_c: Index scan exercises full bounded bridge features
+--
+-- All Patch 11–15 bridge features must work through the second consumer.
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p16 WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_classify_last_horizon();
+SELECT epoch_xid_horizon_last_source();
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P16_d: Guard off disables 64-bit bridge but epoch path is still entered
+--
+-- With the Stage 1 guard force-disabled, the epoch function is still called
+-- (because the relation is materialized + MVCC snapshot), but the 64-bit
+-- bridge features are inactive.  The caller is still heap_hot_search_buffer.
+
+SELECT epoch_xid_stage1_force_disable(true);
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p16 WHERE id = 1;
+
+-- Caller is still heap_hot_search_buffer (epoch function was called)
+SELECT epoch_xid_mvcc_last_caller();
+-- But the 64-bit snapshot bridge was NOT used (guard off)
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+RESET enable_seqscan;
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P16_e: HOT chain traversal — update non-indexed column, query via index
+--
+-- Creates a real HOT chain by updating a non-indexed column.
+
+INSERT INTO epoch_p16 VALUES (2, 'original');
+UPDATE epoch_p16 SET val = 'updated' WHERE id = 2;
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT val FROM epoch_p16 WHERE id = 2;
+
+-- Must be 'heap_hot_search_buffer' — HOT chain traversal
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+DROP TABLE epoch_p16;

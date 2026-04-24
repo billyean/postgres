@@ -125,6 +125,30 @@ static bool epoch_bridge_force_reconstruct = false;
  */
 static char epoch_horizon_last_source = 'n';
 
+/*
+ * Test-only instrumentation: records which call site last invoked
+ * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
+ * the function, via EpochMVCCSetCaller().
+ *
+ * Values:
+ *   'n' = not called (initial)
+ *   'f' = heap_fetch (Patch 10 consumer: TID scan)
+ *   'h' = heap_hot_search_buffer (Patch 16 consumer: index scan HOT chain)
+ */
+static char epoch_mvcc_last_caller = 'n';
+
+/*
+ * EpochMVCCSetCaller -- set the test-only caller tag before invoking
+ * EpochHeapTupleSatisfiesMVCC.  Called from each consumer call site
+ * (heap_fetch, heap_hot_search_buffer) so that epoch_xid_mvcc_last_caller()
+ * can report which path exercised the bridge.
+ */
+void
+EpochMVCCSetCaller(char caller)
+{
+	epoch_mvcc_last_caller = caller;
+}
+
 /* Forward declaration: defined in the Phase 5 section, needed by Phase 4 */
 static inline FullTransactionId
 EpochFullXidRelativeTo(FullTransactionId ref, TransactionId xid);
@@ -3242,6 +3266,46 @@ epoch_xid_horizon_last_source(PG_FUNCTION_ARGS)
 			break;
 		default:
 			result = "not_used";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_mvcc_last_caller() -> text
+ *
+ * TEST-ONLY function.  Returns which call site last invoked
+ * EpochHeapTupleSatisfiesMVCC.  Each call site sets the caller tag
+ * via EpochMVCCSetCaller() before calling the function.
+ *
+ * Returns:
+ *   'heap_fetch'               - Patch 10 consumer (TID scan)
+ *   'heap_hot_search_buffer'   - Patch 16 consumer (index scan HOT chain)
+ *   'not_called'               - epoch path not entered
+ *
+ * This is the direct proof mechanism for Patch 16: it identifies which
+ * real internal consumer path exercised the epoch bridge, without
+ * relying on query-plan inference.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_mvcc_last_caller);
+
+Datum
+epoch_xid_mvcc_last_caller(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_mvcc_last_caller)
+	{
+		case 'f':
+			result = "heap_fetch";
+			break;
+		case 'h':
+			result = "heap_hot_search_buffer";
+			break;
+		default:
+			result = "not_called";
 			break;
 	}
 

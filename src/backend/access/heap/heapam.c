@@ -1765,6 +1765,7 @@ heap_fetch(Relation relation,
 	{
 		EpochMVCCResult epoch_result;
 
+		EpochMVCCSetCaller(EPOCH_CALLER_HEAP_FETCH);
 		epoch_result = EpochHeapTupleSatisfiesMVCC(relation, tuple,
 												   snapshot, buffer);
 		if (epoch_result == EPOCH_MVCC_CANNOT_DETERMINE)

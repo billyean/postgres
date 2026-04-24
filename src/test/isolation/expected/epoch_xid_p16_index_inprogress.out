@@ -1,0 +1,28 @@
+Parsed test spec with 2 sessions
+
+starting permutation: insert1 idx_scan check_caller check_membership check_path release1
+step insert1: BEGIN; INSERT INTO epoch_p16_inprog VALUES (1, 'uncommitted');
+step idx_scan: SELECT * FROM epoch_p16_inprog WHERE id = 1;
+id|val
+--+---
+(0 rows)
+
+step check_caller: SELECT epoch_xid_mvcc_last_caller();
+epoch_xid_mvcc_last_caller
+--------------------------
+heap_hot_search_buffer    
+(1 row)
+
+step check_membership: SELECT epoch_xid_classify_last_membership();
+epoch_xid_classify_last_membership
+----------------------------------
+not_called                        
+(1 row)
+
+step check_path: SELECT epoch_xid_mvcc_last_path();
+epoch_xid_mvcc_last_path
+------------------------
+snapshot_bridge         
+(1 row)
+
+step release1: ROLLBACK;

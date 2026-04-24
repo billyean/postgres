@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/epoch_xid.h"
 #include "access/relscan.h"
 #include "storage/predicate.h"
 
@@ -174,8 +175,34 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 		 */
 		if (!skip)
 		{
-			/* If it's visible per the snapshot, we must return it */
-			valid = HeapTupleSatisfiesVisibility(heapTuple, snapshot, buffer);
+			/*
+			 * If it's visible per the snapshot, we must return it.
+			 *
+			 * Patch 16: second real epoch-aware consumer.  For materialized
+			 * relations with MVCC snapshots, use the epoch path first.  This
+			 * proves the bounded bridge is reusable beyond heap_fetch().
+			 * The integration pattern is identical to the heap_fetch() branch.
+			 */
+			if (EpochRelationIsMaterialized(relation) &&
+				snapshot->snapshot_type == SNAPSHOT_MVCC)
+			{
+				EpochMVCCResult epoch_result;
+
+				EpochMVCCSetCaller(EPOCH_CALLER_HEAP_HOT_SEARCH);
+				epoch_result = EpochHeapTupleSatisfiesMVCC(relation,
+														   heapTuple,
+														   snapshot, buffer);
+				if (epoch_result == EPOCH_MVCC_CANNOT_DETERMINE)
+					valid = HeapTupleSatisfiesVisibility(heapTuple, snapshot,
+														 buffer);
+				else
+					valid = (epoch_result == EPOCH_MVCC_VISIBLE);
+			}
+			else
+			{
+				valid = HeapTupleSatisfiesVisibility(heapTuple, snapshot,
+													 buffer);
+			}
 			HeapCheckForSerializableConflictOut(valid, relation, heapTuple,
 												buffer, snapshot);
 
