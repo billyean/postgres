@@ -619,39 +619,82 @@ CopySnapshot(Snapshot snapshot)
 	if (snapshot->subxcnt > 0)
 		size += snapshot->subxcnt * sizeof(TransactionId);
 
-	newsnap = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
-	memcpy(newsnap, snapshot, sizeof(SnapshotData));
-
-	newsnap->regd_count = 0;
-	newsnap->active_count = 0;
-	newsnap->copied = true;
-	newsnap->snapXactCompletionCount = 0;
-
-	/* setup XID array */
-	if (snapshot->xcnt > 0)
-	{
-		newsnap->xip = (TransactionId *) (newsnap + 1);
-		memcpy(newsnap->xip, snapshot->xip,
-			   snapshot->xcnt * sizeof(TransactionId));
-	}
-	else
-		newsnap->xip = NULL;
-
 	/*
-	 * Setup subXID array. Don't bother to copy it if it had overflowed,
-	 * though, because it's not used anywhere in that case. Except if it's a
-	 * snapshot taken during recovery; all the top-level XIDs are in subxip as
-	 * well in that case, so we mustn't lose them.
+	 * Patch 18: include space for pre-promoted 64-bit membership arrays.
+	 * Deep-copied into this block; owned by the copy.
 	 */
-	if (snapshot->subxcnt > 0 &&
-		(!snapshot->suboverflowed || snapshot->takenDuringRecovery))
 	{
-		newsnap->subxip = (TransactionId *) ((char *) newsnap + subxipoff);
-		memcpy(newsnap->subxip, snapshot->subxip,
-			   snapshot->subxcnt * sizeof(TransactionId));
+		Size		full_xip_off = size;
+
+		size += snapshot->xcnt * sizeof(FullTransactionId);
+		if (snapshot->subxcnt > 0)
+			size += snapshot->subxcnt * sizeof(FullTransactionId);
+
+		newsnap = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
+		memcpy(newsnap, snapshot, sizeof(SnapshotData));
+
+		newsnap->regd_count = 0;
+		newsnap->active_count = 0;
+		newsnap->copied = true;
+		newsnap->snapXactCompletionCount = 0;
+
+		/* setup XID array */
+		if (snapshot->xcnt > 0)
+		{
+			newsnap->xip = (TransactionId *) (newsnap + 1);
+			memcpy(newsnap->xip, snapshot->xip,
+				   snapshot->xcnt * sizeof(TransactionId));
+		}
+		else
+			newsnap->xip = NULL;
+
+		/*
+		 * Setup subXID array. Don't bother to copy it if it had overflowed,
+		 * though, because it's not used anywhere in that case. Except if it's a
+		 * snapshot taken during recovery; all the top-level XIDs are in subxip as
+		 * well in that case, so we mustn't lose them.
+		 */
+		if (snapshot->subxcnt > 0 &&
+			(!snapshot->suboverflowed || snapshot->takenDuringRecovery))
+		{
+			newsnap->subxip = (TransactionId *) ((char *) newsnap + subxipoff);
+			memcpy(newsnap->subxip, snapshot->subxip,
+				   snapshot->subxcnt * sizeof(TransactionId));
+		}
+		else
+			newsnap->subxip = NULL;
+
+		/*
+		 * Patch 18: deep-copy pre-promoted 64-bit membership arrays.
+		 * These are valid only when the source has non-NULL arrays.
+		 */
+		if (snapshot->epoch_bridge.full_xip != NULL && snapshot->xcnt > 0)
+		{
+			newsnap->epoch_bridge.full_xip =
+				(FullTransactionId *) ((char *) newsnap + full_xip_off);
+			memcpy(newsnap->epoch_bridge.full_xip,
+				   snapshot->epoch_bridge.full_xip,
+				   snapshot->xcnt * sizeof(FullTransactionId));
+		}
+		else
+			newsnap->epoch_bridge.full_xip = NULL;
+
+		if (snapshot->epoch_bridge.full_subxip != NULL &&
+			snapshot->subxcnt > 0 &&
+			(!snapshot->suboverflowed || snapshot->takenDuringRecovery))
+		{
+			Size	full_subxip_off = full_xip_off +
+				snapshot->xcnt * sizeof(FullTransactionId);
+
+			newsnap->epoch_bridge.full_subxip =
+				(FullTransactionId *) ((char *) newsnap + full_subxip_off);
+			memcpy(newsnap->epoch_bridge.full_subxip,
+				   snapshot->epoch_bridge.full_subxip,
+				   snapshot->subxcnt * sizeof(FullTransactionId));
+		}
+		else
+			newsnap->epoch_bridge.full_subxip = NULL;
 	}
-	else
-		newsnap->subxip = NULL;
 
 	return newsnap;
 }

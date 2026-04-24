@@ -240,6 +240,23 @@ typedef struct SnapshotData
 		FullTransactionId anchor;
 		FullTransactionId full_xmin;
 		FullTransactionId full_xmax;
+
+		/*
+		 * Patch 18: pre-promoted membership arrays.  Parallel to the 32-bit
+		 * xip[]/subxip[] arrays, each entry promoted via FullXidRelativeTo
+		 * at snapshot acquisition time.  Consumers read these directly
+		 * instead of calling EpochFullXidRelativeTo per entry per tuple.
+		 *
+		 * Ownership:
+		 *   Static snapshots: malloc'd once, reused (session lifetime).
+		 *   Copied snapshots: deep-copied into the palloc block (owned).
+		 *   Special/imported: NULL (consumers fall back to reconstruction).
+		 *
+		 * Validity: non-NULL iff all xcnt/subxcnt entries are populated.
+		 * Partial population is forbidden.
+		 */
+		FullTransactionId *full_xip;
+		FullTransactionId *full_subxip;
 	}			epoch_bridge;
 } SnapshotData;
 

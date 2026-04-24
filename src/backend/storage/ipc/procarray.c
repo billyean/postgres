@@ -2161,6 +2161,23 @@ GetSnapshotData(Snapshot snapshot)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory")));
+
+		/*
+		 * Patch 18: allocate parallel 64-bit membership arrays.
+		 * Same sizing as xip/subxip; owned by this static snapshot object.
+		 */
+		snapshot->epoch_bridge.full_xip = (FullTransactionId *)
+			malloc(GetMaxSnapshotXidCount() * sizeof(FullTransactionId));
+		if (snapshot->epoch_bridge.full_xip == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+		snapshot->epoch_bridge.full_subxip = (FullTransactionId *)
+			malloc(GetMaxSnapshotSubxidCount() * sizeof(FullTransactionId));
+		if (snapshot->epoch_bridge.full_subxip == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
 	}
 
 	/*
@@ -2260,7 +2277,13 @@ GetSnapshotData(Snapshot snapshot)
 				xmin = xid;
 
 			/* Add XID to snapshot. */
-			xip[count++] = xid;
+			xip[count] = xid;
+
+			/* Patch 18: pre-promote to 64-bit in parallel array */
+			snapshot->epoch_bridge.full_xip[count] =
+				FullXidRelativeTo(latest_completed, xid);
+
+			count++;
 
 			/*
 			 * Save subtransaction XIDs if possible (if we've already
@@ -2296,6 +2319,13 @@ GetSnapshotData(Snapshot snapshot)
 						memcpy(snapshot->subxip + subcount,
 							   proc->subxids.xids,
 							   nsubxids * sizeof(TransactionId));
+
+						/* Patch 18: pre-promote subxip entries to 64-bit */
+						for (int k = 0; k < nsubxids; k++)
+							snapshot->epoch_bridge.full_subxip[subcount + k] =
+								FullXidRelativeTo(latest_completed,
+												  proc->subxids.xids[k]);
+
 						subcount += nsubxids;
 					}
 				}

@@ -1,0 +1,30 @@
+Parsed test spec with 2 sessions
+
+starting permutation: begin_hold declare_cur fetch_cur check_source check_path close_cur release_hold
+step begin_hold: BEGIN; SELECT txid_current() IS NOT NULL AS has_xid;
+has_xid
+-------
+t      
+(1 row)
+
+step declare_cur: BEGIN; DECLARE epoch_cur CURSOR FOR SELECT * FROM epoch_p18_copy WHERE ctid = '(0,1)';
+step fetch_cur: FETCH NEXT FROM epoch_cur;
+id|val      
+--+---------
+ 1|copy_test
+(1 row)
+
+step check_source: SELECT epoch_xid_bridge_last_source();
+epoch_xid_bridge_last_source
+----------------------------
+precomputed                 
+(1 row)
+
+step check_path: SELECT epoch_xid_mvcc_last_path();
+epoch_xid_mvcc_last_path
+------------------------
+snapshot_bridge         
+(1 row)
+
+step close_cur: CLOSE epoch_cur; COMMIT;
+step release_hold: COMMIT;

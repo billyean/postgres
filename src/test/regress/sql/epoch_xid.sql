@@ -1974,3 +1974,76 @@ COMMIT;
 RESET enable_seqscan;
 
 DROP TABLE epoch_p16;
+
+-- ======================================================
+-- Patch 18: pre-promoted snapshot membership arrays
+-- ======================================================
+--
+-- These tests prove that FullXidInMVCCSnapshot now reads pre-promoted
+-- full_xip[]/full_subxip[] directly instead of calling
+-- EpochFullXidRelativeTo per entry per tuple.
+
+-- P18_a: Precomputed membership arrays are used
+--
+-- A committed tuple causes FullXidInMVCCSnapshot to be called in Phase 5.
+-- The bridge_last_source must report 'precomputed', proving the
+-- pre-promoted arrays were consumed (not per-entry reconstruction).
+
+CREATE TABLE epoch_p18 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p18 VALUES (1, 'membership_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p18 WHERE ctid = '(0,1)';
+
+-- Precomputed path: boundaries AND membership arrays from acquisition time
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+-- P18_b: Forced reconstruction still works as fallback
+--
+-- The force_bridge_reconstruct override disables precomputed arrays.
+-- The same visibility result must be produced via per-entry reconstruction.
+
+SELECT epoch_xid_force_bridge_reconstruct(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p18 WHERE ctid = '(0,1)';
+
+-- Must report 'reconstructed' — per-entry fallback
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_force_bridge_reconstruct(false);
+
+-- P18_c: Parity — both paths produce same result
+--
+-- After restoring normal mode, precomputed resumes.
+
+BEGIN;
+
+SELECT * FROM epoch_p18 WHERE ctid = '(0,1)';
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+-- P18_d: Index scan also uses precomputed membership arrays
+--
+-- The second consumer path (heap_hot_search_buffer) must also benefit.
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p18 WHERE id = 1;
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+DROP TABLE epoch_p18;

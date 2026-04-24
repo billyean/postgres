@@ -1,0 +1,31 @@
+Parsed test spec with 2 sessions
+
+starting permutation: begin1 savepoint1 insert_sub begin2 commit1 tid_scan check_source check_path commit2
+step begin1: BEGIN;
+step savepoint1: SAVEPOINT sp1;
+step insert_sub: INSERT INTO epoch_p18_subxip VALUES (1, 'from_subtxn');
+step begin2: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;
+?column?
+--------
+       1
+(1 row)
+
+step commit1: COMMIT;
+step tid_scan: SELECT * FROM epoch_p18_subxip WHERE ctid = '(0,1)';
+id|val
+--+---
+(0 rows)
+
+step check_source: SELECT epoch_xid_bridge_last_source();
+epoch_xid_bridge_last_source
+----------------------------
+precomputed                 
+(1 row)
+
+step check_path: SELECT epoch_xid_mvcc_last_path();
+epoch_xid_mvcc_last_path
+------------------------
+snapshot_bridge         
+(1 row)
+
+step commit2: COMMIT;

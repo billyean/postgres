@@ -1776,3 +1776,71 @@ BEGIN
 COMMIT
 RESET
 DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ id |       val       
+----+-----------------
+  1 | membership_test
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+COMMIT
+ epoch_xid_force_bridge_reconstruct 
+------------------------------------
+ 
+(1 row)
+
+BEGIN
+ id |       val       
+----+-----------------
+  1 | membership_test
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ reconstructed
+(1 row)
+
+COMMIT
+ epoch_xid_force_bridge_reconstruct 
+------------------------------------
+ 
+(1 row)
+
+BEGIN
+ id |       val       
+----+-----------------
+  1 | membership_test
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+COMMIT
+SET
+BEGIN
+ id |       val       
+----+-----------------
+  1 | membership_test
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+COMMIT
+RESET
+DROP TABLE

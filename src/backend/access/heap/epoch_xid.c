@@ -1475,37 +1475,72 @@ FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
 
 	/*
 	 * Check subxip array (if not overflowed).
-	 * Promote each 32-bit entry to 64-bit via the anchor.
+	 *
+	 * Patch 18: use pre-promoted full_subxip[] when available, avoiding
+	 * per-entry EpochFullXidRelativeTo reconstruction.
 	 */
 	if (!snapshot->suboverflowed)
 	{
 		int32		j;
 
-		for (j = 0; j < snapshot->subxcnt; j++)
+		if (!epoch_bridge_force_reconstruct &&
+			snapshot->epoch_bridge.full_subxip != NULL)
 		{
-			FullTransactionId full_subxid =
-				EpochFullXidRelativeTo(anchor, snapshot->subxip[j]);
-
-			if (FullTransactionIdEquals(full_subxid, fxid))
-				return true;
+			for (j = 0; j < snapshot->subxcnt; j++)
+			{
+				if (FullTransactionIdEquals(
+						snapshot->epoch_bridge.full_subxip[j], fxid))
+					return true;
+			}
 		}
-		/* fxid is not a known-running subtransaction in this range */
+		else
+		{
+			for (j = 0; j < snapshot->subxcnt; j++)
+			{
+				FullTransactionId full_subxid =
+					EpochFullXidRelativeTo(anchor, snapshot->subxip[j]);
+
+				if (FullTransactionIdEquals(full_subxid, fxid))
+					return true;
+			}
+		}
 	}
 
-	/* Check main xip array */
-	for (i = 0; i < snapshot->xcnt; i++)
+	/*
+	 * Check main xip array.
+	 *
+	 * Patch 18: use pre-promoted full_xip[] when available.
+	 */
+	if (!epoch_bridge_force_reconstruct &&
+		snapshot->epoch_bridge.full_xip != NULL)
 	{
-		FullTransactionId full_xip =
-			EpochFullXidRelativeTo(anchor, snapshot->xip[i]);
+		for (i = 0; i < snapshot->xcnt; i++)
+		{
+			if (FullTransactionIdEquals(
+					snapshot->epoch_bridge.full_xip[i], fxid))
+				return true;
+		}
+	}
+	else
+	{
+		for (i = 0; i < snapshot->xcnt; i++)
+		{
+			FullTransactionId full_xip =
+				EpochFullXidRelativeTo(anchor, snapshot->xip[i]);
 
-		if (FullTransactionIdEquals(full_xip, fxid))
-			return true;
+			if (FullTransactionIdEquals(full_xip, fxid))
+				return true;
+		}
 	}
 
 	/*
 	 * If subxip overflowed, check whether fxid's toplevel parent is in xip.
 	 * SubTransGetTopmostTransaction uses 32-bit XID, which is correct for
 	 * Stage 1 (epoch-0 operation).
+	 *
+	 * Note: the parent XID is determined at runtime, so it cannot be
+	 * pre-promoted.  We still use the anchor for reconstruction here,
+	 * but use the pre-promoted xip[] for the comparison loop when available.
 	 */
 	if (snapshot->suboverflowed)
 	{
@@ -1513,13 +1548,26 @@ FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
 		TransactionId parentXid = SubTransGetTopmostTransaction(xid32);
 		FullTransactionId full_parent = EpochFullXidRelativeTo(anchor, parentXid);
 
-		for (i = 0; i < snapshot->xcnt; i++)
+		if (!epoch_bridge_force_reconstruct &&
+			snapshot->epoch_bridge.full_xip != NULL)
 		{
-			FullTransactionId full_xip =
-				EpochFullXidRelativeTo(anchor, snapshot->xip[i]);
+			for (i = 0; i < snapshot->xcnt; i++)
+			{
+				if (FullTransactionIdEquals(
+						snapshot->epoch_bridge.full_xip[i], full_parent))
+					return true;
+			}
+		}
+		else
+		{
+			for (i = 0; i < snapshot->xcnt; i++)
+			{
+				FullTransactionId full_xip =
+					EpochFullXidRelativeTo(anchor, snapshot->xip[i]);
 
-			if (FullTransactionIdEquals(full_xip, full_parent))
-				return true;
+				if (FullTransactionIdEquals(full_xip, full_parent))
+					return true;
+			}
 		}
 	}
 

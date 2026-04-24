@@ -16,7 +16,7 @@ heap_hot_search_buffer
 step check_membership: SELECT epoch_xid_classify_last_membership();
 epoch_xid_classify_last_membership
 ----------------------------------
-not_called                        
+64bit_membership                  
 (1 row)
 
 step check_path: SELECT epoch_xid_mvcc_last_path();

@@ -146,3 +146,5 @@ test: epoch_xid_fetch_snapshot
 test: epoch_xid_p14_horizon
 test: epoch_xid_p14_mxid_horizon
 test: epoch_xid_p16_index_inprogress
+test: epoch_xid_p18_subxip
+test: epoch_xid_p18_copy

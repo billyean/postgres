@@ -28,13 +28,13 @@ id|val
 step check_horizon_inprogress: SELECT epoch_xid_classify_last_horizon();
 epoch_xid_classify_last_horizon
 -------------------------------
-horizon_fastpath               
+not_used                       
 (1 row)
 
 step check_membership_inprogress: SELECT epoch_xid_classify_last_membership();
 epoch_xid_classify_last_membership
 ----------------------------------
-not_called                        
+64bit_membership                  
 (1 row)
 
 step release1: ROLLBACK;
