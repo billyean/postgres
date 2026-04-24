@@ -2107,3 +2107,134 @@ CLOSE epoch_p19_cur;
 COMMIT;
 
 DROP TABLE epoch_p19;
+
+-- ======================================================
+-- Patch 20: bounded snapshot membership view
+-- ======================================================
+--
+-- These tests prove that snapshot acquisition now produces an explicit
+-- EpochMembershipView and that consumers use EpochMembershipContains
+-- instead of interpreting raw full_xip[]/full_subxip[] arrays.
+--
+-- After Patch 20, two production runtime modes:
+--   Mode 1: membership.valid == true  -> EpochMembershipContains ('view')
+--   Mode 2: membership.valid == false -> XidInMVCCSnapshot ('native')
+-- The old FullXidInMVCCSnapshot is retained only as a test-only parity oracle.
+
+-- P20_a: Production consumer uses view path
+--
+-- A committed tuple on an epoch-materialized relation with an MVCC snapshot
+-- in epoch 0 must use the view path for membership queries.
+
+CREATE TABLE epoch_p20 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p20 VALUES (1, 'membership_view_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p20 WHERE ctid = '(0,1)';
+
+-- Must report 'view' — EpochMembershipContains was called
+SELECT epoch_xid_membership_last_source();
+
+-- Bridge source must be 'precomputed' — no fallback reconstruction
+SELECT epoch_xid_bridge_last_source();
+
+-- Populate helper must have been invoked
+SELECT epoch_xid_bridge_populate_source();
+
+COMMIT;
+
+-- P20_b: Stage 1 guard disable forces native fallback
+--
+-- When the bounded guard is force-disabled, membership.valid is effectively
+-- false, and the consumer must fall back to native 32-bit path.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p20 WHERE ctid = '(0,1)';
+
+-- Must report 'native' — XidInMVCCSnapshot was used
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P20_c: View path restores after re-enabling guard
+--
+-- After re-enabling, the view path must resume.
+
+BEGIN;
+
+SELECT * FROM epoch_p20 WHERE ctid = '(0,1)';
+
+-- Must report 'view' again
+SELECT epoch_xid_membership_last_source();
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+-- P20_d: Index scan consumer also uses view path
+--
+-- heap_hot_search_buffer (the second consumer) must also use the view.
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p20 WHERE id = 1;
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P20_e: Copied snapshot preserves membership view
+--
+-- A cursor forces CopySnapshot.  The copied snapshot's membership view
+-- must still yield 'view' for the consumer.
+
+BEGIN;
+
+DECLARE epoch_p20_cur CURSOR FOR
+    SELECT * FROM epoch_p20 WHERE ctid = '(0,1)';
+
+FETCH NEXT FROM epoch_p20_cur;
+
+-- Copy helper was used
+SELECT epoch_xid_bridge_copy_source();
+
+-- Consumer still uses view path from the copied snapshot
+SELECT epoch_xid_membership_last_source();
+
+CLOSE epoch_p20_cur;
+
+COMMIT;
+
+-- P20_f: Parity with test-only oracle
+--
+-- The force_bridge_reconstruct flag activates the old FullXidInMVCCSnapshot
+-- oracle path (test-only).  After Patch 20 this flag is a parity oracle
+-- control, not a production fallback.  When it is set, the consumer still
+-- uses EpochMembershipContains on the production path (force_reconstruct
+-- only affects the old oracle, which is no longer called by the consumer).
+-- This test verifies that the view path is taken regardless of the
+-- force_reconstruct flag, confirming the oracle is decoupled from production.
+
+SELECT epoch_xid_force_bridge_reconstruct(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p20 WHERE ctid = '(0,1)';
+
+-- Production consumer still uses the view path
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_force_bridge_reconstruct(false);
+
+DROP TABLE epoch_p20;

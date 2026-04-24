@@ -257,6 +257,24 @@ typedef struct SnapshotData
 		 */
 		FullTransactionId *full_xip;
 		FullTransactionId *full_subxip;
+
+		/*
+		 * Patch 20: bounded membership view.  Populated at acquisition
+		 * time by EpochMembershipViewPopulate().  Consumers query via
+		 * EpochMembershipContains() instead of interpreting raw arrays.
+		 */
+		struct EpochMembershipViewData
+		{
+			bool		valid;
+			FullTransactionId full_xmin;
+			FullTransactionId full_xmax;
+			FullTransactionId *full_xip;
+			uint32		xcnt;
+			FullTransactionId *full_subxip;
+			int32		subxcnt;
+			bool		suboverflowed;
+			FullTransactionId anchor;
+		}			membership;
 	}			epoch_bridge;
 } SnapshotData;
 

@@ -426,4 +426,47 @@ extern Size EpochBridgeCopySize(Snapshot snap);
 extern void EpochBridgeCopyArrays(Snapshot dest, Snapshot src,
 								  char *block, Size full_xip_off);
 
+/* ---------- Bounded membership view (Patch 20) ---------- */
+
+/*
+ * EpochMembershipView -- bounded snapshot-membership representation.
+ *
+ * The struct is defined inline in snapshot.h (as struct EpochMembershipViewData)
+ * to avoid circular header dependencies.  This typedef provides the
+ * canonical name used by all epoch_xid functions.
+ *
+ * Produced at snapshot acquisition time by EpochMembershipViewPopulate().
+ * Consumers call EpochMembershipContains() instead of directly interpreting
+ * the raw full_xip[]/full_subxip[] arrays and scattered SnapshotData fields.
+ *
+ * When valid == true, all fields are usable and EpochMembershipContains()
+ * is the production 64-bit membership path.  When valid == false, consumers
+ * fall back to the native 32-bit XidInMVCCSnapshot().
+ *
+ * Array pointers are borrowed from EpochSnapshotBridge (not owned).
+ * Lifetime: valid as long as the owning snapshot is valid.
+ */
+typedef struct EpochMembershipViewData EpochMembershipView;
+
+/*
+ * EpochMembershipContains -- production 64-bit membership query.
+ *
+ * Returns true if fxid is "in the snapshot" (in-progress at snapshot time).
+ * Operates entirely on the view; does not access Snapshot or bridge fields.
+ *
+ * Caller must ensure view->valid == true before calling.
+ */
+extern bool EpochMembershipContains(const EpochMembershipView *view,
+									FullTransactionId fxid);
+
+/*
+ * EpochMembershipViewPopulate -- populate the membership view from bridge state.
+ *
+ * Must be called after EpochBridgePopulate() and after the xip/subxip
+ * promotion loop has completed, so all borrowed fields are in their
+ * final state.
+ */
+extern void EpochMembershipViewPopulate(EpochMembershipView *view,
+										Snapshot snap);
+
 #endif							/* EPOCH_XID_H */

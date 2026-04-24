@@ -2468,6 +2468,12 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	EpochBridgePopulate(snapshot, latest_completed, xmin, xmax);
 
+	/*
+	 * Patch 20: populate bounded membership view from bridge state.
+	 * Must follow EpochBridgePopulate and the xip/subxip promotion loop.
+	 */
+	EpochMembershipViewPopulate(&snapshot->epoch_bridge.membership, snapshot);
+
 	snapshot->curcid = GetCurrentCommandId(false);
 
 	/*

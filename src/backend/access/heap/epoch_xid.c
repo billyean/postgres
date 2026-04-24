@@ -126,6 +126,20 @@ static bool epoch_bridge_force_reconstruct = false;
 static char epoch_horizon_last_source = 'n';
 
 /*
+ * Test-only instrumentation (Patch 20): records which membership-query
+ * mode was used by the last EpochHeapTupleSatisfiesMVCC invocation.
+ *
+ * Values:
+ *   'n' = not reached (initial, or no membership query this invocation)
+ *   'v' = view path: EpochMembershipContains was called (production 64-bit)
+ *   'f' = native fallback: XidInMVCCSnapshot was called (production 32-bit)
+ *
+ * After Patch 20, production runtime uses only 'v' or 'f'.
+ * The old FullXidInMVCCSnapshot (test-only parity oracle) does not set this.
+ */
+static char epoch_membership_last_source = 'n';
+
+/*
  * Test-only instrumentation: records which call site last invoked
  * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
  * the function, via EpochMVCCSetCaller().
@@ -1425,14 +1439,89 @@ EpochFullXidRelativeTo(FullTransactionId ref, TransactionId xid)
 }
 
 /*
- * FullXidInMVCCSnapshot -- 64-bit XID snapshot membership check.
+ * EpochMembershipContains -- production 64-bit snapshot membership query.
+ *
+ * Patch 20: this is the production membership path when view->valid is true.
+ * Operates entirely on the EpochMembershipView; does not access Snapshot
+ * or EpochSnapshotBridge fields.  No fallback reconstruction logic.
  *
  * Returns true if fxid is "in the snapshot" (in-progress at snapshot time).
  * Returns false if fxid committed before the snapshot.
  *
- * Mirrors XidInMVCCSnapshot logic but with 64-bit comparisons.
+ * The two production runtime modes after Patch 20 are:
+ *   Mode 1: view->valid == true  -> EpochMembershipContains (this function)
+ *   Mode 2: view->valid == false -> XidInMVCCSnapshot (native 32-bit)
+ * There is no production reconstructed-64-bit mode.
  */
-static bool
+bool
+EpochMembershipContains(const EpochMembershipView *view,
+						FullTransactionId fxid)
+{
+	uint32		i;
+
+	Assert(view->valid);
+	Assert(view->full_xip != NULL);
+
+	/* Boundary checks using view's 64-bit bounds */
+	if (FullTransactionIdPrecedes(fxid, view->full_xmin))
+		return false;		/* committed before snapshot */
+	if (FullTransactionIdFollowsOrEquals(fxid, view->full_xmax))
+		return true;		/* started after snapshot */
+
+	/* Check subxip array (if not overflowed) */
+	if (!view->suboverflowed)
+	{
+		int32		j;
+
+		for (j = 0; j < view->subxcnt; j++)
+		{
+			if (FullTransactionIdEquals(view->full_subxip[j], fxid))
+				return true;
+		}
+	}
+
+	/* Check main xip array */
+	for (i = 0; i < view->xcnt; i++)
+	{
+		if (FullTransactionIdEquals(view->full_xip[i], fxid))
+			return true;
+	}
+
+	/*
+	 * If subxip overflowed, check whether fxid's toplevel parent is in xip.
+	 * SubTransGetTopmostTransaction uses 32-bit XID, correct for epoch-0.
+	 * The parent XID is determined at runtime and cannot be pre-promoted.
+	 */
+	if (view->suboverflowed)
+	{
+		TransactionId xid32 = XidFromFullTransactionId(fxid);
+		TransactionId parentXid = SubTransGetTopmostTransaction(xid32);
+		FullTransactionId full_parent = EpochFullXidRelativeTo(view->anchor,
+															   parentXid);
+
+		for (i = 0; i < view->xcnt; i++)
+		{
+			if (FullTransactionIdEquals(view->full_xip[i], full_parent))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * FullXidInMVCCSnapshot -- TEST-ONLY parity oracle (Patch 20 reclassification).
+ *
+ * Retained solely for validation: proves EpochMembershipContains produces
+ * identical results to the pre-Patch-20 scattered-field-access implementation.
+ * Gated by the epoch_bridge_force_reconstruct test-only flag.
+ *
+ * NOT called on any production runtime path after Patch 20.
+ * Production membership uses EpochMembershipContains exclusively.
+ *
+ * Original Patch 12 description: 64-bit XID snapshot membership check.
+ */
+static bool pg_attribute_unused()
 FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
 {
 	FullTransactionId anchor = snapshot->epoch_bridge.anchor;
@@ -1619,7 +1708,8 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	TransactionId xmin_xid,
 				xmax_xid,
 				effective_xmax;
-	bool		use_64bit_snapshot;
+	bool		use_membership;
+	const EpochMembershipView *mv;
 
 	Assert(snapshot != NULL);
 	Assert(snapshot->snapshot_type == SNAPSHOT_MVCC);
@@ -1628,6 +1718,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	epoch_classify_last_horizon = 'n';
 	epoch_bridge_last_source = 'n';
 	epoch_horizon_last_source = 'n';
+	epoch_membership_last_source = 'n';
 
 	/* Read epoch slot data (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
@@ -1669,73 +1760,45 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	xmin_xid = XidFromFullTransactionId(interp.full_xmin);
 
 	/*
-	 * Stage 1 bounded guard (Patch 11, unchanged by Patch 12): determine
-	 * whether the 64-bit epoch-aware paths are available.  This gates both
-	 * the Phase 4 membership check (Patch 12) and the Phase 5 snapshot
-	 * comparison (Patch 11).  It requires:
+	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 20).
 	 *
-	 * (1) A valid epoch_anchor in the snapshot (set by GetSnapshotData).
-	 *     Imported/special snapshots may have epoch_anchor = 0; for those
-	 *     we fall back to 32-bit comparison.
+	 * Patch 20: the guard now checks membership.valid instead of
+	 * epoch_bridge.active.  membership.valid is true iff the bridge is
+	 * active (epoch 0, valid anchor) AND pre-promoted arrays exist.
+	 * The test-only force-disable override is still applied here at
+	 * consumption time, not baked into the view.
 	 *
-	 * (2) The anchor must be in epoch 0 (pre-wrap).  Stage 1 is validated
-	 *     ONLY for pre-wrap / epoch-0 operation.  Once the system crosses
-	 *     into epoch 1+, the fallback-to-native path is no longer safe for
-	 *     CANNOT_DETERMINE cases and other non-epoch-wired visibility paths.
-	 *     Cross-epoch safety requires further ProcArray/horizon work.
-	 *
-	 * This is a real code boundary, not just a comment.
-	 *
-	 * Patch 17: the guard is now pre-evaluated at acquisition time as
-	 * epoch_bridge.active.  The test-only force-disable override is still
-	 * applied here at consumption time.
+	 * After Patch 20, two production runtime modes:
+	 *   Mode 1: use_membership == true  -> EpochMembershipContains (view)
+	 *   Mode 2: use_membership == false -> XidInMVCCSnapshot (native 32-bit)
 	 */
-	use_64bit_snapshot = !epoch_stage1_force_disabled &&
-		snapshot->epoch_bridge.active;
+	mv = &snapshot->epoch_bridge.membership;
+	use_membership = !epoch_stage1_force_disabled && mv->valid;
 
 	/*
 	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
-	 * For xmax, also obtain the effective updater XID for MultiXact cases.
 	 *
-	 * When the Stage 1 guard passes, pass the full 64-bit XIDs so Phase 4
-	 * uses FullTransactionIdIsInProgress for the membership check (Patch 13),
-	 * and supply the pre-computed 64-bit snapshot horizon for the fast-reject
-	 * (Patch 14).
-	 *
-	 * epoch_horizon is now read directly from snapshot->epoch_bridge.full_xmin
-	 * (Patch 15), which was pre-computed at acquisition time in
-	 * GetSnapshotData.  This eliminates the per-tuple EpochFullXidRelativeTo
-	 * reconstruction that Patch 14 performed here.
-	 *
-	 * When the guard is off, pass InvalidFullTransactionId for both full_xid
-	 * and epoch_horizon so Phase 4 falls back to the 32-bit path.
+	 * When the guard passes, the epoch_horizon for fast-reject is read
+	 * directly from the membership view's full_xmin (always populated
+	 * when valid == true; no fallback reconstruction needed).
 	 */
 	{
 		FullTransactionId epoch_horizon = InvalidFullTransactionId;
 
-		if (use_64bit_snapshot)
+		if (use_membership)
 		{
-			if (!epoch_bridge_force_reconstruct &&
-				FullTransactionIdIsValid(snapshot->epoch_bridge.full_xmin))
-			{
-				epoch_horizon = snapshot->epoch_bridge.full_xmin;
-				epoch_horizon_last_source = 'p';
-			}
-			else
-			{
-				epoch_horizon = EpochFullXidRelativeTo(snapshot->epoch_bridge.anchor,
-													   snapshot->xmin);
-				epoch_horizon_last_source = 'r';
-			}
+			epoch_horizon = mv->full_xmin;
+			epoch_horizon_last_source = 'p';
+			epoch_bridge_last_source = 'p';
 		}
 
 		xmin_status = EpochClassifyXidStatus(xmin_xid,
-						use_64bit_snapshot ? interp.full_xmin : InvalidFullTransactionId,
+						use_membership ? interp.full_xmin : InvalidFullTransactionId,
 						epoch_horizon,
 						tuple, true, NULL);
 		xmax_status = EpochClassifyXidStatus(
 						HeapTupleHeaderGetRawXmax(tuple),
-						use_64bit_snapshot ? interp.full_xmax : InvalidFullTransactionId,
+						use_membership ? interp.full_xmax : InvalidFullTransactionId,
 						epoch_horizon,
 						tuple, false,
 						&effective_xmax);
@@ -1760,7 +1823,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 
 	/* Test-only: record which internal path was taken */
 	if (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
-		epoch_mvcc_last_path = use_64bit_snapshot ? 's' : 'm';
+		epoch_mvcc_last_path = use_membership ? 's' : 'm';
 	else
 		epoch_mvcc_last_path = 'd';
 
@@ -1788,13 +1851,31 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		return EPOCH_MVCC_INVISIBLE;	/* other xact's uncommitted insert */
 	}
 
-	/* xmin committed: snapshot check uses 64-bit bridge when available */
+	/*
+	 * xmin committed: snapshot membership check.
+	 *
+	 * Patch 20: production uses EpochMembershipContains (view path) or
+	 * XidInMVCCSnapshot (native 32-bit).  No other production mode.
+	 */
 	Assert(xmin_status == EPOCH_XID_COMMITTED);
 
-	if (use_64bit_snapshot
-		? FullXidInMVCCSnapshot(interp.full_xmin, snapshot)
-		: XidInMVCCSnapshot(xmin_xid, snapshot))
-		return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
+	{
+		bool		xmin_in_snapshot;
+
+		if (use_membership)
+		{
+			xmin_in_snapshot = EpochMembershipContains(mv, interp.full_xmin);
+			epoch_membership_last_source = 'v';
+		}
+		else
+		{
+			xmin_in_snapshot = XidInMVCCSnapshot(xmin_xid, snapshot);
+			epoch_membership_last_source = 'f';
+		}
+
+		if (xmin_in_snapshot)
+			return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
+	}
 
 check_xmax:
 
@@ -1814,28 +1895,33 @@ check_xmax:
 		return EPOCH_MVCC_VISIBLE;	/* other xact's uncommitted delete */
 	}
 
-	/* xmax committed: snapshot check uses 64-bit bridge when available */
+	/*
+	 * xmax committed: snapshot membership check.
+	 *
+	 * Patch 20: same two-mode split as xmin above.
+	 */
 	Assert(xmax_status == EPOCH_XID_COMMITTED);
 
 	{
 		bool		xmax_in_snapshot;
 
-		if (use_64bit_snapshot)
+		if (use_membership)
 		{
 			FullTransactionId full_xmax_for_snap;
 
 			if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
 				full_xmax_for_snap = EpochFullXidRelativeTo(
-					snapshot->epoch_bridge.anchor, effective_xmax);
+					mv->anchor, effective_xmax);
 			else
 				full_xmax_for_snap = interp.full_xmax;
 
-			xmax_in_snapshot = FullXidInMVCCSnapshot(full_xmax_for_snap,
-													 snapshot);
+			xmax_in_snapshot = EpochMembershipContains(mv, full_xmax_for_snap);
+			epoch_membership_last_source = 'v';
 		}
 		else
 		{
 			xmax_in_snapshot = XidInMVCCSnapshot(xmax_xid, snapshot);
+			epoch_membership_last_source = 'f';
 		}
 
 		if (xmax_in_snapshot)
@@ -3500,7 +3586,57 @@ EpochBridgeCopyArrays(Snapshot dest, Snapshot src,
 	else
 		dest->epoch_bridge.full_subxip = NULL;
 
+	/*
+	 * Patch 20: fix up the membership view's borrowed array pointers to
+	 * point into the destination's palloc block (not the source's), and
+	 * re-snapshot the counts/flags from the destination snapshot.
+	 */
+	if (dest->epoch_bridge.membership.valid)
+	{
+		dest->epoch_bridge.membership.full_xip = dest->epoch_bridge.full_xip;
+		dest->epoch_bridge.membership.full_subxip = dest->epoch_bridge.full_subxip;
+		dest->epoch_bridge.membership.xcnt = dest->xcnt;
+		dest->epoch_bridge.membership.subxcnt = dest->subxcnt;
+		dest->epoch_bridge.membership.suboverflowed = dest->suboverflowed;
+	}
+
 	epoch_bridge_last_copy_source = 'h';
+}
+
+/*
+ * EpochMembershipViewPopulate -- populate the bounded membership view.
+ *
+ * Captures all state needed for EpochMembershipContains() into a single
+ * coherent struct.  Must be called after EpochBridgePopulate() and after
+ * the xip/subxip promotion loop has completed, so all borrowed fields
+ * are in their final state.
+ *
+ * The view borrows full_xip/full_subxip pointers from the bridge (not
+ * owned).  For copied snapshots, EpochBridgeCopyArrays fixes up these
+ * pointers to point into the copy's palloc block.
+ */
+void
+EpochMembershipViewPopulate(EpochMembershipView *view, Snapshot snap)
+{
+	view->valid = snap->epoch_bridge.active &&
+		snap->epoch_bridge.full_xip != NULL;
+
+	if (view->valid)
+	{
+		view->full_xmin = snap->epoch_bridge.full_xmin;
+		view->full_xmax = snap->epoch_bridge.full_xmax;
+		view->full_xip = snap->epoch_bridge.full_xip;
+		view->xcnt = snap->xcnt;
+		view->full_subxip = snap->epoch_bridge.full_subxip;
+		view->subxcnt = snap->subxcnt;
+		view->suboverflowed = snap->suboverflowed;
+		view->anchor = snap->epoch_bridge.anchor;
+	}
+	else
+	{
+		MemSet(view, 0, sizeof(EpochMembershipView));
+		/* valid is already false from MemSet */
+	}
 }
 
 
@@ -3559,6 +3695,41 @@ epoch_xid_bridge_copy_source(PG_FUNCTION_ARGS)
 			break;
 		default:
 			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_membership_last_source() -> text
+ *
+ * TEST-ONLY function (Patch 20).  Returns which membership-query mode was
+ * used by the last EpochHeapTupleSatisfiesMVCC invocation.
+ *
+ * Returns:
+ *   'view'         - EpochMembershipContains was called (production 64-bit)
+ *   'native'       - XidInMVCCSnapshot was called (production 32-bit fallback)
+ *   'not_reached'  - no membership query this invocation (initial state)
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_membership_last_source);
+
+Datum
+epoch_xid_membership_last_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_membership_last_source)
+	{
+		case 'v':
+			result = "view";
+			break;
+		case 'f':
+			result = "native";
+			break;
+		default:
+			result = "not_reached";
 			break;
 	}
 

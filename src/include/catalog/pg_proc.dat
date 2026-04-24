@@ -12938,4 +12938,10 @@
   proname => 'epoch_xid_bridge_copy_source', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_bridge_copy_source' },
+
+{ oid => '9929',
+  descr => 'TEST-ONLY: report which membership-query mode was used (view vs native)',
+  proname => 'epoch_xid_membership_last_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_membership_last_source' },
 ]
