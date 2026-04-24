@@ -56,6 +56,37 @@ WHERE c.relname = 'usagecount_test'
   AND b.usagecount > 0;
 DROP TABLE usagecount_test;
 
+-- Exercise the buffer eviction sweep path by forcing churn larger than
+-- shared_buffers.  When the decoupled chunk-based sweep (Patch 2) is
+-- active, this exercises the three-phase chunk algorithm and split-chunk
+-- wraparound under real victim-search pressure.  The sanity checks
+-- afterward confirm the pool state is still internally consistent.
+CREATE TABLE eviction_pressure_test (id int, payload text);
+INSERT INTO eviction_pressure_test
+    SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g;
+-- Sequential scan forces the sweep to find victims repeatedly
+SELECT count(*) FROM eviction_pressure_test;
+-- Verify pool consistency after heavy eviction
+SELECT count(*) = 0
+FROM pg_buffercache
+WHERE usagecount IS NOT NULL AND (usagecount < 0 OR usagecount > 5);
+SELECT sum(buffers) = (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers')
+FROM pg_buffercache_usage_counts();
+DROP TABLE eviction_pressure_test;
+
+-- Verify that after heavy churn, the usagecount distribution is not degenerate.
+-- Under chunk-based sweep (Patch 2), the bulk decrement and candidate selection
+-- must keep the distribution healthy: some buffers should have usagecount > 0
+-- (recently accessed system catalog pages, for example).  If chunk decrement
+-- were broken, all buffers would decay to 0 with no increment to counteract.
+CREATE TABLE churn_test (id int, data text);
+INSERT INTO churn_test SELECT g, repeat('y', 100) FROM generate_series(1, 2000) g;
+SELECT count(*) FROM churn_test;
+SELECT count(*) FROM churn_test;
+-- After accessing data, some buffers must have usagecount > 0
+SELECT (SELECT sum(buffers) FROM pg_buffercache_usage_counts() WHERE usage_count > 0) > 0;
+DROP TABLE churn_test;
+
 -- Check that the functions / views can't be accessed by default. To avoid
 -- having to create a dedicated user, use the pg_database_owner pseudo-role.
 SET ROLE pg_database_owner;

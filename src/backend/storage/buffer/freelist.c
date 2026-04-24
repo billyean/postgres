@@ -17,7 +17,9 @@
 
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "port/pg_bitutils.h"
 #include "storage/buf_internals.h"
+#include "storage/buf_usage_scan.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
@@ -165,6 +167,165 @@ ClockSweepTick(void)
 	return victim;
 }
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+
+/*
+ * ClockSweepTickChunk - Chunk-based variant of ClockSweepTick().
+ *
+ * Move the clock hand 'chunk_size' buffers ahead of its current position and
+ * return the id of the buffer now under the hand.  The caller processes the
+ * range [returned_id, returned_id + chunk_size) modulo NBuffers, potentially
+ * split into a tail segment and a head segment.
+ *
+ * The wraparound and completePasses protocol is identical to ClockSweepTick();
+ * only the stride passed to fetch_add differs.
+ */
+static inline uint32
+ClockSweepTickChunk(int chunk_size)
+{
+	uint32		victim;
+
+	/*
+	 * Atomically move hand ahead by chunk_size buffers - if there's several
+	 * processes doing this, this can lead to buffers being returned slightly
+	 * out of apparent order.
+	 */
+	victim =
+		pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer,
+								chunk_size);
+
+	if (victim >= NBuffers)
+	{
+		uint32		originalVictim = victim;
+
+		/* always wrap what we look up in BufferDescriptors */
+		victim = victim % NBuffers;
+
+		/*
+		 * If we're the one that just caused a wraparound, force
+		 * completePasses to be incremented while holding the spinlock. We
+		 * need the spinlock so StrategySyncStart() can return a consistent
+		 * value consisting of nextVictimBuffer and completePasses.
+		 */
+		if (victim == 0)
+		{
+			uint32		expected;
+			uint32		wrapped;
+			bool		success = false;
+
+			expected = originalVictim + chunk_size;
+
+			while (!success)
+			{
+				/*
+				 * Acquire the spinlock while increasing completePasses. That
+				 * allows other readers to read nextVictimBuffer and
+				 * completePasses in a consistent manner which is required for
+				 * StrategySyncStart().  In theory delaying the increment
+				 * could lead to an overflow of nextVictimBuffers, but that's
+				 * highly unlikely and wouldn't be particularly harmful.
+				 */
+				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+
+				wrapped = expected % NBuffers;
+
+				success = pg_atomic_compare_exchange_u32(
+					&StrategyControl->nextVictimBuffer,
+					&expected, wrapped);
+				if (success)
+					StrategyControl->completePasses++;
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			}
+		}
+	}
+	return victim;
+}
+
+/*
+ * process_chunk_segment - Run phases 1-3 on one contiguous segment.
+ *
+ * Scans seg_count entries of BufferUsageMap starting at seg_map (physical
+ * buffer IDs starting at seg_base), validates zero-usage candidates against
+ * the hot state word, attempts to CAS-pin, then bulk-decrements non-zero
+ * entries.
+ *
+ * Returns a victim BufferDesc if one was pinned, or NULL.
+ * Sets *made_progress to true if Phase 3 decremented at least one entry.
+ */
+static BufferDesc *
+process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
+					  BufferAccessStrategy strategy, uint64 *buf_state_out,
+					  bool *made_progress)
+{
+	UsageScanResult scan;
+	uint32			mask;
+
+	Assert(seg_count > 0 && seg_count <= 32);
+
+	/* Phase 1: scan segment for zero-usage candidates */
+	scan = pg_usage_scan(seg_map, seg_count);
+	Assert((scan.zero_mask & ~usage_scan_valid_mask(seg_count)) == 0);
+
+	/* Phase 2: validate candidates against hot state, try to pin */
+	mask = scan.zero_mask;
+	while (mask != 0)
+	{
+		int			idx = pg_rightmost_one_pos32(mask);
+		int			buf_id = seg_base + idx;
+		BufferDesc *cand = GetBufferDescriptor(buf_id);
+		uint64		cand_state;
+
+		cand_state = pg_atomic_read_u64(&cand->state);
+
+		/*
+		 * Hot-state checks — must match the existing StrategyGetBuffer()
+		 * path.  Check refcount and BM_LOCKED only; BM_IO_IN_PROGRESS is
+		 * handled later by the caller via StartBufferIO().
+		 *
+		 * Settled Patch 2 policy: skip locked candidates rather than
+		 * waiting, because other candidates within the same chunk may be
+		 * available.  The locked buffer will be revisited on a future pass.
+		 */
+		if (BUF_STATE_GET_REFCOUNT(cand_state) == 0 &&
+			!(cand_state & BM_LOCKED))
+		{
+			uint64		new_state = cand_state + BUF_REFCOUNT_ONE;
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			AssertUsageCountDecoupled(cand_state);
+#endif
+
+			if (pg_atomic_compare_exchange_u64(&cand->state,
+											   &cand_state,
+											   new_state))
+			{
+				if (strategy != NULL)
+					AddBufferToRing(strategy, cand);
+				*buf_state_out = new_state;
+
+				TrackNewBufferPin(BufferDescriptorGetBuffer(cand));
+
+				return cand;
+			}
+		}
+
+		mask &= (mask - 1);		/* clear lowest set bit */
+	}
+
+	/*
+	 * Phase 3: bulk decrement non-zero entries.
+	 *
+	 * This runs after Phase 2 so that entries pinned in Phase 2 are not
+	 * pointlessly decremented.  The decrement is a plain store, not atomic —
+	 * same heuristic-level race as Patch 1 (see design doc Section 7.4).
+	 */
+	*made_progress = pg_usage_decrement(seg_map, seg_count);
+
+	return NULL;
+}
+
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
+
 /*
  * StrategyGetBuffer
  *
@@ -236,7 +397,69 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 	 */
 	pg_atomic_fetch_add_u32(&StrategyControl->numBufferAllocs, 1);
 
-	/* Use the "clock sweep" algorithm to find a free buffer */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	/*
+	 * Chunk-based clock sweep when decoupled usage_count is active (Patch 2).
+	 *
+	 * Instead of examining one buffer per tick, advance the clock hand by
+	 * effective_chunk positions and process the entire chunk in three phases:
+	 *   Phase 1 — scan map for zero-usage candidates (bitmask)
+	 *   Phase 2 — validate candidates against hot state, CAS-pin
+	 *   Phase 3 — bulk-decrement non-zero entries
+	 *
+	 * A logical chunk may span two physical segments when it crosses NBuffers.
+	 * Both segments are processed within the same loop iteration so that no
+	 * buffer position is skipped.
+	 */
+	if (enable_decoupled_usage_count)
+	{
+		int			effective_chunk = Min(pg_usage_scan_chunk_size, NBuffers);
+
+		trycounter = NBuffers;
+		for (;;)
+		{
+			uint32		start;
+			int			tail_count;
+			int			head_count;
+			bool		progress_tail = false;
+			bool		progress_head = false;
+
+			start = ClockSweepTickChunk(effective_chunk);
+			tail_count = Min(effective_chunk, NBuffers - (int) start);
+			head_count = effective_chunk - tail_count;
+			Assert(tail_count > 0 && tail_count <= effective_chunk);
+			Assert(head_count >= 0);
+			Assert(tail_count + head_count == effective_chunk);
+
+			/* Process tail segment: [start, start + tail_count) */
+			buf = process_chunk_segment(BufferUsageMap + start, (int) start,
+										tail_count, strategy, buf_state,
+										&progress_tail);
+			if (buf != NULL)
+				return buf;
+
+			/* Process head segment if the chunk wrapped: [0, head_count) */
+			if (head_count > 0)
+			{
+				buf = process_chunk_segment(BufferUsageMap, 0,
+											head_count, strategy, buf_state,
+											&progress_head);
+				if (buf != NULL)
+					return buf;
+			}
+
+			if (progress_tail || progress_head)
+				trycounter = NBuffers;
+			else
+				trycounter -= effective_chunk;
+
+			if (trycounter <= 0)
+				elog(ERROR, "no unpinned buffers available");
+		}
+	}
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
+
+	/* Per-buffer clock sweep — original path (upstream + Patch 1 fallback) */
 	trycounter = NBuffers;
 	for (;;)
 	{
@@ -264,13 +487,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			{
 				if (--trycounter == 0)
 				{
-					/*
-					 * We've scanned all the buffers without making any state
-					 * changes, so all the buffers are pinned (or were when we
-					 * looked at them). We could hope that someone will free
-					 * one eventually, but it's probably better to fail than
-					 * to risk getting stuck in an infinite loop.
-					 */
 					elog(ERROR, "no unpinned buffers available");
 				}
 				break;
@@ -283,63 +499,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 				continue;
 			}
 
-#ifdef USE_DECOUPLED_USAGE_COUNT
-			if (enable_decoupled_usage_count)
-			{
-				uint8_t		usage = BufUsageMapGet(buf->buf_id);
-
-				if (usage != 0)
-				{
-					/*
-					 * Decrement usage_count via plain store to the map, not
-					 * via state-word CAS.  This is an intentional semantic
-					 * weakening: the decrement is no longer serialized against
-					 * concurrent pin-path increments on the same byte.
-					 * Acceptable because usage_count is heuristic state.
-					 */
-					BufUsageMapDecrement(buf->buf_id);
-					trycounter = NBuffers;
-					break;
-				}
-				else
-				{
-					/*
-					 * usage_count == 0 in map.  Re-read state word for
-					 * freshness before attempting the pin CAS — another
-					 * backend may have pinned this buffer since our initial
-					 * read at the top of the inner loop.
-					 */
-					old_buf_state = pg_atomic_read_u64(&buf->state);
-					local_buf_state = old_buf_state;
-
-					if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
-						break;
-					if (unlikely(local_buf_state & BM_LOCKED))
-					{
-						old_buf_state = WaitBufHdrUnlocked(buf);
-						continue;
-					}
-
-					/* Pin via CAS on the state word — correctness path. */
-					local_buf_state += BUF_REFCOUNT_ONE;
-
-					if (pg_atomic_compare_exchange_u64(&buf->state,
-													   &old_buf_state,
-													   local_buf_state))
-					{
-						if (strategy != NULL)
-							AddBufferToRing(strategy, buf);
-						*buf_state = local_buf_state;
-
-						TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
-
-						return buf;
-					}
-				}
-			}
-			else
-			{
-#endif
 			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
 			{
 				local_buf_state -= BUF_USAGECOUNT_ONE;
@@ -369,9 +528,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 					return buf;
 				}
 			}
-#ifdef USE_DECOUPLED_USAGE_COUNT
-			}
-#endif
 		}
 	}
 }
