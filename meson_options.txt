@@ -46,6 +46,9 @@ option('tap_tests', type: 'feature', value: 'auto',
 option('injection_points', type: 'boolean', value: false,
   description: 'Enable injection points')
 
+option('decoupled_usage_count', type: 'boolean', value: false,
+  description: 'Enable decoupled buffer usage_count prototype (experimental)')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

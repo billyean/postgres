@@ -167,6 +167,10 @@ extern PGDLLIMPORT int bgwriter_lru_maxpages;
 extern PGDLLIMPORT double bgwriter_lru_multiplier;
 extern PGDLLIMPORT bool track_io_timing;
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+extern PGDLLIMPORT bool enable_decoupled_usage_count;
+#endif
+
 #define DEFAULT_EFFECTIVE_IO_CONCURRENCY 16
 #define DEFAULT_MAINTENANCE_IO_CONCURRENCY 16
 extern PGDLLIMPORT int effective_io_concurrency;

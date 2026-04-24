@@ -2324,12 +2324,21 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * checkpoints, except for their "init" forks, which need to be treated
 	 * just like permanent relations.
 	 */
-	set_bits |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
+	set_bits |= BM_TAG_VALID;
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	if (likely(!enable_decoupled_usage_count))
+#endif
+		set_bits |= BUF_USAGECOUNT_ONE;
 	if (relpersistence == RELPERSISTENCE_PERMANENT || forkNum == INIT_FORKNUM)
 		set_bits |= BM_PERMANENT;
 
 	UnlockBufHdrExt(victim_buf_hdr, victim_buf_state,
 					set_bits, 0, 0);
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	if (enable_decoupled_usage_count)
+		BufUsageMapSet(victim_buf_hdr->buf_id, 1);
+#endif
 
 	LWLockRelease(newPartitionLock);
 
@@ -2437,6 +2446,16 @@ retry:
 					BUF_FLAG_MASK | BUF_USAGECOUNT_MASK,
 					0);
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	/*
+	 * Zero the map entry.  This happens after the header unlock, but that is
+	 * fine: the buffer is no longer BM_TAG_VALID, so no sweep or pin path
+	 * will consult its usage_count.  A stale non-zero map value is harmless.
+	 */
+	if (enable_decoupled_usage_count)
+		BufUsageMapSet(buf->buf_id, 0);
+#endif
+
 	/*
 	 * Remove the buffer from the lookup hashtable, if it was in there.
 	 */
@@ -2519,6 +2538,12 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 					0,
 					BUF_FLAG_MASK | BUF_USAGECOUNT_MASK,
 					0);
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	/* See comment in InvalidateVictimBuffer about post-unlock map zeroing. */
+	if (enable_decoupled_usage_count)
+		BufUsageMapSet(buf_hdr->buf_id, 0);
+#endif
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 
@@ -2979,13 +3004,22 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 			victim_buf_hdr->tag = tag;
 
-			set_bits |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
+			set_bits |= BM_TAG_VALID;
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			if (likely(!enable_decoupled_usage_count))
+#endif
+				set_bits |= BUF_USAGECOUNT_ONE;
 			if (bmr.relpersistence == RELPERSISTENCE_PERMANENT || fork == INIT_FORKNUM)
 				set_bits |= BM_PERMANENT;
 
 			UnlockBufHdrExt(victim_buf_hdr, buf_state,
 							set_bits, 0,
 							0);
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			if (enable_decoupled_usage_count)
+				BufUsageMapSet(victim_buf_hdr->buf_id, 1);
+#endif
 
 			LWLockRelease(partition_lock);
 
@@ -3309,20 +3343,29 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 			/* increase refcount */
 			buf_state += BUF_REFCOUNT_ONE;
 
-			if (strategy == NULL)
+			/*
+			 * Bump usage_count in the state word, unless decoupled mode moves
+			 * it to BufferUsageMap (handled after CAS success below).
+			 */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			if (likely(!enable_decoupled_usage_count))
+#endif
 			{
-				/* Default case: increase usagecount unless already max. */
-				if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
-					buf_state += BUF_USAGECOUNT_ONE;
-			}
-			else
-			{
-				/*
-				 * Ring buffers shouldn't evict others from pool.  Thus we
-				 * don't make usagecount more than 1.
-				 */
-				if (BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
-					buf_state += BUF_USAGECOUNT_ONE;
+				if (strategy == NULL)
+				{
+					/* Default case: increase usagecount unless already max. */
+					if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
+						buf_state += BUF_USAGECOUNT_ONE;
+				}
+				else
+				{
+					/*
+					 * Ring buffers shouldn't evict others from pool.  Thus we
+					 * don't make usagecount more than 1.
+					 */
+					if (BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+						buf_state += BUF_USAGECOUNT_ONE;
+				}
 			}
 
 			if (pg_atomic_compare_exchange_u64(&buf->state, &old_buf_state,
@@ -3334,6 +3377,30 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 				break;
 			}
 		}
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+		/*
+		 * In decoupled mode, usage_count lives in BufferUsageMap.  Update it
+		 * after CAS success via a plain (non-atomic) store.  This is an
+		 * intentional semantic weakening: concurrent pinners and sweepers
+		 * can race on the same map byte.  Acceptable because usage_count
+		 * is heuristic state — lost updates shift eviction by at most one
+		 * sweep tick, and correctness is always validated against the
+		 * atomic state word.
+		 */
+		if (enable_decoupled_usage_count)
+		{
+			AssertUsageCountDecoupled(buf_state);
+
+			if (strategy == NULL)
+				BufUsageMapIncrement(buf->buf_id);
+			else
+			{
+				if (BufUsageMapGet(buf->buf_id) == 0)
+					BufUsageMapSet(buf->buf_id, 1);
+			}
+		}
+#endif
 	}
 	else
 	{
@@ -4148,16 +4215,25 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 */
 	buf_state = LockBufHdr(bufHdr);
 
-	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
-		BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
 	{
-		result |= BUF_REUSABLE;
-	}
-	else if (skip_recently_used)
-	{
-		/* Caller told us not to write recently-used buffers */
-		UnlockBufHdr(bufHdr);
-		return result;
+#ifdef USE_DECOUPLED_USAGE_COUNT
+		uint32		uc = enable_decoupled_usage_count
+			? BufUsageMapGet(bufHdr->buf_id)
+			: BUF_STATE_GET_USAGECOUNT(buf_state);
+#else
+		uint32		uc = BUF_STATE_GET_USAGECOUNT(buf_state);
+#endif
+
+		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 && uc == 0)
+		{
+			result |= BUF_REUSABLE;
+		}
+		else if (skip_recently_used)
+		{
+			/* Caller told us not to write recently-used buffers */
+			UnlockBufHdr(bufHdr);
+			return result;
+		}
 	}
 
 	if (!(buf_state & BM_VALID) || !(buf_state & BM_DIRTY))

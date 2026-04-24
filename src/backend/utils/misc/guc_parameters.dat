@@ -878,6 +878,14 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_decoupled_usage_count', type => 'bool', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Stores buffer usage_count in a separate array instead of the state word (experimental).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'enable_decoupled_usage_count',
+  boot_val => 'false',
+  ifdef => 'USE_DECOUPLED_USAGE_COUNT',
+},
+
 { name => 'enable_distinct_reordering', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables reordering of DISTINCT keys.',
   flags => 'GUC_EXPLAIN',

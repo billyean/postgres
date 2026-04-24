@@ -283,6 +283,63 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 				continue;
 			}
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			if (enable_decoupled_usage_count)
+			{
+				uint8_t		usage = BufUsageMapGet(buf->buf_id);
+
+				if (usage != 0)
+				{
+					/*
+					 * Decrement usage_count via plain store to the map, not
+					 * via state-word CAS.  This is an intentional semantic
+					 * weakening: the decrement is no longer serialized against
+					 * concurrent pin-path increments on the same byte.
+					 * Acceptable because usage_count is heuristic state.
+					 */
+					BufUsageMapDecrement(buf->buf_id);
+					trycounter = NBuffers;
+					break;
+				}
+				else
+				{
+					/*
+					 * usage_count == 0 in map.  Re-read state word for
+					 * freshness before attempting the pin CAS — another
+					 * backend may have pinned this buffer since our initial
+					 * read at the top of the inner loop.
+					 */
+					old_buf_state = pg_atomic_read_u64(&buf->state);
+					local_buf_state = old_buf_state;
+
+					if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
+						break;
+					if (unlikely(local_buf_state & BM_LOCKED))
+					{
+						old_buf_state = WaitBufHdrUnlocked(buf);
+						continue;
+					}
+
+					/* Pin via CAS on the state word — correctness path. */
+					local_buf_state += BUF_REFCOUNT_ONE;
+
+					if (pg_atomic_compare_exchange_u64(&buf->state,
+													   &old_buf_state,
+													   local_buf_state))
+					{
+						if (strategy != NULL)
+							AddBufferToRing(strategy, buf);
+						*buf_state = local_buf_state;
+
+						TrackNewBufferPin(BufferDescriptorGetBuffer(buf));
+
+						return buf;
+					}
+				}
+			}
+			else
+			{
+#endif
 			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
 			{
 				local_buf_state -= BUF_USAGECOUNT_ONE;
@@ -312,6 +369,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 					return buf;
 				}
 			}
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			}
+#endif
 		}
 	}
 }
@@ -661,9 +721,21 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint64 *buf_state)
 		 * A higher usage_count indicates someone else has touched the buffer,
 		 * so we shouldn't re-use it.
 		 */
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0
-			|| BUF_STATE_GET_USAGECOUNT(local_buf_state) > 1)
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) != 0)
 			break;
+
+		{
+#ifdef USE_DECOUPLED_USAGE_COUNT
+			uint32		uc = enable_decoupled_usage_count
+				? BufUsageMapGet(buf->buf_id)
+				: BUF_STATE_GET_USAGECOUNT(local_buf_state);
+#else
+			uint32		uc = BUF_STATE_GET_USAGECOUNT(local_buf_state);
+#endif
+
+			if (uc > 1)
+				break;
+		}
 
 		/* See equivalent code in PinBuffer() */
 		if (unlikely(local_buf_state & BM_LOCKED))

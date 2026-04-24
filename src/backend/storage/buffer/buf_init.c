@@ -27,6 +27,11 @@ ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+PGDLLIMPORT uint8_t *BufferUsageMap;
+PGDLLIMPORT bool enable_decoupled_usage_count = false;
+#endif
+
 static void BufferManagerShmemRequest(void *arg);
 static void BufferManagerShmemInit(void *arg);
 static void BufferManagerShmemAttach(void *arg);
@@ -108,6 +113,20 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(CkptSortItem),
 					   .ptr = (void **) &CkptBufferIds,
 		);
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	/*
+	 * Allocate BufferUsageMap unconditionally when compiled in.  The runtime
+	 * GUC enable_decoupled_usage_count controls whether the map is actually
+	 * used for behavior; this avoids needing GUC-conditional shared memory
+	 * sizing.  Cost is NBuffers bytes (e.g. 16 MB for 128 GB shared_buffers).
+	 */
+	ShmemRequestStruct(.name = "Buffer Usage Map",
+					   .size = NBuffers * sizeof(uint8_t),
+					   .alignment = PG_CACHE_LINE_SIZE,
+					   .ptr = (void **) &BufferUsageMap,
+		);
+#endif
 }
 
 /*
@@ -138,6 +157,11 @@ BufferManagerShmemInit(void *arg)
 		proclist_init(&buf->lock_waiters);
 		ConditionVariableInit(BufferDescriptorGetIOCV(buf));
 	}
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	/* Zero-init the usage map; all buffers start at usage_count=0 */
+	memset(BufferUsageMap, 0, NBuffers * sizeof(uint8_t));
+#endif
 
 	/* Initialize per-backend file flush context */
 	WritebackContextInit(&BackendWritebackContext,

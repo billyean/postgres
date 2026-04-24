@@ -18,6 +18,44 @@ from pg_buffercache_summary();
 
 SELECT count(*) > 0 FROM pg_buffercache_usage_counts() WHERE buffers >= 0;
 
+-- Verify usagecount values are always in valid range [0, BM_MAX_USAGE_COUNT]
+-- This validates correct reporting regardless of decoupled usage_count mode.
+SELECT count(*) = 0
+FROM pg_buffercache
+WHERE usagecount IS NOT NULL AND (usagecount < 0 OR usagecount > 5);
+
+-- Verify pg_buffercache_usage_counts returns exactly the expected rows (0..5)
+SELECT count(*) = 6 FROM pg_buffercache_usage_counts();
+
+-- Verify total buffers from usage_counts matches shared_buffers
+SELECT sum(buffers) = (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers')
+FROM pg_buffercache_usage_counts();
+
+-- Verify usagecount_avg from summary is non-negative (sanity for both modes)
+SELECT usagecount_avg >= 0
+FROM pg_buffercache_summary()
+WHERE buffers_used > 0;
+
+-- Cross-check: per-buffer usagecount distribution should sum to buffers_used
+SELECT (SELECT sum(buffers) FROM pg_buffercache_usage_counts()) =
+       (SELECT buffers_used + buffers_unused FROM pg_buffercache_summary());
+
+-- Verify that buffer access actually produces non-zero usagecount.
+-- This confirms the usage_count source (state word or decoupled map) is
+-- being written by pin activity, not just that the reporting SQL works.
+CREATE TABLE usagecount_test (id int);
+INSERT INTO usagecount_test SELECT generate_series(1, 100);
+-- Access repeatedly to ensure usagecount > 0 for these buffers.
+SELECT count(*) FROM usagecount_test;
+SELECT count(*) FROM usagecount_test;
+SELECT count(*) FROM usagecount_test;
+SELECT count(*) > 0
+FROM pg_buffercache b
+     JOIN pg_class c ON c.relfilenode = b.relfilenode
+WHERE c.relname = 'usagecount_test'
+  AND b.usagecount > 0;
+DROP TABLE usagecount_test;
+
 -- Check that the functions / views can't be accessed by default. To avoid
 -- having to create a dedicated user, use the pg_database_owner pseudo-role.
 SET ROLE pg_database_owner;

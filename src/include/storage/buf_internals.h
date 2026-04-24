@@ -146,6 +146,78 @@ StaticAssertDecl(MAX_BACKENDS_BITS <= (BUF_LOCK_BITS - 2),
 StaticAssertDecl(BM_MAX_USAGE_COUNT < (UINT64CONST(1) << BUF_USAGECOUNT_BITS),
 				 "BM_MAX_USAGE_COUNT doesn't fit in BUF_USAGECOUNT_BITS bits");
 
+
+/*
+ * Decoupled usage_count support (experimental prototype).
+ *
+ * When USE_DECOUPLED_USAGE_COUNT is defined and enable_decoupled_usage_count
+ * is true, usage_count is stored in a separate dense uint8 array
+ * (BufferUsageMap) rather than in the BufferDesc.state word.  The state-word
+ * usage_count bits (18-21) are kept permanently zero.
+ *
+ * All per-buffer usage_count access must go through these accessors.
+ * Direct indexing of BufferUsageMap[] is reserved for the accessor
+ * implementations and future SIMD scan paths (Patches 2-3).
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+
+extern PGDLLIMPORT uint8_t *BufferUsageMap;
+extern PGDLLIMPORT bool enable_decoupled_usage_count;
+
+static inline uint8_t
+BufUsageMapGet(int buf_id)
+{
+	Assert(buf_id >= 0 && buf_id < NBuffers);
+	Assert(BufferUsageMap != NULL);
+	return BufferUsageMap[buf_id];
+}
+
+static inline void
+BufUsageMapSet(int buf_id, uint8_t val)
+{
+	Assert(buf_id >= 0 && buf_id < NBuffers);
+	Assert(BufferUsageMap != NULL);
+	Assert(val <= BM_MAX_USAGE_COUNT);
+	BufferUsageMap[buf_id] = val;
+}
+
+static inline void
+BufUsageMapIncrement(int buf_id)
+{
+	uint8_t		cur;
+
+	Assert(buf_id >= 0 && buf_id < NBuffers);
+	Assert(BufferUsageMap != NULL);
+	cur = BufferUsageMap[buf_id];
+	if (cur < BM_MAX_USAGE_COUNT)
+		BufferUsageMap[buf_id] = cur + 1;
+}
+
+static inline void
+BufUsageMapDecrement(int buf_id)
+{
+	uint8_t		cur;
+
+	Assert(buf_id >= 0 && buf_id < NBuffers);
+	Assert(BufferUsageMap != NULL);
+	cur = BufferUsageMap[buf_id];
+	if (cur > 0)
+		BufferUsageMap[buf_id] = cur - 1;
+}
+
+/*
+ * Assert that the state-word usage_count bits are zero.  Use this after
+ * reading buf->state on hot paths to catch missed redirects.
+ */
+static inline void
+AssertUsageCountDecoupled(uint64 buf_state)
+{
+	Assert(BUF_STATE_GET_USAGECOUNT(buf_state) == 0);
+}
+
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
+
+
 /*
  * Buffer tag identifies which disk block the buffer contains.
  *
