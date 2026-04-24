@@ -1637,8 +1637,8 @@ DROP TABLE epoch_visfetch_p14;
 
 BEGIN;
 
-SELECT anchor_valid, (full_xmin > 0) AS xmin_valid,
-       (full_xmax > 0) AS xmax_valid, guard_active
+SELECT anchor_valid, (full_xmin != 0) AS xmin_valid,
+       (full_xmax != 0) AS xmax_valid, guard_active
   FROM epoch_xid_snapshot_bridge_info();
 
 COMMIT;
@@ -1769,6 +1769,104 @@ SELECT epoch_xid_horizon_last_source();
 COMMIT;
 
 DROP TABLE epoch_visfetch_p15src;
+
+-- ======================================================
+-- Patch 17: structural consolidation — EpochSnapshotBridge parity proof
+-- ======================================================
+--
+-- These tests prove that the EpochSnapshotBridge struct (Patch 17) is
+-- a pure structural consolidation: same values, same guard semantics,
+-- no behavioral change.
+
+-- P17_a: Bridge struct fields are populated and valid
+--
+-- anchor_valid, full_xmin, full_xmax must all be non-zero for a normal
+-- MVCC snapshot in epoch 0.  active must be true.
+
+BEGIN;
+
+SELECT anchor_valid, (full_xmin != 0) AS xmin_populated,
+       (full_xmax != 0) AS xmax_populated, guard_active
+  FROM epoch_xid_snapshot_bridge_info();
+
+COMMIT;
+
+-- P17_b: Guard pre-evaluation matches old multi-condition evaluation
+--
+-- epoch_bridge.active must be equivalent to the old guard:
+--   FullTransactionIdIsValid(epoch_anchor) AND epoch == 0
+-- epoch_xid_stage1_bridge_enabled() now reads epoch_bridge.active
+-- (with the test-only override applied).  It must be true.
+
+SELECT epoch_xid_stage1_bridge_enabled();
+
+-- P17_c: Visibility behavior unchanged — TID scan
+--
+-- A committed tuple must be visible through the epoch bridge exactly
+-- as before the struct consolidation.
+
+CREATE TABLE epoch_p17_parity (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p17_parity VALUES (1, 'parity_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p17_parity WHERE ctid = '(0,1)';
+
+-- Bridge path was used
+SELECT epoch_xid_mvcc_last_path();
+-- Caller is heap_fetch (TID scan)
+SELECT epoch_xid_mvcc_last_caller();
+-- Horizon fast-reject exercised
+SELECT epoch_xid_classify_last_horizon();
+-- Sources are precomputed (acquisition-time bridge, now via struct)
+SELECT epoch_xid_horizon_last_source();
+SELECT epoch_xid_bridge_last_source();
+
+COMMIT;
+
+-- P17_d: Visibility behavior unchanged — index scan
+--
+-- Same parity check through the second consumer path.
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p17_parity WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_path();
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_classify_last_horizon();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P17_e: Guard force-disable still works through the struct
+--
+-- epoch_bridge.active is true (pre-evaluated), but the test override
+-- disables the bridge at consumption time.
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+-- guard_active is false (test override applied on top of epoch_bridge.active)
+SELECT guard_active FROM epoch_xid_snapshot_bridge_info();
+
+-- bridge_enabled is also false (same override)
+SELECT epoch_xid_stage1_bridge_enabled();
+
+SELECT * FROM epoch_p17_parity WHERE ctid = '(0,1)';
+
+-- Bridge was not used (guard disabled)
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+DROP TABLE epoch_p17_parity;
 
 -- ======================================================
 -- Patch 16: second real internal consumer — heap_hot_search_buffer()

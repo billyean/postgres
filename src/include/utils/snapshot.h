@@ -210,47 +210,37 @@ typedef struct SnapshotData
 	uint64		snapXactCompletionCount;
 
 	/*
-	 * XID64 EPOCH FORK (Patch 11 Stage 1): epoch anchor for 64-bit XID
-	 * reconstruction from this snapshot's 32-bit xip/subxip arrays.
+	 * XID64 EPOCH FORK (Patch 17): explicit snapshot bridge representation.
 	 *
-	 * Captured from TransamVariables->latestCompletedXid in the same
-	 * ProcArrayLock critical section where xmin/xmax/xip are filled.
-	 * Enables FullXidInMVCCSnapshot() to promote 32-bit XIDs to 64-bit
-	 * using signed arithmetic relative to this anchor.
+	 * Packages the bounded 64-bit bridge state into a named struct so that
+	 * epoch-aware consumers interact with a single representation rather
+	 * than scattered loose fields.  Populated by GetSnapshotData.
 	 *
-	 * Stage 1 operational boundary: this mechanism is validated for
-	 * pre-wrap / epoch-0 operation only.  Cross-epoch safety requires
-	 * Stages 2-3 (ProcArray/horizon 64-bit awareness).
+	 * epoch_bridge.active: pre-evaluated Stage 1 guard — true iff anchor
+	 *   is valid AND epoch is 0 (pre-wrap).  Consumers check this single
+	 *   bool instead of re-evaluating the multi-condition guard.  The
+	 *   test-only epoch_stage1_force_disabled override is applied at
+	 *   consumption time, outside this flag.
 	 *
-	 * Zero/invalid if the snapshot was not filled by GetSnapshotData
-	 * (e.g., imported snapshots, special snapshots).  The epoch-aware
-	 * path must check for this and fall back to native comparison.
+	 * epoch_bridge.anchor: latestCompletedXid at snapshot time (Patch 11).
+	 *   Used for per-entry xip[]/subxip[] 64-bit reconstruction.
+	 *
+	 * epoch_bridge.full_xmin: pre-computed 64-bit form of xmin (Patch 15).
+	 *   Serves as Phase 4 horizon and Phase 5 lower bound.
+	 *
+	 * epoch_bridge.full_xmax: pre-computed 64-bit form of xmax (Patch 15).
+	 *   Serves as Phase 5 upper bound.
+	 *
+	 * All fields are zero/invalid when the snapshot was not filled by
+	 * GetSnapshotData (imported/special snapshots).  active is false.
 	 */
-	FullTransactionId epoch_anchor;
-
-	/*
-	 * XID64 EPOCH FORK (Patch 15): pre-computed 64-bit snapshot boundaries.
-	 *
-	 * Derived from epoch_anchor at snapshot acquisition time inside
-	 * GetSnapshotData, eliminating per-tuple reconstruction in the
-	 * epoch-aware visibility path.
-	 *
-	 * epoch_full_xmin = FullXidRelativeTo(latestCompletedXid, xmin):
-	 *   64-bit lower boundary.  Any XID preceding this was completed
-	 *   before the snapshot.  Serves as the Phase 4 horizon (Patch 13)
-	 *   and the Phase 5 lower bound (Patch 11) without ad hoc
-	 *   per-consumer reconstruction.
-	 *
-	 * epoch_full_xmax = FullXidRelativeTo(latestCompletedXid, xmax):
-	 *   64-bit upper boundary.  Any XID at or following this started
-	 *   after the snapshot.
-	 *
-	 * Zero/invalid when epoch_anchor is invalid (imported/special
-	 * snapshots).  The epoch-aware path checks the Stage 1 guard before
-	 * consuming these fields.
-	 */
-	FullTransactionId epoch_full_xmin;
-	FullTransactionId epoch_full_xmax;
+	struct
+	{
+		bool		active;
+		FullTransactionId anchor;
+		FullTransactionId full_xmin;
+		FullTransactionId full_xmax;
+	}			epoch_bridge;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

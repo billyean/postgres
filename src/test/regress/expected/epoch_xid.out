@@ -1560,6 +1560,109 @@ BEGIN
 
 COMMIT
 DROP TABLE
+BEGIN
+ anchor_valid | xmin_populated | xmax_populated | guard_active 
+--------------+----------------+----------------+--------------
+ t            | t              | t              | t
+(1 row)
+
+COMMIT
+ epoch_xid_stage1_bridge_enabled 
+---------------------------------
+ t
+(1 row)
+
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ id |     val     
+----+-------------
+  1 | parity_test
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_fetch
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+ epoch_xid_horizon_last_source 
+-------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+COMMIT
+SET
+BEGIN
+ id |     val     
+----+-------------
+  1 | parity_test
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+ epoch_xid_mvcc_last_caller 
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+ epoch_xid_classify_last_horizon 
+---------------------------------
+ horizon_fastpath
+(1 row)
+
+COMMIT
+RESET
+ epoch_xid_stage1_force_disable 
+--------------------------------
+ 
+(1 row)
+
+BEGIN
+ guard_active 
+--------------
+ f
+(1 row)
+
+ epoch_xid_stage1_bridge_enabled 
+---------------------------------
+ f
+(1 row)
+
+ id |     val     
+----+-------------
+  1 | parity_test
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ materialized
+(1 row)
+
+COMMIT
+ epoch_xid_stage1_force_disable 
+--------------------------------
+ 
+(1 row)
+
+DROP TABLE
 CREATE TABLE
 INSERT 0 1
 SET

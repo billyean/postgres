@@ -93,7 +93,7 @@ static char epoch_classify_last_horizon = 'n';
  *
  * Values:
  *   'n' = not reached (initial, or epoch path not entered)
- *   'p' = precomputed: boundaries read from snapshot->epoch_full_xmin/xmax
+ *   'p' = precomputed: boundaries read from snapshot->epoch_bridge.full_xmin/xmax
  *         (populated at acquisition time by GetSnapshotData, Patch 15)
  *   'r' = reconstructed: boundaries derived ad hoc via EpochFullXidRelativeTo
  *         (fallback for snapshots not filled by GetSnapshotData)
@@ -120,7 +120,7 @@ static bool epoch_bridge_force_reconstruct = false;
  *
  * Values:
  *   'n' = not reached (initial, or guard off, epoch path not entered)
- *   'p' = precomputed: horizon read from snapshot->epoch_full_xmin
+ *   'p' = precomputed: horizon read from snapshot->epoch_bridge.full_xmin
  *   'r' = reconstructed: horizon derived via EpochFullXidRelativeTo
  */
 static char epoch_horizon_last_source = 'n';
@@ -1435,7 +1435,7 @@ EpochFullXidRelativeTo(FullTransactionId ref, TransactionId xid)
 static bool
 FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
 {
-	FullTransactionId anchor = snapshot->epoch_anchor;
+	FullTransactionId anchor = snapshot->epoch_bridge.anchor;
 	FullTransactionId full_xmin;
 	FullTransactionId full_xmax;
 	uint32		i;
@@ -1454,10 +1454,10 @@ FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
 	 * from anchor + 32-bit fields as before.
 	 */
 	if (!epoch_bridge_force_reconstruct &&
-		FullTransactionIdIsValid(snapshot->epoch_full_xmin))
+		FullTransactionIdIsValid(snapshot->epoch_bridge.full_xmin))
 	{
-		full_xmin = snapshot->epoch_full_xmin;
-		full_xmax = snapshot->epoch_full_xmax;
+		full_xmin = snapshot->epoch_bridge.full_xmin;
+		full_xmax = snapshot->epoch_bridge.full_xmax;
 		epoch_bridge_last_source = 'p';
 	}
 	else
@@ -1637,10 +1637,13 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	 *     Cross-epoch safety requires further ProcArray/horizon work.
 	 *
 	 * This is a real code boundary, not just a comment.
+	 *
+	 * Patch 17: the guard is now pre-evaluated at acquisition time as
+	 * epoch_bridge.active.  The test-only force-disable override is still
+	 * applied here at consumption time.
 	 */
 	use_64bit_snapshot = !epoch_stage1_force_disabled &&
-		FullTransactionIdIsValid(snapshot->epoch_anchor) &&
-		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+		snapshot->epoch_bridge.active;
 
 	/*
 	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
@@ -1651,7 +1654,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	 * and supply the pre-computed 64-bit snapshot horizon for the fast-reject
 	 * (Patch 14).
 	 *
-	 * epoch_horizon is now read directly from snapshot->epoch_full_xmin
+	 * epoch_horizon is now read directly from snapshot->epoch_bridge.full_xmin
 	 * (Patch 15), which was pre-computed at acquisition time in
 	 * GetSnapshotData.  This eliminates the per-tuple EpochFullXidRelativeTo
 	 * reconstruction that Patch 14 performed here.
@@ -1665,14 +1668,14 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		if (use_64bit_snapshot)
 		{
 			if (!epoch_bridge_force_reconstruct &&
-				FullTransactionIdIsValid(snapshot->epoch_full_xmin))
+				FullTransactionIdIsValid(snapshot->epoch_bridge.full_xmin))
 			{
-				epoch_horizon = snapshot->epoch_full_xmin;
+				epoch_horizon = snapshot->epoch_bridge.full_xmin;
 				epoch_horizon_last_source = 'p';
 			}
 			else
 			{
-				epoch_horizon = EpochFullXidRelativeTo(snapshot->epoch_anchor,
+				epoch_horizon = EpochFullXidRelativeTo(snapshot->epoch_bridge.anchor,
 													   snapshot->xmin);
 				epoch_horizon_last_source = 'r';
 			}
@@ -1775,7 +1778,7 @@ check_xmax:
 
 			if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
 				full_xmax_for_snap = EpochFullXidRelativeTo(
-					snapshot->epoch_anchor, effective_xmax);
+					snapshot->epoch_bridge.anchor, effective_xmax);
 			else
 				full_xmax_for_snap = interp.full_xmax;
 
@@ -3092,8 +3095,7 @@ epoch_xid_stage1_bridge_enabled(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 
 	enabled = !epoch_stage1_force_disabled &&
-		FullTransactionIdIsValid(snapshot->epoch_anchor) &&
-		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+		snapshot->epoch_bridge.active;
 
 	PG_RETURN_BOOL(enabled);
 }
@@ -3157,16 +3159,15 @@ epoch_xid_snapshot_bridge_info(PG_FUNCTION_ARGS)
 		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 	}
 
-	anchor_valid = FullTransactionIdIsValid(snapshot->epoch_anchor);
+	anchor_valid = FullTransactionIdIsValid(snapshot->epoch_bridge.anchor);
 	guard_active = !epoch_stage1_force_disabled &&
-		anchor_valid &&
-		(EpochFromFullTransactionId(snapshot->epoch_anchor) == 0);
+		snapshot->epoch_bridge.active;
 
 	values[0] = BoolGetDatum(anchor_valid);
 	values[1] = Int64GetDatum(anchor_valid ?
-		(int64) U64FromFullTransactionId(snapshot->epoch_full_xmin) : 0);
+		(int64) U64FromFullTransactionId(snapshot->epoch_bridge.full_xmin) : 0);
 	values[2] = Int64GetDatum(anchor_valid ?
-		(int64) U64FromFullTransactionId(snapshot->epoch_full_xmax) : 0);
+		(int64) U64FromFullTransactionId(snapshot->epoch_bridge.full_xmax) : 0);
 	values[3] = BoolGetDatum(guard_active);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
@@ -3180,7 +3181,7 @@ epoch_xid_snapshot_bridge_info(PG_FUNCTION_ARGS)
  * boundaries in the last EpochHeapTupleSatisfiesMVCC invocation.
  *
  * Returns:
- *   'precomputed'  - boundaries read from snapshot->epoch_full_xmin/xmax
+ *   'precomputed'  - boundaries read from snapshot->epoch_bridge.full_xmin/xmax
  *                    (populated at acquisition time by GetSnapshotData)
  *   'reconstructed' - boundaries derived ad hoc via EpochFullXidRelativeTo
  *                    (fallback for snapshots without pre-computed fields)
@@ -3241,7 +3242,7 @@ epoch_xid_force_bridge_reconstruct(PG_FUNCTION_ARGS)
  * in the last EpochHeapTupleSatisfiesMVCC invocation.
  *
  * Returns:
- *   'precomputed'   - horizon read from snapshot->epoch_full_xmin
+ *   'precomputed'   - horizon read from snapshot->epoch_bridge.full_xmin
  *   'reconstructed' - horizon derived via EpochFullXidRelativeTo
  *   'not_used'      - horizon path not reached (guard off, or epoch path
  *                     not entered for this invocation)

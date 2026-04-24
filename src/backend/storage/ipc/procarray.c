@@ -2444,29 +2444,28 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->suboverflowed = suboverflowed;
 	snapshot->snapXactCompletionCount = curXactCompletionCount;
 
-	/* XID64 EPOCH FORK: capture epoch anchor for 64-bit XID reconstruction */
-	snapshot->epoch_anchor = latest_completed;
-
 	/*
-	 * XID64 EPOCH FORK (Patch 15): pre-compute 64-bit snapshot boundaries.
+	 * XID64 EPOCH FORK (Patch 17): populate the epoch bridge struct.
 	 *
-	 * These are the 64-bit forms of snapshot->xmin and snapshot->xmax,
-	 * derived from the same latestCompletedXid anchor.  Pre-computing them
-	 * here eliminates per-tuple reconstruction in the epoch-aware
-	 * visibility path (EpochHeapTupleSatisfiesMVCC, FullXidInMVCCSnapshot).
-	 *
-	 * Populated whenever epoch_anchor is valid.  The consumer-side Stage 1
-	 * guard controls whether these fields are actually used.
+	 * Packages the anchor and pre-computed 64-bit boundaries into the
+	 * named EpochSnapshotBridge representation.  The 'active' flag
+	 * pre-evaluates the Stage 1 guard (anchor valid AND epoch == 0)
+	 * so consumers check one bool instead of three conditions.
 	 */
-	if (FullTransactionIdIsValid(snapshot->epoch_anchor))
+	snapshot->epoch_bridge.anchor = latest_completed;
+
+	if (FullTransactionIdIsValid(snapshot->epoch_bridge.anchor))
 	{
-		snapshot->epoch_full_xmin = FullXidRelativeTo(latest_completed, xmin);
-		snapshot->epoch_full_xmax = FullXidRelativeTo(latest_completed, xmax);
+		snapshot->epoch_bridge.full_xmin = FullXidRelativeTo(latest_completed, xmin);
+		snapshot->epoch_bridge.full_xmax = FullXidRelativeTo(latest_completed, xmax);
+		snapshot->epoch_bridge.active =
+			(EpochFromFullTransactionId(latest_completed) == 0);
 	}
 	else
 	{
-		snapshot->epoch_full_xmin = InvalidFullTransactionId;
-		snapshot->epoch_full_xmax = InvalidFullTransactionId;
+		snapshot->epoch_bridge.full_xmin = InvalidFullTransactionId;
+		snapshot->epoch_bridge.full_xmax = InvalidFullTransactionId;
+		snapshot->epoch_bridge.active = false;
 	}
 
 	snapshot->curcid = GetCurrentCommandId(false);
