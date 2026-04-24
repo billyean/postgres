@@ -3360,3 +3360,207 @@ epoch_xid_mvcc_last_caller(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
+
+
+/* ----------------------------------------------------------------
+ *	Bridge lifecycle helpers (Patch 19)
+ *
+ *	Centralize EpochSnapshotBridge allocation, population, and copy
+ *	so producers call named helpers instead of inline field-by-field code.
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Test-only instrumentation: records whether the last bridge population
+ * was performed by the EpochBridgePopulate helper ('h') or not yet
+ * called ('n').  Exposed via epoch_xid_bridge_populate_source().
+ */
+static char epoch_bridge_last_populate_source = 'n';
+
+/*
+ * Test-only instrumentation: records whether the last bridge array copy
+ * was performed by the EpochBridgeCopyArrays helper ('h') or not yet
+ * called ('n').  Exposed via epoch_xid_bridge_copy_source().
+ */
+static char epoch_bridge_last_copy_source = 'n';
+
+/*
+ * EpochBridgeAlloc -- one-time allocation of full_xip/full_subxip buffers.
+ *
+ * Called from GetSnapshotData on the first call for a static snapshot object.
+ * The buffers are reused across subsequent acquisitions (session lifetime).
+ */
+void
+EpochBridgeAlloc(Snapshot snap)
+{
+	snap->epoch_bridge.full_xip = (FullTransactionId *)
+		malloc(GetMaxSnapshotXidCount() * sizeof(FullTransactionId));
+	if (snap->epoch_bridge.full_xip == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	snap->epoch_bridge.full_subxip = (FullTransactionId *)
+		malloc(GetMaxSnapshotSubxidCount() * sizeof(FullTransactionId));
+	if (snap->epoch_bridge.full_subxip == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+}
+
+/*
+ * EpochBridgePopulate -- set bridge scalar fields after xip/subxip population.
+ *
+ * Computes anchor, active, full_xmin, full_xmax from the provided
+ * latestCompletedXid and snapshot boundaries.  Does NOT populate per-entry
+ * full_xip[i]/full_subxip[j] -- those stay inline in the GetSnapshotData
+ * loop for locality and performance.
+ */
+void
+EpochBridgePopulate(Snapshot snap, FullTransactionId latest_completed,
+					TransactionId xmin, TransactionId xmax)
+{
+	snap->epoch_bridge.anchor = latest_completed;
+
+	if (FullTransactionIdIsValid(snap->epoch_bridge.anchor))
+	{
+		snap->epoch_bridge.full_xmin =
+			EpochFullXidRelativeTo(latest_completed, xmin);
+		snap->epoch_bridge.full_xmax =
+			EpochFullXidRelativeTo(latest_completed, xmax);
+		snap->epoch_bridge.active =
+			(EpochFromFullTransactionId(latest_completed) == 0);
+	}
+	else
+	{
+		snap->epoch_bridge.full_xmin = InvalidFullTransactionId;
+		snap->epoch_bridge.full_xmax = InvalidFullTransactionId;
+		snap->epoch_bridge.active = false;
+	}
+
+	epoch_bridge_last_populate_source = 'h';
+}
+
+/*
+ * EpochBridgeCopySize -- additional palloc bytes for bridge arrays.
+ *
+ * Returns the extra space CopySnapshot needs in its palloc block for
+ * the pre-promoted full_xip[] and full_subxip[] arrays.
+ */
+Size
+EpochBridgeCopySize(Snapshot snap)
+{
+	Size		extra = 0;
+
+	extra += snap->xcnt * sizeof(FullTransactionId);
+	if (snap->subxcnt > 0)
+		extra += snap->subxcnt * sizeof(FullTransactionId);
+
+	return extra;
+}
+
+/*
+ * EpochBridgeCopyArrays -- deep-copy bridge arrays into a palloc block.
+ *
+ * dest: the copied snapshot (already memcpy'd from src for scalar fields).
+ * src:  the source snapshot.
+ * block: base address of the palloc block (== dest cast to char*).
+ * full_xip_off: byte offset within block where full_xip[] should start.
+ *
+ * Handles NULL source arrays, suboverflowed, and takenDuringRecovery.
+ * After this call, dest owns its own copies of the arrays.
+ */
+void
+EpochBridgeCopyArrays(Snapshot dest, Snapshot src,
+					  char *block, Size full_xip_off)
+{
+	if (src->epoch_bridge.full_xip != NULL && src->xcnt > 0)
+	{
+		dest->epoch_bridge.full_xip =
+			(FullTransactionId *) (block + full_xip_off);
+		memcpy(dest->epoch_bridge.full_xip,
+			   src->epoch_bridge.full_xip,
+			   src->xcnt * sizeof(FullTransactionId));
+	}
+	else
+		dest->epoch_bridge.full_xip = NULL;
+
+	if (src->epoch_bridge.full_subxip != NULL &&
+		src->subxcnt > 0 &&
+		(!src->suboverflowed || src->takenDuringRecovery))
+	{
+		Size	full_subxip_off = full_xip_off +
+			src->xcnt * sizeof(FullTransactionId);
+
+		dest->epoch_bridge.full_subxip =
+			(FullTransactionId *) (block + full_subxip_off);
+		memcpy(dest->epoch_bridge.full_subxip,
+			   src->epoch_bridge.full_subxip,
+			   src->subxcnt * sizeof(FullTransactionId));
+	}
+	else
+		dest->epoch_bridge.full_subxip = NULL;
+
+	epoch_bridge_last_copy_source = 'h';
+}
+
+
+/*
+ * epoch_xid_bridge_populate_source() -> text
+ *
+ * TEST-ONLY function.  Returns whether the last bridge population was
+ * performed by the EpochBridgePopulate helper.
+ *
+ * Returns:
+ *   'helper'     - EpochBridgePopulate was called
+ *   'not_called' - helper was not invoked (initial state)
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_populate_source);
+
+Datum
+epoch_xid_bridge_populate_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_bridge_last_populate_source)
+	{
+		case 'h':
+			result = "helper";
+			break;
+		default:
+			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+
+/*
+ * epoch_xid_bridge_copy_source() -> text
+ *
+ * TEST-ONLY function.  Returns whether the last bridge array copy was
+ * performed by the EpochBridgeCopyArrays helper.
+ *
+ * Returns:
+ *   'helper'     - EpochBridgeCopyArrays was called
+ *   'not_called' - helper was not invoked (initial state)
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_copy_source);
+
+Datum
+epoch_xid_bridge_copy_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_bridge_last_copy_source)
+	{
+		case 'h':
+			result = "helper";
+			break;
+		default:
+			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}

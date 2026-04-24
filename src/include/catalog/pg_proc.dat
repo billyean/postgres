@@ -12926,4 +12926,16 @@
   proname => 'epoch_xid_mvcc_last_caller', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_mvcc_last_caller' },
+
+{ oid => '9927',
+  descr => 'TEST-ONLY: report whether bridge population used the EpochBridgePopulate helper',
+  proname => 'epoch_xid_bridge_populate_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_populate_source' },
+
+{ oid => '9928',
+  descr => 'TEST-ONLY: report whether bridge copy used the EpochBridgeCopyArrays helper',
+  proname => 'epoch_xid_bridge_copy_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_copy_source' },
 ]

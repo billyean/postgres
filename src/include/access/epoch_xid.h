@@ -403,4 +403,27 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 
 extern void EpochMVCCSetCaller(char caller);
 
+/*
+ * Bridge lifecycle helpers (Patch 19).
+ *
+ * Centralize EpochSnapshotBridge allocation, population, and copy logic
+ * so producers (GetSnapshotData, CopySnapshot) call named helpers instead
+ * of bespoke inline field-by-field code.
+ */
+
+/* One-time allocation of full_xip/full_subxip for static snapshot objects. */
+extern void EpochBridgeAlloc(Snapshot snap);
+
+/* Populate bridge scalars (anchor, active, full_xmin, full_xmax). */
+extern void EpochBridgePopulate(Snapshot snap,
+								FullTransactionId latest_completed,
+								TransactionId xmin, TransactionId xmax);
+
+/* Return additional palloc bytes needed for bridge arrays in CopySnapshot. */
+extern Size EpochBridgeCopySize(Snapshot snap);
+
+/* Deep-copy bridge arrays into the copy's palloc block at full_xip_off. */
+extern void EpochBridgeCopyArrays(Snapshot dest, Snapshot src,
+								  char *block, Size full_xip_off);
+
 #endif							/* EPOCH_XID_H */

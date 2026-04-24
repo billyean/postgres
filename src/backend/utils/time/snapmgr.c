@@ -107,6 +107,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/epoch_xid.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -620,15 +621,12 @@ CopySnapshot(Snapshot snapshot)
 		size += snapshot->subxcnt * sizeof(TransactionId);
 
 	/*
-	 * Patch 18: include space for pre-promoted 64-bit membership arrays.
-	 * Deep-copied into this block; owned by the copy.
+	 * Patch 19: compute additional space for bridge arrays via helper.
 	 */
 	{
 		Size		full_xip_off = size;
 
-		size += snapshot->xcnt * sizeof(FullTransactionId);
-		if (snapshot->subxcnt > 0)
-			size += snapshot->subxcnt * sizeof(FullTransactionId);
+		size += EpochBridgeCopySize(snapshot);
 
 		newsnap = (Snapshot) MemoryContextAlloc(TopTransactionContext, size);
 		memcpy(newsnap, snapshot, sizeof(SnapshotData));
@@ -665,35 +663,10 @@ CopySnapshot(Snapshot snapshot)
 			newsnap->subxip = NULL;
 
 		/*
-		 * Patch 18: deep-copy pre-promoted 64-bit membership arrays.
-		 * These are valid only when the source has non-NULL arrays.
+		 * Patch 19: deep-copy bridge arrays via centralized helper.
 		 */
-		if (snapshot->epoch_bridge.full_xip != NULL && snapshot->xcnt > 0)
-		{
-			newsnap->epoch_bridge.full_xip =
-				(FullTransactionId *) ((char *) newsnap + full_xip_off);
-			memcpy(newsnap->epoch_bridge.full_xip,
-				   snapshot->epoch_bridge.full_xip,
-				   snapshot->xcnt * sizeof(FullTransactionId));
-		}
-		else
-			newsnap->epoch_bridge.full_xip = NULL;
-
-		if (snapshot->epoch_bridge.full_subxip != NULL &&
-			snapshot->subxcnt > 0 &&
-			(!snapshot->suboverflowed || snapshot->takenDuringRecovery))
-		{
-			Size	full_subxip_off = full_xip_off +
-				snapshot->xcnt * sizeof(FullTransactionId);
-
-			newsnap->epoch_bridge.full_subxip =
-				(FullTransactionId *) ((char *) newsnap + full_subxip_off);
-			memcpy(newsnap->epoch_bridge.full_subxip,
-				   snapshot->epoch_bridge.full_subxip,
-				   snapshot->subxcnt * sizeof(FullTransactionId));
-		}
-		else
-			newsnap->epoch_bridge.full_subxip = NULL;
+		EpochBridgeCopyArrays(newsnap, snapshot, (char *) newsnap,
+							  full_xip_off);
 	}
 
 	return newsnap;

@@ -2047,3 +2047,63 @@ COMMIT;
 RESET enable_seqscan;
 
 DROP TABLE epoch_p18;
+
+-- ======================================================
+-- Patch 19: bridge lifecycle helper family
+-- ======================================================
+--
+-- These tests prove that the full EpochBridge* helper family is actually
+-- used for bridge population AND copy, and that all behavior is preserved.
+
+-- P19_a: Populate helper invocation proof
+--
+-- A fresh transaction triggers GetSnapshotData → EpochBridgePopulate.
+-- The instrumentation must report 'helper'.
+
+CREATE TABLE epoch_p19 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p19 VALUES (1, 'helper_test');
+
+BEGIN;
+
+-- This SELECT forces a snapshot to be acquired via GetSnapshotData
+SELECT * FROM epoch_p19 WHERE ctid = '(0,1)';
+SELECT epoch_xid_bridge_populate_source();
+
+COMMIT;
+
+-- P19_b: Full populate pipeline — helper populates, consumer uses precomputed
+
+BEGIN;
+
+SELECT * FROM epoch_p19 WHERE ctid = '(0,1)';
+SELECT epoch_xid_bridge_populate_source();
+SELECT epoch_xid_bridge_last_source();
+SELECT epoch_xid_mvcc_last_path();
+
+COMMIT;
+
+-- P19_c: Copy helper invocation proof
+--
+-- A cursor forces CopySnapshot → EpochBridgeCopyArrays.
+-- The copy-source instrumentation must report 'helper'.
+-- The copied snapshot must still yield 'precomputed' for consumers.
+
+BEGIN;
+
+DECLARE epoch_p19_cur CURSOR FOR
+    SELECT * FROM epoch_p19 WHERE ctid = '(0,1)';
+
+FETCH NEXT FROM epoch_p19_cur;
+
+-- Copy helper was used
+SELECT epoch_xid_bridge_copy_source();
+
+-- Consumer still sees precomputed from the copied snapshot
+SELECT epoch_xid_bridge_last_source();
+SELECT epoch_xid_mvcc_last_path();
+
+CLOSE epoch_p19_cur;
+
+COMMIT;
+
+DROP TABLE epoch_p19;

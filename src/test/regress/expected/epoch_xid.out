@@ -1844,3 +1844,64 @@ BEGIN
 COMMIT
 RESET
 DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ id |     val     
+----+-------------
+  1 | helper_test
+(1 row)
+
+ epoch_xid_bridge_populate_source 
+----------------------------------
+ helper
+(1 row)
+
+COMMIT
+BEGIN
+ id |     val     
+----+-------------
+  1 | helper_test
+(1 row)
+
+ epoch_xid_bridge_populate_source 
+----------------------------------
+ helper
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+COMMIT
+BEGIN
+DECLARE CURSOR
+ id |     val     
+----+-------------
+  1 | helper_test
+(1 row)
+
+ epoch_xid_bridge_copy_source 
+------------------------------
+ helper
+(1 row)
+
+ epoch_xid_bridge_last_source 
+------------------------------
+ precomputed
+(1 row)
+
+ epoch_xid_mvcc_last_path 
+--------------------------
+ snapshot_bridge
+(1 row)
+
+CLOSE CURSOR
+COMMIT
+DROP TABLE

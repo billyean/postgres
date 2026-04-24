@@ -48,6 +48,7 @@
 #include <signal.h>
 
 #include "access/subtrans.h"
+#include "access/epoch_xid.h"
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xact.h"
@@ -2163,21 +2164,9 @@ GetSnapshotData(Snapshot snapshot)
 					 errmsg("out of memory")));
 
 		/*
-		 * Patch 18: allocate parallel 64-bit membership arrays.
-		 * Same sizing as xip/subxip; owned by this static snapshot object.
+		 * Patch 19: allocate bridge arrays via centralized helper.
 		 */
-		snapshot->epoch_bridge.full_xip = (FullTransactionId *)
-			malloc(GetMaxSnapshotXidCount() * sizeof(FullTransactionId));
-		if (snapshot->epoch_bridge.full_xip == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-		snapshot->epoch_bridge.full_subxip = (FullTransactionId *)
-			malloc(GetMaxSnapshotSubxidCount() * sizeof(FullTransactionId));
-		if (snapshot->epoch_bridge.full_subxip == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
+		EpochBridgeAlloc(snapshot);
 	}
 
 	/*
@@ -2475,28 +2464,9 @@ GetSnapshotData(Snapshot snapshot)
 	snapshot->snapXactCompletionCount = curXactCompletionCount;
 
 	/*
-	 * XID64 EPOCH FORK (Patch 17): populate the epoch bridge struct.
-	 *
-	 * Packages the anchor and pre-computed 64-bit boundaries into the
-	 * named EpochSnapshotBridge representation.  The 'active' flag
-	 * pre-evaluates the Stage 1 guard (anchor valid AND epoch == 0)
-	 * so consumers check one bool instead of three conditions.
+	 * Patch 19: populate bridge scalars via centralized helper.
 	 */
-	snapshot->epoch_bridge.anchor = latest_completed;
-
-	if (FullTransactionIdIsValid(snapshot->epoch_bridge.anchor))
-	{
-		snapshot->epoch_bridge.full_xmin = FullXidRelativeTo(latest_completed, xmin);
-		snapshot->epoch_bridge.full_xmax = FullXidRelativeTo(latest_completed, xmax);
-		snapshot->epoch_bridge.active =
-			(EpochFromFullTransactionId(latest_completed) == 0);
-	}
-	else
-	{
-		snapshot->epoch_bridge.full_xmin = InvalidFullTransactionId;
-		snapshot->epoch_bridge.full_xmax = InvalidFullTransactionId;
-		snapshot->epoch_bridge.active = false;
-	}
+	EpochBridgePopulate(snapshot, latest_completed, xmin, xmax);
 
 	snapshot->curcid = GetCurrentCommandId(false);
 
