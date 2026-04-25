@@ -262,6 +262,9 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 
 	Assert(seg_count > 0 && seg_count <= 32);
 
+	pg_usage_scan_stats.segments_scanned++;
+	pg_usage_scan_stats.scan_calls++;
+
 	/* Phase 1: scan segment for zero-usage candidates */
 	scan = pg_usage_scan(seg_map, seg_count);
 	Assert((scan.zero_mask & ~usage_scan_valid_mask(seg_count)) == 0);
@@ -276,6 +279,8 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 		uint64		cand_state;
 
 		cand_state = pg_atomic_read_u64(&cand->state);
+
+		pg_usage_scan_stats.candidates_examined++;
 
 		/*
 		 * Hot-state checks — must match the existing StrategyGetBuffer()
@@ -305,8 +310,22 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 
 				TrackNewBufferPin(BufferDescriptorGetBuffer(cand));
 
+				pg_usage_scan_stats.victims_found++;
+
 				return cand;
 			}
+			else
+			{
+				pg_usage_scan_stats.cas_failures++;
+			}
+		}
+		else if (BUF_STATE_GET_REFCOUNT(cand_state) != 0)
+		{
+			pg_usage_scan_stats.rejected_refcount++;
+		}
+		else
+		{
+			pg_usage_scan_stats.rejected_locked++;
 		}
 
 		mask &= (mask - 1);		/* clear lowest set bit */
@@ -319,7 +338,12 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 	 * pointlessly decremented.  The decrement is a plain store, not atomic —
 	 * same heuristic-level race as Patch 1 (see design doc Section 7.4).
 	 */
+	pg_usage_scan_stats.decrement_calls++;
 	*made_progress = pg_usage_decrement(seg_map, seg_count);
+	if (*made_progress)
+		pg_usage_scan_stats.decrement_progress++;
+	else
+		pg_usage_scan_stats.decrement_noprogress++;
 
 	return NULL;
 }
@@ -424,6 +448,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			bool		progress_tail = false;
 			bool		progress_head = false;
 
+			pg_usage_scan_stats.chunks_scanned++;
+
 			start = ClockSweepTickChunk(effective_chunk);
 			tail_count = Min(effective_chunk, NBuffers - (int) start);
 			head_count = effective_chunk - tail_count;
@@ -449,7 +475,10 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			}
 
 			if (progress_tail || progress_head)
+			{
 				trycounter = NBuffers;
+				pg_usage_scan_stats.trycounter_resets++;
+			}
 			else
 				trycounter -= effective_chunk;
 

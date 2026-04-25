@@ -54,6 +54,42 @@ extern UsageScanResult usage_scan_scalar(const uint8_t *map, int count);
 extern bool usage_decrement_scalar(uint8_t *map, int count);
 
 /*
+ * Backend-local eviction instrumentation counters.
+ *
+ * The struct always exists.  dispatch_path is initialized to:
+ *   "not_initialized" when USE_DECOUPLED_USAGE_COUNT is on (pre-dispatch)
+ *   "not_enabled"     when USE_DECOUPLED_USAGE_COUNT is off
+ * InitUsageScanDispatch() replaces it with the concrete ISA label.
+ * Reset clears activity counters but preserves dispatch fields.
+ */
+typedef struct UsageScanStats
+{
+	/* Dispatch info — set once by InitUsageScanDispatch, not cleared by reset */
+	const char *dispatch_path;
+	int			dispatch_chunk_size;
+
+	/* Sweep activity */
+	int64		chunks_scanned;
+	int64		segments_scanned;
+	int64		scan_calls;
+	int64		decrement_calls;
+
+	/* Candidate flow */
+	int64		candidates_examined;
+	int64		rejected_refcount;
+	int64		rejected_locked;
+	int64		cas_failures;
+	int64		victims_found;
+
+	/* Decay/progress */
+	int64		decrement_progress;
+	int64		decrement_noprogress;
+	int64		trycounter_resets;
+} UsageScanStats;
+
+extern PGDLLIMPORT UsageScanStats pg_usage_scan_stats;
+
+/*
  * usage_scan_valid_mask - Return a uint32 bitmask with the lowest 'n' bits
  * set.  Safe for n in [0, 32]; avoids undefined behavior from (1U << 32).
  */

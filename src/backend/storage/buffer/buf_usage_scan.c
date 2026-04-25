@@ -59,6 +59,20 @@ UsageScanFn		pg_usage_scan = usage_scan_choose;
 UsageDecrementFn	pg_usage_decrement = usage_decrement_choose;
 int				pg_usage_scan_chunk_size = USAGE_SCAN_CHUNK_SIZE;
 
+/*
+ * Backend-local instrumentation counters (Patch 4).
+ *
+ * When USE_DECOUPLED_USAGE_COUNT is on, dispatch_path starts as
+ * "not_initialized" and is updated by InitUsageScanDispatch() on first call.
+ * When the feature is compiled out, dispatch_path is "not_enabled" and
+ * the counters are never incremented.
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+UsageScanStats	pg_usage_scan_stats = {.dispatch_path = "not_initialized"};
+#else
+UsageScanStats	pg_usage_scan_stats = {.dispatch_path = "not_enabled"};
+#endif
+
 
 /*
  * usage_scan_scalar
@@ -216,6 +230,22 @@ InitUsageScanDispatch(void)
 		pg_usage_scan = usage_scan_cross_check;
 		pg_usage_decrement = usage_decrement_cross_check;
 	}
+#endif
+
+	/* Record dispatch selection for observability (Patch 4). */
+	pg_usage_scan_stats.dispatch_chunk_size = pg_usage_scan_chunk_size;
+
+#if defined(__x86_64__) || defined(_M_AMD64)
+#ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
+	if (pg_usage_scan_chunk_size == 32)
+		pg_usage_scan_stats.dispatch_path = "avx2";
+	else
+#endif
+		pg_usage_scan_stats.dispatch_path = "sse2";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+	pg_usage_scan_stats.dispatch_path = "neon";
+#else
+	pg_usage_scan_stats.dispatch_path = "scalar";
 #endif
 }
 

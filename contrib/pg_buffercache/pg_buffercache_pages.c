@@ -14,7 +14,9 @@
 #include "funcapi.h"
 #include "port/pg_numa.h"
 #include "storage/buf_internals.h"
+#include "storage/buf_usage_scan.h"
 #include "storage/bufmgr.h"
+#include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
 
@@ -28,6 +30,7 @@
 #define NUM_BUFFERCACHE_EVICT_ALL_ELEM 3
 #define NUM_BUFFERCACHE_MARK_DIRTY_ELEM 2
 #define NUM_BUFFERCACHE_MARK_DIRTY_RELATION_ELEM 3
+#define NUM_BUFFERCACHE_EVICTION_STATS_ELEM 14
 #define NUM_BUFFERCACHE_MARK_DIRTY_ALL_ELEM 3
 
 #define NUM_BUFFERCACHE_OS_PAGES_ELEM	3
@@ -75,6 +78,8 @@ PG_FUNCTION_INFO_V1(pg_buffercache_evict_all);
 PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty);
 PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty_relation);
 PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty_all);
+PG_FUNCTION_INFO_V1(pg_buffercache_eviction_stats);
+PG_FUNCTION_INFO_V1(pg_buffercache_eviction_stats_reset);
 
 
 /* Only need to touch memory once per backend process lifetime */
@@ -884,4 +889,84 @@ pg_buffercache_mark_dirty_all(PG_FUNCTION_ARGS)
 	result = HeapTupleGetDatum(tuple);
 
 	PG_RETURN_DATUM(result);
+}
+
+/*
+ * pg_buffercache_eviction_stats
+ *
+ * Returns one row of backend-local eviction instrumentation counters.
+ * When USE_DECOUPLED_USAGE_COUNT is not compiled in, returns stable
+ * sentinel values (dispatch_path = 'not_enabled', all counters = 0).
+ */
+Datum
+pg_buffercache_eviction_stats(PG_FUNCTION_ARGS)
+{
+	Datum		result;
+	TupleDesc	tupledesc;
+	HeapTuple	tuple;
+	Datum		values[NUM_BUFFERCACHE_EVICTION_STATS_ELEM];
+	bool		nulls[NUM_BUFFERCACHE_EVICTION_STATS_ELEM];
+
+	if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	pg_buffercache_superuser_check("pg_buffercache_eviction_stats");
+
+	memset(nulls, 0, sizeof(nulls));
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	values[0] = CStringGetTextDatum(pg_usage_scan_stats.dispatch_path);
+	values[1] = Int32GetDatum(pg_usage_scan_stats.dispatch_chunk_size);
+	values[2] = Int64GetDatum(pg_usage_scan_stats.chunks_scanned);
+	values[3] = Int64GetDatum(pg_usage_scan_stats.segments_scanned);
+	values[4] = Int64GetDatum(pg_usage_scan_stats.scan_calls);
+	values[5] = Int64GetDatum(pg_usage_scan_stats.decrement_calls);
+	values[6] = Int64GetDatum(pg_usage_scan_stats.candidates_examined);
+	values[7] = Int64GetDatum(pg_usage_scan_stats.rejected_refcount);
+	values[8] = Int64GetDatum(pg_usage_scan_stats.rejected_locked);
+	values[9] = Int64GetDatum(pg_usage_scan_stats.cas_failures);
+	values[10] = Int64GetDatum(pg_usage_scan_stats.victims_found);
+	values[11] = Int64GetDatum(pg_usage_scan_stats.decrement_progress);
+	values[12] = Int64GetDatum(pg_usage_scan_stats.decrement_noprogress);
+	values[13] = Int64GetDatum(pg_usage_scan_stats.trycounter_resets);
+#else
+	values[0] = CStringGetTextDatum("not_enabled");
+	values[1] = Int32GetDatum(0);
+	for (int i = 2; i < NUM_BUFFERCACHE_EVICTION_STATS_ELEM; i++)
+		values[i] = Int64GetDatum((int64) 0);
+#endif
+
+	tuple = heap_form_tuple(tupledesc, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
+ * pg_buffercache_eviction_stats_reset
+ *
+ * Zeros all activity counters.  Dispatch fields are preserved.
+ * No-op when USE_DECOUPLED_USAGE_COUNT is not compiled in.
+ */
+Datum
+pg_buffercache_eviction_stats_reset(PG_FUNCTION_ARGS)
+{
+	pg_buffercache_superuser_check("pg_buffercache_eviction_stats_reset");
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	pg_usage_scan_stats.chunks_scanned = 0;
+	pg_usage_scan_stats.segments_scanned = 0;
+	pg_usage_scan_stats.scan_calls = 0;
+	pg_usage_scan_stats.decrement_calls = 0;
+	pg_usage_scan_stats.candidates_examined = 0;
+	pg_usage_scan_stats.rejected_refcount = 0;
+	pg_usage_scan_stats.rejected_locked = 0;
+	pg_usage_scan_stats.cas_failures = 0;
+	pg_usage_scan_stats.victims_found = 0;
+	pg_usage_scan_stats.decrement_progress = 0;
+	pg_usage_scan_stats.decrement_noprogress = 0;
+	pg_usage_scan_stats.trycounter_resets = 0;
+#endif
+
+	PG_RETURN_VOID();
 }

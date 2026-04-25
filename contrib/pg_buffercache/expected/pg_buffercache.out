@@ -362,3 +362,159 @@ SELECT pg_buffercache_mark_dirty_all() IS NOT NULL;
 (1 row)
 
 DROP ROLE regress_buffercache_normal;
+------
+---- Test pg_buffercache_eviction_stats (Patch 4)
+------
+-- A. Stable contract checks — valid regardless of feature-on/off
+-- SRF shape: returns exactly one row
+SELECT count(*) = 1 FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- dispatch_path is always one of the settled sentinel/ISA values
+SELECT dispatch_path IN ('not_enabled', 'not_initialized',
+                         'scalar', 'sse2', 'avx2', 'neon')
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- dispatch_chunk_size is 0 (sentinel) or 16 or 32 (active)
+SELECT dispatch_chunk_size IN (0, 16, 32)
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- All counter fields are non-negative
+SELECT chunks_scanned >= 0 AND segments_scanned >= 0
+       AND scan_calls >= 0 AND decrement_calls >= 0
+       AND candidates_examined >= 0 AND rejected_refcount >= 0
+       AND rejected_locked >= 0 AND cas_failures >= 0
+       AND victims_found >= 0
+       AND decrement_progress >= 0 AND decrement_noprogress >= 0
+       AND trycounter_resets >= 0
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Reset succeeds (no error, returns void)
+SELECT pg_buffercache_eviction_stats_reset();
+ pg_buffercache_eviction_stats_reset 
+-------------------------------------
+ 
+(1 row)
+
+-- After reset, all activity counters are zero
+SELECT chunks_scanned = 0 AND segments_scanned = 0
+       AND scan_calls = 0 AND decrement_calls = 0
+       AND candidates_examined = 0 AND victims_found = 0
+       AND decrement_progress = 0 AND decrement_noprogress = 0
+       AND trycounter_resets = 0
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Reset preserves dispatch fields (they are NOT zeroed)
+SELECT dispatch_path IN ('not_enabled', 'not_initialized',
+                         'scalar', 'sse2', 'avx2', 'neon')
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- dispatch_chunk_size must be consistent with dispatch_path
+SELECT CASE
+    WHEN dispatch_path IN ('scalar', 'sse2', 'neon') THEN dispatch_chunk_size = 16
+    WHEN dispatch_path = 'avx2' THEN dispatch_chunk_size = 32
+    ELSE dispatch_chunk_size = 0
+END AS dispatch_fields_consistent
+FROM pg_buffercache_eviction_stats();
+ dispatch_fields_consistent 
+----------------------------
+ t
+(1 row)
+
+-- B. Movement and invariant checks — conditional on dispatch state.
+-- When not_enabled or not_initialized, all counters must be 0.
+-- When the feature is active, movement checks validate counter relationships
+-- but do not require any specific counter to be positive, because eviction
+-- and decrement activity cannot be guaranteed in every test environment.
+SELECT pg_buffercache_eviction_stats_reset();
+ pg_buffercache_eviction_stats_reset 
+-------------------------------------
+ 
+(1 row)
+
+-- Smoke workload intended to exercise buffer activity.
+CREATE TABLE eviction_stats_test (id int, payload text);
+INSERT INTO eviction_stats_test
+    SELECT g, repeat('x', 500) FROM generate_series(1, 10000) g;
+SELECT count(*) FROM eviction_stats_test;
+ count 
+-------
+ 10000
+(1 row)
+
+SELECT count(*) FROM eviction_stats_test WHERE id % 2 = 0;
+ count 
+-------
+  5000
+(1 row)
+
+DROP TABLE eviction_stats_test;
+-- Active-path contract: counter relationships must hold regardless of
+-- whether eviction actually occurred.  Decrement invariants are checked
+-- separately, conditional on decrement_calls, because a victim can be
+-- found before Phase 3 runs.
+SELECT CASE
+    WHEN dispatch_path IN ('scalar', 'sse2', 'avx2', 'neon')
+        THEN chunks_scanned >= victims_found
+             AND scan_calls >= victims_found
+             AND candidates_examined >= victims_found
+    ELSE
+        scan_calls = 0 AND decrement_calls = 0
+END AS counter_contract_holds
+FROM pg_buffercache_eviction_stats();
+ counter_contract_holds 
+------------------------
+ t
+(1 row)
+
+-- C. Invariant checks — each group conditional on its own activity
+SELECT
+    -- scan invariants (when scan activity occurred)
+    CASE WHEN scan_calls > 0 THEN
+        segments_scanned >= chunks_scanned
+        AND scan_calls = segments_scanned
+        AND rejected_refcount + rejected_locked + cas_failures + victims_found
+            <= candidates_examined
+    ELSE true END
+    AND
+    -- decrement invariants (when decrement activity occurred)
+    CASE WHEN decrement_calls > 0 THEN
+        decrement_progress + decrement_noprogress = decrement_calls
+    ELSE true END
+AS invariants_hold
+FROM pg_buffercache_eviction_stats();
+ invariants_hold 
+-----------------
+ t
+(1 row)
+
+-- Permission checks
+SET ROLE pg_database_owner;
+SELECT * FROM pg_buffercache_eviction_stats();
+ERROR:  must be superuser to use pg_buffercache_eviction_stats()
+SELECT pg_buffercache_eviction_stats_reset();
+ERROR:  must be superuser to use pg_buffercache_eviction_stats_reset()
+RESET ROLE;
