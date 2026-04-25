@@ -41,6 +41,7 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "common/hashfn_unstable.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -163,6 +164,15 @@ static bool baseSearchPathValid = true;
  */
 static bool searchPathCacheValid = false;
 static MemoryContext SearchPathCacheContext = NULL;
+
+/* Cached search path hash for shared plan cache key. */
+static uint64 cached_search_path_hash = 0;
+static uint64 cached_search_path_generation = 0;
+static bool cached_search_path_hash_valid = false;
+
+#ifdef USE_ASSERT_CHECKING
+static uint64 search_path_hash_compute_count = 0;
+#endif
 
 typedef struct SearchPathCacheKey
 {
@@ -4032,6 +4042,55 @@ SearchPathMatchesCurrentEnvironment(SearchPathMatcher *path)
 
 	return true;
 }
+
+/*
+ * GetSearchPathHash - return a deterministic uint64 hash of the current
+ * resolved search path.
+ *
+ * Hashes the fully resolved activeSearchPath OID list (including implicit
+ * pg_catalog and temp namespace), plus activeTempCreationPending.
+ * Lazily recomputed using activePathGeneration.
+ */
+uint64
+GetSearchPathHash(void)
+{
+	uint64		hash;
+	ListCell   *lc;
+
+	recomputeNamespacePath();
+
+	if (cached_search_path_hash_valid &&
+		cached_search_path_generation == activePathGeneration)
+		return cached_search_path_hash;
+
+	hash = 0;					/* fixed seed */
+
+	foreach(lc, activeSearchPath)
+	{
+		hash = hash_combine64(hash, (uint64) (uint32) lfirst_oid(lc));
+	}
+
+	hash = hash_combine64(hash, (uint64) list_length(activeSearchPath));
+	hash = hash_combine64(hash, (uint64) (activeTempCreationPending ? 1 : 0));
+
+	cached_search_path_hash = hash;
+	cached_search_path_generation = activePathGeneration;
+	cached_search_path_hash_valid = true;
+
+#ifdef USE_ASSERT_CHECKING
+	search_path_hash_compute_count++;
+#endif
+
+	return cached_search_path_hash;
+}
+
+#ifdef USE_ASSERT_CHECKING
+uint64
+GetSearchPathHashComputeCount(void)
+{
+	return search_path_hash_compute_count;
+}
+#endif
 
 /*
  * get_collation_oid - find a collation by possibly qualified name

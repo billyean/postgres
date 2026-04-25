@@ -1,0 +1,4 @@
+comment = 'Test code for search path hash'
+default_version = '1.0'
+module_pathname = '$libdir/test_search_path_hash'
+relocatable = true

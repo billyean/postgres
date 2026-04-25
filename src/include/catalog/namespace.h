@@ -189,6 +189,12 @@ extern SearchPathMatcher *GetSearchPathMatcher(MemoryContext context);
 extern SearchPathMatcher *CopySearchPathMatcher(SearchPathMatcher *path);
 extern bool SearchPathMatchesCurrentEnvironment(SearchPathMatcher *path);
 
+extern uint64 GetSearchPathHash(void);
+
+#ifdef USE_ASSERT_CHECKING
+extern uint64 GetSearchPathHashComputeCount(void);
+#endif
+
 extern Oid	get_collation_oid(List *collname, bool missing_ok);
 extern Oid	get_conversion_oid(List *conname, bool missing_ok);
 extern Oid	FindDefaultConversionProc(int32 for_encoding, int32 to_encoding);

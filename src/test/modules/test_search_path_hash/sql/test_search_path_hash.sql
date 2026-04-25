@@ -1,0 +1,131 @@
+CREATE EXTENSION test_search_path_hash;
+
+-- T1: Same effective search path produces same hash
+SELECT test_search_path_hash() = test_search_path_hash() AS same_hash;
+
+-- T2: Different search path order produces different hash
+CREATE SCHEMA sp_test_a;
+CREATE SCHEMA sp_test_b;
+SELECT test_search_path_hash() AS hash_default \gset
+SET search_path = sp_test_a, sp_test_b, public;
+SELECT test_search_path_hash() AS hash_ab \gset
+SET search_path = sp_test_b, sp_test_a, public;
+SELECT test_search_path_hash() AS hash_ba \gset
+SELECT :'hash_ab'::int8 <> :'hash_default'::int8 AS changed;
+SELECT :'hash_ab'::int8 <> :'hash_ba'::int8 AS order_matters;
+RESET search_path;
+DROP SCHEMA sp_test_a;
+DROP SCHEMA sp_test_b;
+
+-- T3: Text differences resolving to same OIDs produce same hash
+CREATE SCHEMA sp_test_c;
+SET search_path = sp_test_c, public;
+SELECT test_search_path_hash() AS hash1 \gset
+SET search_path = 'sp_test_c', 'public';
+SELECT test_search_path_hash() AS hash2 \gset
+SELECT :'hash1'::int8 = :'hash2'::int8 AS same_despite_quoting;
+RESET search_path;
+DROP SCHEMA sp_test_c;
+
+-- T4: $user expansion — skipped when schema does not exist
+SET search_path = '"$user"', public;
+SELECT test_search_path_hash() AS hash_with_user \gset
+SET search_path = public;
+SELECT test_search_path_hash() AS hash_public_only \gset
+SELECT :'hash_with_user'::int8 = :'hash_public_only'::int8
+       AS user_skipped_when_absent;
+RESET search_path;
+
+-- T5: Implicit vs explicit pg_catalog
+-- Rules: pg_catalog is prepended if not explicitly listed.
+-- search_path = public             -> resolved [pg_catalog, public]
+-- search_path = pg_catalog, public -> resolved [pg_catalog, public] (same)
+-- search_path = public, pg_catalog -> resolved [public, pg_catalog] (different)
+SET search_path = public;
+SELECT test_search_path_hash() AS hash_implicit \gset
+SET search_path = pg_catalog, public;
+SELECT test_search_path_hash() AS hash_explicit_first \gset
+SET search_path = public, pg_catalog;
+SELECT test_search_path_hash() AS hash_explicit_second \gset
+SELECT :'hash_implicit'::int8 = :'hash_explicit_first'::int8
+       AS implicit_equals_explicit_first;
+SELECT :'hash_implicit'::int8 <> :'hash_explicit_second'::int8
+       AS different_when_catalog_last;
+RESET search_path;
+
+-- T6: Temp namespace changes hash after materialization
+SELECT test_search_path_hash() AS hash_before_temp \gset
+CREATE TEMP TABLE sp_test_temp (id int);
+SELECT test_search_path_hash() AS hash_after_temp \gset
+SELECT :'hash_before_temp'::int8 <> :'hash_after_temp'::int8
+       AS temp_changes_hash;
+DROP TABLE sp_test_temp;
+
+-- T7: CREATE SCHEMA / SET search_path invalidation
+SELECT test_search_path_hash() AS hash_before \gset
+CREATE SCHEMA sp_test_inv;
+SET search_path = sp_test_inv, public;
+SELECT test_search_path_hash() AS hash_with_inv \gset
+SELECT :'hash_before'::int8 <> :'hash_with_inv'::int8 AS changed;
+RESET search_path;
+SELECT test_search_path_hash() AS hash_after_reset \gset
+SELECT :'hash_before'::int8 = :'hash_after_reset'::int8 AS restored;
+DROP SCHEMA sp_test_inv;
+
+-- T8: SET LOCAL and transaction rollback
+CREATE SCHEMA sp_test_local;
+SELECT test_search_path_hash() AS hash_before \gset
+BEGIN;
+SET LOCAL search_path = sp_test_local, public;
+SELECT test_search_path_hash() <> :'hash_before'::int8 AS changed_in_txn;
+ROLLBACK;
+SELECT test_search_path_hash() = :'hash_before'::int8
+       AS restored_after_rollback;
+DROP SCHEMA sp_test_local;
+
+-- T9: DROP SCHEMA invalidation
+CREATE SCHEMA sp_test_drop;
+SET search_path = sp_test_drop, public;
+SELECT test_search_path_hash() AS hash_with_schema \gset
+DROP SCHEMA sp_test_drop;
+SELECT test_search_path_hash() AS hash_after_drop \gset
+SELECT :'hash_with_schema'::int8 <> :'hash_after_drop'::int8
+       AS drop_changes_hash;
+RESET search_path;
+
+-- T10: Unrelated GUCs do not change hash
+SELECT test_search_path_hash() AS hash_before \gset
+SET work_mem = '64MB';
+SET enable_seqscan = off;
+SELECT test_search_path_hash() = :'hash_before'::int8 AS unchanged;
+RESET work_mem;
+RESET enable_seqscan;
+
+-- T11: Repeated calls without changes return cached value
+SELECT test_search_path_hash() AS h1 \gset
+SELECT test_search_path_hash() AS h2 \gset
+SELECT test_search_path_hash() AS h3 \gset
+SELECT :'h1'::int8 = :'h2'::int8 AND :'h2'::int8 = :'h3'::int8
+       AS all_same;
+
+-- T12: Lazy recomputation (assert-enabled builds)
+SELECT test_search_path_hash_recompute_count() AS count_before \gset
+SELECT test_search_path_hash() AS discard \gset
+SELECT test_search_path_hash() AS discard \gset
+SELECT test_search_path_hash() AS discard \gset
+SELECT test_search_path_hash_recompute_count() AS count_after \gset
+SELECT CASE
+  WHEN :'count_before'::int8 < 0 THEN true
+  ELSE :'count_after'::int8 = :'count_before'::int8
+END AS no_extra_recompute;
+
+CREATE SCHEMA sp_test_recomp;
+SET search_path = sp_test_recomp, public;
+SELECT test_search_path_hash() AS discard \gset
+SELECT test_search_path_hash_recompute_count() AS count_after_set \gset
+SELECT CASE
+  WHEN :'count_before'::int8 < 0 THEN true
+  ELSE (:'count_after_set'::int8 - :'count_after'::int8) = 1
+END AS one_recompute_after_change;
+RESET search_path;
+DROP SCHEMA sp_test_recomp;
