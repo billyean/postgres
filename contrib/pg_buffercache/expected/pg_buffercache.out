@@ -518,3 +518,67 @@ ERROR:  must be superuser to use pg_buffercache_eviction_stats()
 SELECT pg_buffercache_eviction_stats_reset();
 ERROR:  must be superuser to use pg_buffercache_eviction_stats_reset()
 RESET ROLE;
+------
+---- Test pg_buffercache_eviction_stats — Patch 5 requested_mode column
+------
+-- Note: forced-mode and fallback-WARNING validation require a server
+-- restart (PGC_POSTMASTER GUC) and are documented as restart-required
+-- validation, not ordinary pg_regress coverage.
+-- requested_mode column exists and has valid values.
+-- 'not_initialized' is NOT a valid requested_mode value — only
+-- dispatch_path may be 'not_initialized'.
+SELECT requested_mode IN ('not_enabled',
+                          'auto', 'scalar', 'sse2', 'avx2', 'neon')
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- Under default configuration, requested_mode is 'auto' or 'not_enabled'.
+SELECT requested_mode IN ('not_enabled', 'auto')
+FROM pg_buffercache_eviction_stats();
+ ?column? 
+----------
+ t
+(1 row)
+
+-- When dispatch is active, requested_mode must be a mode name (not sentinel).
+SELECT CASE
+    WHEN dispatch_path IN ('scalar', 'sse2', 'avx2', 'neon')
+        THEN requested_mode IN ('auto', 'scalar', 'sse2', 'avx2', 'neon')
+    ELSE true
+END AS requested_mode_consistent
+FROM pg_buffercache_eviction_stats();
+ requested_mode_consistent 
+---------------------------
+ t
+(1 row)
+
+-- requested_mode is stable across reset (derived from config, not stored state).
+-- dispatch_path and dispatch_chunk_size are also preserved by reset.
+SELECT requested_mode AS rm_before,
+       dispatch_path AS dp_before,
+       dispatch_chunk_size AS cs_before
+INTO TEMP pre_reset FROM pg_buffercache_eviction_stats();
+SELECT pg_buffercache_eviction_stats_reset();
+ pg_buffercache_eviction_stats_reset 
+-------------------------------------
+ 
+(1 row)
+
+SELECT (SELECT rm_before FROM pre_reset) =
+       (SELECT requested_mode FROM pg_buffercache_eviction_stats())
+       AND
+       (SELECT dp_before FROM pre_reset) =
+       (SELECT dispatch_path FROM pg_buffercache_eviction_stats())
+       AND
+       (SELECT cs_before FROM pre_reset) =
+       (SELECT dispatch_chunk_size FROM pg_buffercache_eviction_stats())
+AS dispatch_fields_preserved_across_reset;
+ dispatch_fields_preserved_across_reset 
+----------------------------------------
+ t
+(1 row)
+
+DROP TABLE pre_reset;

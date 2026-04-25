@@ -30,7 +30,7 @@
 #define NUM_BUFFERCACHE_EVICT_ALL_ELEM 3
 #define NUM_BUFFERCACHE_MARK_DIRTY_ELEM 2
 #define NUM_BUFFERCACHE_MARK_DIRTY_RELATION_ELEM 3
-#define NUM_BUFFERCACHE_EVICTION_STATS_ELEM 14
+#define NUM_BUFFERCACHE_EVICTION_STATS_ELEM 15
 #define NUM_BUFFERCACHE_MARK_DIRTY_ALL_ELEM 3
 
 #define NUM_BUFFERCACHE_OS_PAGES_ELEM	3
@@ -895,9 +895,36 @@ pg_buffercache_mark_dirty_all(PG_FUNCTION_ARGS)
  * pg_buffercache_eviction_stats
  *
  * Returns one row of backend-local eviction instrumentation counters.
+ * Patch 5 adds requested_mode (derived from the GUC value at query time).
  * When USE_DECOUPLED_USAGE_COUNT is not compiled in, returns stable
- * sentinel values (dispatch_path = 'not_enabled', all counters = 0).
+ * sentinel values (requested_mode = 'not_enabled', dispatch_path = 'not_enabled',
+ * all counters = 0).
  */
+
+/*
+ * Map the dispatch mode GUC enum value to a display string.
+ *
+ * This is local to pg_buffercache rather than calling an exported backend
+ * function, because the mapping is trivial and avoids adding a cross-module
+ * function export just for one SRF column.  The enum constants come from
+ * buf_usage_scan.h (already included).
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+static const char *
+buffercache_dispatch_mode_name(int mode)
+{
+	switch (mode)
+	{
+		case USAGE_SCAN_DISPATCH_AUTO:   return "auto";
+		case USAGE_SCAN_DISPATCH_SCALAR: return "scalar";
+		case USAGE_SCAN_DISPATCH_SSE2:   return "sse2";
+		case USAGE_SCAN_DISPATCH_AVX2:   return "avx2";
+		case USAGE_SCAN_DISPATCH_NEON:   return "neon";
+	}
+	return "unknown";
+}
+#endif
+
 Datum
 pg_buffercache_eviction_stats(PG_FUNCTION_ARGS)
 {
@@ -915,24 +942,26 @@ pg_buffercache_eviction_stats(PG_FUNCTION_ARGS)
 	memset(nulls, 0, sizeof(nulls));
 
 #ifdef USE_DECOUPLED_USAGE_COUNT
-	values[0] = CStringGetTextDatum(pg_usage_scan_stats.dispatch_path);
-	values[1] = Int32GetDatum(pg_usage_scan_stats.dispatch_chunk_size);
-	values[2] = Int64GetDatum(pg_usage_scan_stats.chunks_scanned);
-	values[3] = Int64GetDatum(pg_usage_scan_stats.segments_scanned);
-	values[4] = Int64GetDatum(pg_usage_scan_stats.scan_calls);
-	values[5] = Int64GetDatum(pg_usage_scan_stats.decrement_calls);
-	values[6] = Int64GetDatum(pg_usage_scan_stats.candidates_examined);
-	values[7] = Int64GetDatum(pg_usage_scan_stats.rejected_refcount);
-	values[8] = Int64GetDatum(pg_usage_scan_stats.rejected_locked);
-	values[9] = Int64GetDatum(pg_usage_scan_stats.cas_failures);
-	values[10] = Int64GetDatum(pg_usage_scan_stats.victims_found);
-	values[11] = Int64GetDatum(pg_usage_scan_stats.decrement_progress);
-	values[12] = Int64GetDatum(pg_usage_scan_stats.decrement_noprogress);
-	values[13] = Int64GetDatum(pg_usage_scan_stats.trycounter_resets);
+	values[0]  = CStringGetTextDatum(buffercache_dispatch_mode_name(pg_usage_scan_dispatch_mode));
+	values[1]  = CStringGetTextDatum(pg_usage_scan_stats.dispatch_path);
+	values[2]  = Int32GetDatum(pg_usage_scan_stats.dispatch_chunk_size);
+	values[3]  = Int64GetDatum(pg_usage_scan_stats.chunks_scanned);
+	values[4]  = Int64GetDatum(pg_usage_scan_stats.segments_scanned);
+	values[5]  = Int64GetDatum(pg_usage_scan_stats.scan_calls);
+	values[6]  = Int64GetDatum(pg_usage_scan_stats.decrement_calls);
+	values[7]  = Int64GetDatum(pg_usage_scan_stats.candidates_examined);
+	values[8]  = Int64GetDatum(pg_usage_scan_stats.rejected_refcount);
+	values[9]  = Int64GetDatum(pg_usage_scan_stats.rejected_locked);
+	values[10] = Int64GetDatum(pg_usage_scan_stats.cas_failures);
+	values[11] = Int64GetDatum(pg_usage_scan_stats.victims_found);
+	values[12] = Int64GetDatum(pg_usage_scan_stats.decrement_progress);
+	values[13] = Int64GetDatum(pg_usage_scan_stats.decrement_noprogress);
+	values[14] = Int64GetDatum(pg_usage_scan_stats.trycounter_resets);
 #else
-	values[0] = CStringGetTextDatum("not_enabled");
-	values[1] = Int32GetDatum(0);
-	for (int i = 2; i < NUM_BUFFERCACHE_EVICTION_STATS_ELEM; i++)
+	values[0]  = CStringGetTextDatum("not_enabled");
+	values[1]  = CStringGetTextDatum("not_enabled");
+	values[2]  = Int32GetDatum(0);
+	for (int i = 3; i < NUM_BUFFERCACHE_EVICTION_STATS_ELEM; i++)
 		values[i] = Int64GetDatum((int64) 0);
 #endif
 

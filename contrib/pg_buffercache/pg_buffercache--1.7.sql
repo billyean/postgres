@@ -126,8 +126,9 @@ CREATE FUNCTION pg_buffercache_mark_dirty_all(
 AS 'MODULE_PATHNAME', 'pg_buffercache_mark_dirty_all'
 LANGUAGE C PARALLEL SAFE VOLATILE;
 
--- Eviction instrumentation (Patch 4).
+-- Eviction instrumentation (Patch 4) with dispatch mode override (Patch 5).
 CREATE FUNCTION pg_buffercache_eviction_stats(
+    OUT requested_mode text,
     OUT dispatch_path text,
     OUT dispatch_chunk_size int4,
     OUT chunks_scanned int8,

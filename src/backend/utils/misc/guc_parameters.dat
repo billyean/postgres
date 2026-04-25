@@ -2360,6 +2360,15 @@
   max => 'INT_MAX',
 },
 
+{ name => 'pg_usage_scan_dispatch_mode', type => 'enum', context => 'PGC_POSTMASTER', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Override dispatch path for chunk-based usage-map scan (experimental).',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'pg_usage_scan_dispatch_mode',
+  boot_val => 'USAGE_SCAN_DISPATCH_AUTO',
+  options => 'usage_scan_dispatch_mode_options',
+  ifdef => 'USE_DECOUPLED_USAGE_COUNT',
+},
+
 { name => 'plan_cache_mode', type => 'enum', context => 'PGC_USERSET', group => 'QUERY_TUNING_OTHER',
   short_desc => 'Controls the planner\'s selection of custom or generic plan.',
   long_desc => 'Prepared statements can have custom and generic plans, and the planner will attempt to choose which is better.  This can be set to override the default behavior.',

@@ -27,6 +27,32 @@
 #define USAGE_SCAN_CHUNK_SIZE	16
 
 /*
+ * Dispatch mode selector for the chunk-based usage-map scan (Patch 5).
+ *
+ * Controls which scan/decrement implementation InitUsageScanDispatch()
+ * selects.  AUTO preserves the Patch 3 best-available auto-detection.
+ * Other values force a specific implementation; if unavailable, the system
+ * logs a WARNING and falls back to SCALAR.
+ *
+ * The enum is always defined when USE_DECOUPLED_USAGE_COUNT is on.
+ * The corresponding GUC pg_usage_scan_dispatch_mode is PGC_POSTMASTER.
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+
+typedef enum UsageScanDispatchMode
+{
+	USAGE_SCAN_DISPATCH_AUTO,
+	USAGE_SCAN_DISPATCH_SCALAR,
+	USAGE_SCAN_DISPATCH_SSE2,
+	USAGE_SCAN_DISPATCH_AVX2,
+	USAGE_SCAN_DISPATCH_NEON
+} UsageScanDispatchMode;
+
+extern PGDLLIMPORT int pg_usage_scan_dispatch_mode;
+
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
+
+/*
  * Result of scanning one contiguous segment of BufferUsageMap.
  * zero_mask: bit i is set if map[i] == 0 (candidate for victim selection).
  * count: number of entries actually scanned (may be < USAGE_SCAN_CHUNK_SIZE

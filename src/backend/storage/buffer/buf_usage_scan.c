@@ -27,6 +27,10 @@
 
 #include "storage/buf_usage_scan.h"
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+#include "utils/guc.h"
+#endif
+
 #ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
 #include "port/pg_cpu.h"
 #endif
@@ -58,6 +62,27 @@ static bool usage_decrement_choose(uint8_t *map, int count);
 UsageScanFn		pg_usage_scan = usage_scan_choose;
 UsageDecrementFn	pg_usage_decrement = usage_decrement_choose;
 int				pg_usage_scan_chunk_size = USAGE_SCAN_CHUNK_SIZE;
+
+/*
+ * Dispatch mode override GUC (Patch 5).
+ *
+ * Enum options array is referenced by guc_parameters.dat.
+ * The variable is read once per backend in InitUsageScanDispatch().
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+
+const struct config_enum_entry usage_scan_dispatch_mode_options[] = {
+	{"auto", USAGE_SCAN_DISPATCH_AUTO, false},
+	{"scalar", USAGE_SCAN_DISPATCH_SCALAR, false},
+	{"sse2", USAGE_SCAN_DISPATCH_SSE2, false},
+	{"avx2", USAGE_SCAN_DISPATCH_AVX2, false},
+	{"neon", USAGE_SCAN_DISPATCH_NEON, false},
+	{NULL, 0, false}
+};
+
+int			pg_usage_scan_dispatch_mode = USAGE_SCAN_DISPATCH_AUTO;
+
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
 
 /*
  * Backend-local instrumentation counters (Patch 4).
@@ -189,16 +214,103 @@ usage_decrement_cross_check(uint8_t *map, int count)
 
 /* ----------------------------------------------------------------
  *	Dispatch initialization
+ *
+ *	Patch 5 addition: when pg_usage_scan_dispatch_mode is set to a
+ *	value other than AUTO, the requested implementation is forced.
+ *	If the requested ISA is not available on this platform/CPU,
+ *	a WARNING is emitted and the system falls back to scalar.
  * ----------------------------------------------------------------
  */
+
+/*
+ * Map the dispatch mode enum to a human-readable string.
+ * Used internally for dispatch_path labeling.
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+static const char *
+dispatch_mode_name(int mode)
+{
+	switch (mode)
+	{
+		case USAGE_SCAN_DISPATCH_AUTO:   return "auto";
+		case USAGE_SCAN_DISPATCH_SCALAR: return "scalar";
+		case USAGE_SCAN_DISPATCH_SSE2:   return "sse2";
+		case USAGE_SCAN_DISPATCH_AVX2:   return "avx2";
+		case USAGE_SCAN_DISPATCH_NEON:   return "neon";
+	}
+	return "unknown";
+}
+#endif
+
 static void
 InitUsageScanDispatch(void)
 {
-	/* Default: scalar */
+	/* Default: scalar (universal fallback). */
 	pg_usage_scan = usage_scan_scalar;
 	pg_usage_decrement = usage_decrement_scalar;
 	pg_usage_scan_chunk_size = USAGE_SCAN_CHUNK_SIZE;
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	switch ((UsageScanDispatchMode) pg_usage_scan_dispatch_mode)
+	{
+		case USAGE_SCAN_DISPATCH_AUTO:
+			/* Fall through to Patch 3 auto-detection below. */
+			break;
+
+		case USAGE_SCAN_DISPATCH_SCALAR:
+			/* Already set to scalar above. */
+			goto dispatch_done;
+
+		case USAGE_SCAN_DISPATCH_SSE2:
+#if defined(__x86_64__) || defined(_M_AMD64)
+			pg_usage_scan = usage_scan_sse2;
+			pg_usage_decrement = usage_decrement_sse2;
+#else
+			ereport(WARNING,
+					(errmsg("requested usage scan dispatch mode \"sse2\" "
+							"is not available on this platform, "
+							"falling back to \"scalar\"")));
+#endif
+			goto dispatch_done;
+
+		case USAGE_SCAN_DISPATCH_AVX2:
+#ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
+			if (x86_feature_available(PG_AVX2))
+			{
+				pg_usage_scan = usage_scan_avx2;
+				pg_usage_decrement = usage_decrement_avx2;
+				pg_usage_scan_chunk_size = 32;
+			}
+			else
+			{
+				ereport(WARNING,
+						(errmsg("requested usage scan dispatch mode \"avx2\" "
+								"is not supported by this CPU, "
+								"falling back to \"scalar\"")));
+			}
+#else
+			ereport(WARNING,
+					(errmsg("requested usage scan dispatch mode \"avx2\" "
+							"is not available on this platform, "
+							"falling back to \"scalar\"")));
+#endif
+			goto dispatch_done;
+
+		case USAGE_SCAN_DISPATCH_NEON:
+#if defined(__aarch64__) || defined(_M_ARM64)
+			pg_usage_scan = usage_scan_neon;
+			pg_usage_decrement = usage_decrement_neon;
+#else
+			ereport(WARNING,
+					(errmsg("requested usage scan dispatch mode \"neon\" "
+							"is not available on this platform, "
+							"falling back to \"scalar\"")));
+#endif
+			goto dispatch_done;
+	}
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
+
+	/* AUTO mode: Patch 3 best-available auto-detection, unchanged. */
 #if defined(__x86_64__) || defined(_M_AMD64)
 
 #ifdef USE_AVX2_USAGE_SCAN_WITH_RUNTIME_CHECK
@@ -222,6 +334,11 @@ InitUsageScanDispatch(void)
 
 #endif
 
+#ifdef USE_DECOUPLED_USAGE_COUNT
+dispatch_done:
+#endif
+
+	/* Install debug cross-check wrappers (assert builds only). */
 #ifdef USE_ASSERT_CHECKING
 	if (pg_usage_scan != usage_scan_scalar)
 	{
@@ -241,9 +358,23 @@ InitUsageScanDispatch(void)
 		pg_usage_scan_stats.dispatch_path = "avx2";
 	else
 #endif
+	if (pg_usage_scan == usage_scan_sse2
+#ifdef USE_ASSERT_CHECKING
+		|| simd_scan_impl == usage_scan_sse2
+#endif
+		)
 		pg_usage_scan_stats.dispatch_path = "sse2";
+	else
+		pg_usage_scan_stats.dispatch_path = "scalar";
 #elif defined(__aarch64__) || defined(_M_ARM64)
-	pg_usage_scan_stats.dispatch_path = "neon";
+	if (pg_usage_scan == usage_scan_neon
+#ifdef USE_ASSERT_CHECKING
+		|| simd_scan_impl == usage_scan_neon
+#endif
+		)
+		pg_usage_scan_stats.dispatch_path = "neon";
+	else
+		pg_usage_scan_stats.dispatch_path = "scalar";
 #else
 	pg_usage_scan_stats.dispatch_path = "scalar";
 #endif
