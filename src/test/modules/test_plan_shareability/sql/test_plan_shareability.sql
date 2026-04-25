@@ -1,0 +1,124 @@
+CREATE EXTENSION test_plan_shareability;
+SET plan_cache_mode = force_generic_plan;
+
+-- T1: Simple generic SELECT is shareable
+PREPARE s1 AS SELECT 1;
+SELECT test_plan_shareability('s1');
+DEALLOCATE s1;
+
+-- T13: Permanent table is shareable
+CREATE TABLE perm_t (x int);
+PREPARE s13 AS SELECT * FROM perm_t;
+SELECT test_plan_shareability('s13');
+DEALLOCATE s13;
+DROP TABLE perm_t;
+
+-- T14: Parameterized prepared statement is shareable (generic)
+PREPARE s14(int) AS SELECT $1;
+SELECT test_plan_shareability('s14');
+DEALLOCATE s14;
+
+-- T15: INSERT on permanent table is shareable (walker covers ModifyTable via lefttree)
+CREATE TABLE dml_t (x int);
+PREPARE s15 AS INSERT INTO dml_t VALUES (1);
+SELECT test_plan_shareability('s15');
+DEALLOCATE s15;
+
+-- T16: UPDATE on permanent table is shareable
+PREPARE s16 AS UPDATE dml_t SET x = 2 WHERE x = 1;
+SELECT test_plan_shareability('s16');
+DEALLOCATE s16;
+
+-- T17: DELETE on permanent table is shareable
+PREPARE s17 AS DELETE FROM dml_t WHERE x = 1;
+SELECT test_plan_shareability('s17');
+DEALLOCATE s17;
+DROP TABLE dml_t;
+
+-- T4: RLS table => DEPENDS_ON_RLS
+-- Use a non-superuser role so RLS is actually enforced (not just RLS_NONE_ENV).
+CREATE TABLE rls_t (x int);
+ALTER TABLE rls_t ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rls_t FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON rls_t USING (true);
+CREATE ROLE regress_rls_user;
+GRANT SELECT ON rls_t TO regress_rls_user;
+SET ROLE regress_rls_user;
+PREPARE s4 AS SELECT * FROM rls_t;
+SELECT test_plan_shareability('s4');
+DEALLOCATE s4;
+RESET ROLE;
+REVOKE SELECT ON rls_t FROM regress_rls_user;
+DROP ROLE regress_rls_user;
+DROP POLICY p ON rls_t;
+ALTER TABLE rls_t DISABLE ROW LEVEL SECURITY;
+ALTER TABLE rls_t NO FORCE ROW LEVEL SECURITY;
+DROP TABLE rls_t;
+
+-- T6: Temp table => TEMP_OBJECT
+CREATE TEMP TABLE tmp_t (x int);
+PREPARE s6 AS SELECT * FROM tmp_t;
+SELECT test_plan_shareability('s6');
+DEALLOCATE s6;
+DROP TABLE tmp_t;
+
+-- T7: Temp sequence => TEMP_OBJECT
+-- nextval('tmp_seq') produces a regclass Const that is added to
+-- plansource->relationOids by fix_expr_common() in setrefs.c.
+CREATE TEMP SEQUENCE tmp_seq;
+PREPARE s7 AS SELECT nextval('tmp_seq');
+SELECT test_plan_shareability('s7');
+DEALLOCATE s7;
+DROP SEQUENCE tmp_seq;
+
+-- ===== Test-module-only helpers for internal-only branches =====
+
+-- Use a simple shareable prepared statement as the base for mutation tests.
+PREPARE s_base AS SELECT 1;
+
+-- Verify base plan is shareable before running mutation tests.
+SELECT test_plan_shareability('s_base') AS base_should_be_none;
+
+-- T_NOT_GENERIC: is_generic_plan = false
+SELECT test_plan_shareability_force_reject('s_base', 'NOT_GENERIC')
+       AS not_generic_ok;
+
+-- T_ONESHOT: plansource->is_oneshot = true
+SELECT test_plan_shareability_force_reject('s_base', 'ONESHOT')
+       AS oneshot_ok;
+
+-- T_INCOMPLETE: plansource->is_complete = false
+SELECT test_plan_shareability_force_reject('s_base', 'INCOMPLETE')
+       AS incomplete_ok;
+
+-- T_POST_REWRITE_HOOK: plansource->postRewrite != NULL
+SELECT test_plan_shareability_force_reject('s_base', 'POST_REWRITE_HOOK')
+       AS post_rewrite_hook_ok;
+
+-- T_DEPENDS_ON_ROLE: plan->dependsOnRole = true
+SELECT test_plan_shareability_force_reject('s_base', 'DEPENDS_ON_ROLE')
+       AS depends_on_role_ok;
+
+-- T_SAVED_XMIN: plan->saved_xmin = valid xid
+SELECT test_plan_shareability_force_reject('s_base', 'SAVED_XMIN')
+       AS saved_xmin_ok;
+
+-- T_EXTENSION_STATE: PlannedStmt.extension_state != NIL
+SELECT test_plan_shareability_force_reject('s_base', 'EXTENSION_STATE')
+       AS extension_state_ok;
+
+-- T_CUSTOM_SCAN: planTree replaced with a minimal CustomScan node
+SELECT test_plan_shareability_force_reject('s_base', 'CUSTOM_SCAN')
+       AS custom_scan_ok;
+
+-- T_FOREIGN_SCAN: planTree replaced with a minimal ForeignScan node
+SELECT test_plan_shareability_force_reject('s_base', 'FOREIGN_SCAN')
+       AS foreign_scan_ok;
+
+-- T_PLANNER_HOOK: planner_hook set to non-NULL
+SELECT test_plan_shareability_force_reject('s_base', 'PLANNER_HOOK')
+       AS planner_hook_ok;
+
+DEALLOCATE s_base;
+
+RESET plan_cache_mode;

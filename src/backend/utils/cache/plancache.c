@@ -61,7 +61,9 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/plannodes.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
@@ -70,6 +72,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/lsyscache.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -2383,4 +2386,276 @@ static void
 ResOwnerReleaseCachedPlan(Datum res)
 {
 	ReleaseCachedPlan((CachedPlan *) DatumGetPointer(res), NULL);
+}
+
+/*
+ * Callback type for the plan-node walker used by PlanIsShareable().
+ * Returns true (abort walk) if the node is unshareable; sets *reason.
+ */
+typedef bool (*PlanWalkerCallback)(Plan *plan,
+								   SharedPlanRejectReason *reason);
+
+/*
+ * walk_plan_node
+ *		Recursively walk a Plan tree, calling the callback on each node.
+ *		Returns true (and sets *reason) if the callback finds an
+ *		unshareable node.
+ */
+static bool
+walk_plan_node(Plan *plan, PlanWalkerCallback callback,
+			   SharedPlanRejectReason *reason)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return false;
+
+	if (callback(plan, reason))
+		return true;
+
+	if (walk_plan_node(plan->lefttree, callback, reason))
+		return true;
+	if (walk_plan_node(plan->righttree, callback, reason))
+		return true;
+
+	switch (nodeTag(plan))
+	{
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+			{
+				if (walk_plan_node((Plan *) lfirst(lc), callback, reason))
+					return true;
+			}
+			break;
+
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+			{
+				if (walk_plan_node((Plan *) lfirst(lc), callback, reason))
+					return true;
+			}
+			break;
+
+		case T_BitmapAnd:
+			foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+			{
+				if (walk_plan_node((Plan *) lfirst(lc), callback, reason))
+					return true;
+			}
+			break;
+
+		case T_BitmapOr:
+			foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+			{
+				if (walk_plan_node((Plan *) lfirst(lc), callback, reason))
+					return true;
+			}
+			break;
+
+		case T_SubqueryScan:
+			if (walk_plan_node(((SubqueryScan *) plan)->subplan,
+							   callback, reason))
+				return true;
+			break;
+
+		case T_CustomScan:
+			/*
+			 * The callback rejects T_CustomScan before reaching here, so
+			 * custom_plans are not walked in the current PlanIsShareable()
+			 * path.  This case exists for future-proofing.
+			 */
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+			{
+				if (walk_plan_node((Plan *) lfirst(lc), callback, reason))
+					return true;
+			}
+			break;
+
+		default:
+			/*
+			 * ModifyTable (PG19+) uses only lefttree for its child plan;
+			 * there is no separate child plan list.  RecursiveUnion uses
+			 * lefttree/righttree only.  All remaining node types reach
+			 * children exclusively through lefttree/righttree above.
+			 */
+			break;
+	}
+
+	return false;
+}
+
+/*
+ * check_unshareable_node
+ *		PlanWalkerCallback that rejects CustomScan and ForeignScan nodes.
+ */
+static bool
+check_unshareable_node(Plan *plan, SharedPlanRejectReason *reason)
+{
+	if (IsA(plan, CustomScan))
+	{
+		*reason = SHARED_PLAN_REJECT_CUSTOM_SCAN;
+		return true;
+	}
+
+	if (IsA(plan, ForeignScan))
+	{
+		*reason = SHARED_PLAN_REJECT_FOREIGN_SCAN;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * plan_tree_contains_unshareable
+ *		Check all PlannedStmts in a CachedPlan for unshareable content.
+ *		Returns true and sets *reason if any unshareable state is found.
+ */
+static bool
+plan_tree_contains_unshareable(CachedPlan *cplan,
+							   SharedPlanRejectReason *reason)
+{
+	ListCell   *lc;
+
+	foreach(lc, cplan->stmt_list)
+	{
+		PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
+
+		if (pstmt->commandType == CMD_UTILITY)
+			continue;
+
+		/* R11: reject non-NIL extension_state */
+		if (pstmt->extension_state != NIL)
+		{
+			*reason = SHARED_PLAN_REJECT_EXTENSION_STATE;
+			return true;
+		}
+
+		/* R9/R10: walk main plan tree */
+		if (walk_plan_node(pstmt->planTree, check_unshareable_node, reason))
+			return true;
+
+		/* Walk all subplans (covers SubPlan and InitPlan references) */
+		{
+			ListCell   *slc;
+
+			foreach(slc, pstmt->subplans)
+			{
+				Plan	   *subplan = (Plan *) lfirst(slc);
+
+				if (subplan == NULL)
+					continue;
+				if (walk_plan_node(subplan, check_unshareable_node, reason))
+					return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
+ * PlanIsShareable
+ *		Determine whether a cached generic plan may be admitted into the
+ *		future shared plan cache.
+ *
+ * Returns true if the plan satisfies all shareability rules.  On false,
+ * *reason is set to the first failing rule (short-circuit evaluation).
+ *
+ * The is_generic_plan flag is provided by the caller to indicate that this
+ * plan was produced by the generic-plan code path; we do not rely solely on
+ * plansource->gplan == plan because that pointer relationship may not hold
+ * at all call sites in the future GetCachedPlan / store path.
+ */
+bool
+PlanIsShareable(CachedPlanSource *plansource,
+				CachedPlan *plan,
+				bool is_generic_plan,
+				SharedPlanRejectReason *reason)
+{
+	ListCell   *lc;
+
+	Assert(reason != NULL);
+
+	/* R1: must be a generic plan */
+	if (plan == NULL || !is_generic_plan)
+	{
+		*reason = SHARED_PLAN_REJECT_NOT_GENERIC;
+		return false;
+	}
+
+#ifdef USE_ASSERT_CHECKING
+	if (plansource->gplan != NULL)
+		Assert(plansource->gplan == plan);
+#endif
+
+	/* R2: plansource must be complete */
+	if (!plansource->is_complete)
+	{
+		*reason = SHARED_PLAN_REJECT_INCOMPLETE;
+		return false;
+	}
+
+	/* R3: must not be a one-shot plan */
+	if (plansource->is_oneshot)
+	{
+		*reason = SHARED_PLAN_REJECT_ONESHOT;
+		return false;
+	}
+
+	/* R4: no postRewrite hook */
+	if (plansource->postRewrite != NULL)
+	{
+		*reason = SHARED_PLAN_REJECT_POST_REWRITE_HOOK;
+		return false;
+	}
+
+	/* R5: no non-core planner hooks active */
+	if (HasUnsafePlannerHooks())
+	{
+		*reason = SHARED_PLAN_REJECT_PLANNER_HOOK;
+		return false;
+	}
+
+	/* R6: must not depend on RLS */
+	if (plansource->dependsOnRLS)
+	{
+		*reason = SHARED_PLAN_REJECT_DEPENDS_ON_RLS;
+		return false;
+	}
+
+	/* R7: plan must not depend on role */
+	if (plan->dependsOnRole)
+	{
+		*reason = SHARED_PLAN_REJECT_DEPENDS_ON_ROLE;
+		return false;
+	}
+
+	/* R8: no temp relations in dependency list */
+	foreach(lc, plansource->relationOids)
+	{
+		Oid			relOid = lfirst_oid(lc);
+		Oid			nspOid;
+
+		nspOid = get_rel_namespace(relOid);
+		if (!OidIsValid(nspOid) || isAnyTempNamespace(nspOid))
+		{
+			*reason = SHARED_PLAN_REJECT_TEMP_OBJECT;
+			return false;
+		}
+	}
+
+	/* R9: no saved_xmin dependency */
+	if (TransactionIdIsValid(plan->saved_xmin))
+	{
+		*reason = SHARED_PLAN_REJECT_SAVED_XMIN;
+		return false;
+	}
+
+	/* R10/R11/R12: plan-tree walker for CustomScan, ForeignScan, extension_state */
+	if (plan_tree_contains_unshareable(plan, reason))
+		return false;
+
+	*reason = SHARED_PLAN_REJECT_NONE;
+	return true;
 }

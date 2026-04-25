@@ -42,6 +42,7 @@ SUBDIRS = \
 		  test_parser \
 		  test_pg_dump \
 		  test_plan_advice \
+		  test_plan_shareability \
 		  test_planner_guc_hash \
 		  test_predtest \
 		  test_radixtree \

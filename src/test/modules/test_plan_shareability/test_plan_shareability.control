@@ -1,0 +1,4 @@
+comment = 'Test code for plan shareability predicate'
+default_version = '1.0'
+module_pathname = '$libdir/test_plan_shareability'
+relocatable = true

@@ -253,4 +253,34 @@ extern bool CachedPlanIsSimplyValid(CachedPlanSource *plansource,
 extern CachedExpression *GetCachedExpression(Node *expr);
 extern void FreeCachedExpression(CachedExpression *cexpr);
 
+/*
+ * Rejection reasons for PlanIsShareable().
+ *
+ * Used internally by the shared plan cache infrastructure to classify why a
+ * cached generic plan cannot be admitted into the shared cache.
+ */
+typedef enum SharedPlanRejectReason
+{
+	SHARED_PLAN_REJECT_NONE = 0,
+	SHARED_PLAN_REJECT_NOT_GENERIC,
+	SHARED_PLAN_REJECT_INCOMPLETE,
+	SHARED_PLAN_REJECT_ONESHOT,
+	SHARED_PLAN_REJECT_POST_REWRITE_HOOK,
+	SHARED_PLAN_REJECT_PLANNER_HOOK,
+	SHARED_PLAN_REJECT_DEPENDS_ON_RLS,
+	SHARED_PLAN_REJECT_DEPENDS_ON_ROLE,
+	SHARED_PLAN_REJECT_TEMP_OBJECT,
+	SHARED_PLAN_REJECT_SAVED_XMIN,
+	SHARED_PLAN_REJECT_CUSTOM_SCAN,
+	SHARED_PLAN_REJECT_FOREIGN_SCAN,
+	SHARED_PLAN_REJECT_EXTENSION_STATE,
+	SHARED_PLAN_REJECT_OVERSIZE,
+	SHARED_PLAN_REJECT_UNKNOWN_UNSHAREABLE,
+} SharedPlanRejectReason;
+
+extern bool PlanIsShareable(CachedPlanSource *plansource,
+							CachedPlan *plan,
+							bool is_generic_plan,
+							SharedPlanRejectReason *reason);
+
 #endif							/* PLANCACHE_H */

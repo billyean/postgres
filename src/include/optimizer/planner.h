@@ -85,4 +85,6 @@ extern RelOptInfo *create_unique_paths(PlannerInfo *root, RelOptInfo *rel,
 extern char *choose_plan_name(PlannerGlobal *glob, const char *name,
 							  bool always_number);
 
+extern bool HasUnsafePlannerHooks(void);
+
 #endif							/* PLANNER_H */

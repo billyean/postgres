@@ -82,6 +82,43 @@ planner_shutdown_hook_type planner_shutdown_hook = NULL;
 /* Hook for plugins to get control when grouping_planner() plans upper rels */
 create_upper_paths_hook_type create_upper_paths_hook = NULL;
 
+/*
+ * HasUnsafePlannerHooks
+ *		Check whether any non-core planner hooks are installed.
+ *
+ * Used by PlanIsShareable() to reject plans generated while extension
+ * planner hooks are active, since those hooks may influence the plan
+ * in backend-local or extension-specific ways not captured by the
+ * SharedPlanKey.  v1 has no safe-hook registry, so any non-NULL hook
+ * is considered unsafe.
+ */
+bool
+HasUnsafePlannerHooks(void)
+{
+	if (planner_hook != NULL)
+		return true;
+	if (planner_setup_hook != NULL)
+		return true;
+	if (planner_shutdown_hook != NULL)
+		return true;
+	if (create_upper_paths_hook != NULL)
+		return true;
+	if (set_rel_pathlist_hook != NULL)
+		return true;
+	if (set_join_pathlist_hook != NULL)
+		return true;
+	if (join_search_hook != NULL)
+		return true;
+	if (join_path_setup_hook != NULL)
+		return true;
+	if (build_simple_rel_hook != NULL)
+		return true;
+	if (joinrel_setup_hook != NULL)
+		return true;
+
+	return false;
+}
+
 
 /* Expression kind codes for preprocess_expression */
 #define EXPRKIND_QUAL				0
