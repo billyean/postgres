@@ -531,6 +531,7 @@
   variable => 'constraint_exclusion',
   boot_val => 'CONSTRAINT_EXCLUSION_PARTITION',
   options => 'constraint_exclusion_options',
+  assign_hook => 'assign_planner_enum_guc',
 },
 
 { name => 'cpu_index_tuple_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -540,6 +541,7 @@
   boot_val => 'DEFAULT_CPU_INDEX_TUPLE_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'cpu_operator_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -549,6 +551,7 @@
   boot_val => 'DEFAULT_CPU_OPERATOR_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'cpu_tuple_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -558,6 +561,7 @@
   boot_val => 'DEFAULT_CPU_TUPLE_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'createrole_self_grant', type => 'string', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
@@ -577,6 +581,7 @@
   boot_val => 'DEFAULT_CURSOR_TUPLE_FRACTION',
   min => '0.0',
   max => '1.0',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'data_checksums', type => 'enum', context => 'PGC_INTERNAL', group => 'PRESET_OPTIONS',
@@ -700,6 +705,7 @@
   variable => 'debug_parallel_query',
   boot_val => 'DEBUG_PARALLEL_OFF',
   options => 'debug_parallel_query_options',
+  assign_hook => 'assign_planner_enum_guc',
 },
 
 { name => 'debug_pretty_print', type => 'bool', context => 'PGC_USERSET', group => 'LOGGING_WHAT',
@@ -843,6 +849,7 @@
   boot_val => 'DEFAULT_EFFECTIVE_CACHE_SIZE',
   min => '1',
   max => 'INT_MAX',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'effective_io_concurrency', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_IO',
@@ -869,6 +876,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_async_append',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_bitmapscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -876,6 +884,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_bitmapscan',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_distinct_reordering', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -883,6 +892,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_distinct_reordering',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_eager_aggregate', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -890,6 +900,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_eager_aggregate',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_gathermerge', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -897,6 +908,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_gathermerge',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_group_by_reordering', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -904,6 +916,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_group_by_reordering',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_hashagg', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -911,6 +924,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_hashagg',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_hashjoin', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -918,6 +932,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_hashjoin',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_incremental_sort', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -925,6 +940,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_incremental_sort',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_indexonlyscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -932,6 +948,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_indexonlyscan',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_indexscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -939,6 +956,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_indexscan',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_material', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -946,6 +964,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_material',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_memoize', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -953,6 +972,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_memoize',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_mergejoin', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -960,6 +980,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_mergejoin',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_nestloop', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -967,6 +988,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_nestloop',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_parallel_append', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -974,6 +996,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_parallel_append',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_parallel_hash', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -981,6 +1004,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_parallel_hash',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_partition_pruning', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -989,6 +1013,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_partition_pruning',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_partitionwise_aggregate', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -996,6 +1021,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_partitionwise_aggregate',
   boot_val => 'false',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_partitionwise_join', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1003,6 +1029,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_partitionwise_join',
   boot_val => 'false',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_presorted_aggregate', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1011,6 +1038,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_presorted_aggregate',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_self_join_elimination', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1018,6 +1046,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_self_join_elimination',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_seqscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1025,6 +1054,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_seqscan',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_sort', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1032,6 +1062,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_sort',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'enable_tidscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1039,6 +1070,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_tidscan',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'event_source', type => 'string', context => 'PGC_POSTMASTER', group => 'LOGGING_WHERE',
@@ -1107,6 +1139,7 @@
   boot_val => '8',
   min => '1',
   max => 'INT_MAX',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'fsync', type => 'bool', context => 'PGC_SIGHUP', group => 'WAL_SETTINGS',
@@ -1129,6 +1162,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'enable_geqo',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'geqo_effort', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
@@ -1138,6 +1172,7 @@
   boot_val => 'DEFAULT_GEQO_EFFORT',
   min => 'MIN_GEQO_EFFORT',
   max => 'MAX_GEQO_EFFORT',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'geqo_generations', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
@@ -1148,6 +1183,7 @@
   boot_val => '0',
   min => '0',
   max => 'INT_MAX',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'geqo_pool_size', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
@@ -1158,6 +1194,7 @@
   boot_val => '0',
   min => '0',
   max => 'INT_MAX',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'geqo_seed', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
@@ -1167,6 +1204,7 @@
   boot_val => '0.0',
   min => '0.0',
   max => '1.0',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'geqo_selection_bias', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
@@ -1176,6 +1214,7 @@
   boot_val => 'DEFAULT_GEQO_SELECTION_BIAS',
   min => 'MIN_GEQO_SELECTION_BIAS',
   max => 'MAX_GEQO_SELECTION_BIAS',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'geqo_threshold', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_GEQO',
@@ -1185,6 +1224,7 @@
   boot_val => '12',
   min => '2',
   max => 'INT_MAX',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'gin_fuzzy_search_limit', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_OTHER',
@@ -1218,6 +1258,7 @@
   boot_val => '2.0',
   min => '1.0',
   max => '1000.0',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'hba_file', type => 'string', context => 'PGC_POSTMASTER', group => 'FILE_LOCATIONS',
@@ -1447,6 +1488,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'jit_enabled',
   boot_val => 'false',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'jit_above_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -1457,6 +1499,7 @@
   boot_val => '100000',
   min => '-1',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 # This is not guaranteed to be available, but given it's a developer
@@ -1491,6 +1534,7 @@
   boot_val => '500000',
   min => '-1',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'jit_optimize_above_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -1501,6 +1545,7 @@
   boot_val => '500000',
   min => '-1',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 # This is not guaranteed to be available, but given it's a developer
@@ -1535,6 +1580,7 @@
   boot_val => '8',
   min => '1',
   max => 'INT_MAX',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'krb_caseins_users', type => 'bool', context => 'PGC_SIGHUP', group => 'CONN_AUTH_AUTH',
@@ -2068,6 +2114,7 @@
   boot_val => '2',
   min => '0',
   max => 'MAX_PARALLEL_WORKER_LIMIT',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'max_pred_locks_per_page', type => 'int', context => 'PGC_SIGHUP', group => 'LOCK_MANAGEMENT',
@@ -2223,6 +2270,7 @@
   boot_val => '8.0',
   min => '0.0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'min_parallel_index_scan_size', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -2233,6 +2281,7 @@
   boot_val => '(512 * 1024) / BLCKSZ',
   min => '0',
   max => 'INT_MAX / 3',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'min_parallel_table_scan_size', type => 'int', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -2243,6 +2292,7 @@
   boot_val => '(8 * 1024 * 1024) / BLCKSZ',
   min => '0',
   max => 'INT_MAX / 3',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'min_wal_size', type => 'int', context => 'PGC_SIGHUP', group => 'WAL_CHECKPOINTS',
@@ -2315,6 +2365,7 @@
   flags => 'GUC_EXPLAIN',
   variable => 'parallel_leader_participation',
   boot_val => 'true',
+  assign_hook => 'assign_planner_bool_guc',
 },
 
 { name => 'parallel_setup_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -2324,6 +2375,7 @@
   boot_val => 'DEFAULT_PARALLEL_SETUP_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'parallel_tuple_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
@@ -2333,6 +2385,7 @@
   boot_val => 'DEFAULT_PARALLEL_TUPLE_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'password_encryption', type => 'enum', context => 'PGC_USERSET', group => 'CONN_AUTH_AUTH',
@@ -2417,6 +2470,7 @@
   boot_val => 'DEFAULT_RANDOM_PAGE_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'recovery_end_command', type => 'string', context => 'PGC_SIGHUP', group => 'WAL_ARCHIVE_RECOVERY',
@@ -2519,6 +2573,7 @@
   boot_val => 'DEFAULT_RECURSIVE_WORKTABLE_FACTOR',
   min => '0.001',
   max => '1000000.0',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'remove_temp_files_after_crash', type => 'bool', context => 'PGC_SIGHUP', group => 'DEVELOPER_OPTIONS',
@@ -2636,6 +2691,7 @@
   boot_val => 'DEFAULT_SEQ_PAGE_COST',
   min => '0',
   max => 'DBL_MAX',
+  assign_hook => 'assign_planner_real_guc',
 },
 
 { name => 'serializable_buffers', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
@@ -3630,6 +3686,7 @@
   boot_val => '4096',
   min => '64',
   max => 'MAX_KILOBYTES',
+  assign_hook => 'assign_planner_int_guc',
 },
 
 { name => 'xmlbinary', type => 'enum', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',

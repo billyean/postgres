@@ -101,6 +101,7 @@
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/plancache.h"
+#include "utils/planner_guc_hash.h"
 #include "utils/ps_status.h"
 #include "utils/rls.h"
 #include "utils/xml.h"

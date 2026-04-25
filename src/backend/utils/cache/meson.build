@@ -9,6 +9,7 @@ backend_sources += files(
   'lsyscache.c',
   'partcache.c',
   'plancache.c',
+  'planner_guc_hash.c',
   'relcache.c',
   'relfilenumbermap.c',
   'relmapper.c',

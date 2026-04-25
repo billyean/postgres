@@ -1,0 +1,4 @@
+comment = 'Test code for planner GUC hash'
+default_version = '1.0'
+module_pathname = '$libdir/test_planner_guc_hash'
+relocatable = true

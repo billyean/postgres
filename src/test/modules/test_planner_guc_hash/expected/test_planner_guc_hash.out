@@ -1,0 +1,207 @@
+CREATE EXTENSION test_planner_guc_hash;
+-- T1: Same settings produce same hash
+SELECT test_planner_guc_hash() = test_planner_guc_hash() AS same_hash;
+ same_hash 
+-----------
+ t
+(1 row)
+
+-- T2: Changing an enable_* flag changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET enable_seqscan = off;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET enable_seqscan;
+-- T3: Changing a cost constant changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET random_page_cost = 2.0;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET random_page_cost;
+-- T4: Changing a parallel setting changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET max_parallel_workers_per_gather = 0;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+-- T5: Changing a GEQO setting changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET geqo_effort = 10;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET geqo_effort;
+-- T6: Changing a collapse limit changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET join_collapse_limit = 1;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET join_collapse_limit;
+-- T7: Changing a JIT threshold changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET jit_above_cost = 0;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET jit_above_cost;
+-- T8: Changing work_mem changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET work_mem = '64MB';
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET work_mem;
+-- T9: Changing hash_mem_multiplier changes the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET hash_mem_multiplier = 4.0;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET hash_mem_multiplier;
+-- T10: Resetting a GUC returns to previous hash
+SELECT test_planner_guc_hash() AS hash_default \gset
+SET enable_hashjoin = off;
+SELECT test_planner_guc_hash() <> :'hash_default'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET enable_hashjoin;
+SELECT test_planner_guc_hash() = :'hash_default'::int8 AS restored;
+ restored 
+----------
+ t
+(1 row)
+
+-- T11: Unrelated GUCs do not change the hash
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET statement_timeout = '5s';
+SET log_min_duration_statement = 1000;
+SET client_min_messages = 'warning';
+SELECT test_planner_guc_hash() = :'hash_before'::int8 AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+RESET statement_timeout;
+RESET log_min_duration_statement;
+RESET client_min_messages;
+-- T12: SET LOCAL and transaction rollback
+SELECT test_planner_guc_hash() AS hash_before \gset
+BEGIN;
+SET LOCAL enable_nestloop = off;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed_in_txn;
+ changed_in_txn 
+----------------
+ t
+(1 row)
+
+ROLLBACK;
+SELECT test_planner_guc_hash() = :'hash_before'::int8 AS restored_after_rollback;
+ restored_after_rollback 
+-------------------------
+ t
+(1 row)
+
+-- T13: Lazy recomputation (recompute count)
+-- In assert builds, recompute_count tracks actual recomputes.
+-- In non-assert builds, it returns -1; we skip strict checking.
+SELECT test_planner_guc_hash_recompute_count() AS count_before \gset
+SELECT test_planner_guc_hash() AS discard \gset
+SELECT test_planner_guc_hash() AS discard \gset
+SELECT test_planner_guc_hash() AS discard \gset
+SELECT test_planner_guc_hash_recompute_count() AS count_after \gset
+-- Three calls with no GUC change: no recomputation should occur.
+SELECT CASE
+  WHEN :'count_before'::int8 < 0 THEN true   -- non-assert: skip
+  ELSE :'count_after'::int8 = :'count_before'::int8
+END AS no_extra_recompute;
+ no_extra_recompute 
+--------------------
+ t
+(1 row)
+
+-- One SET, then one hash call: exactly one recomputation.
+SET enable_seqscan = off;
+SELECT test_planner_guc_hash() AS discard \gset
+SELECT test_planner_guc_hash_recompute_count() AS count_after_set \gset
+SELECT CASE
+  WHEN :'count_before'::int8 < 0 THEN true   -- non-assert: skip
+  ELSE (:'count_after_set'::int8 - :'count_after'::int8) = 1
+END AS one_recompute_after_set;
+ one_recompute_after_set 
+-------------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+-- Two SETs, then one hash call: still exactly one recomputation.
+SELECT test_planner_guc_hash_recompute_count() AS count_before2 \gset
+SET enable_hashjoin = off;
+SET random_page_cost = 2.0;
+SELECT test_planner_guc_hash() AS discard \gset
+SELECT test_planner_guc_hash_recompute_count() AS count_after2 \gset
+SELECT CASE
+  WHEN :'count_before2'::int8 < 0 THEN true  -- non-assert: skip
+  ELSE (:'count_after2'::int8 - :'count_before2'::int8) = 1
+END AS one_recompute_after_two_sets;
+ one_recompute_after_two_sets 
+------------------------------
+ t
+(1 row)
+
+RESET enable_hashjoin;
+RESET random_page_cost;
+-- T14 (cross-backend determinism) is tested via TAP test
+-- T15: Additional coverage - test multiple GUC categories together
+SELECT test_planner_guc_hash() AS hash_before \gset
+SET enable_mergejoin = off;
+SET cpu_tuple_cost = 0.02;
+SET from_collapse_limit = 4;
+SET geqo_seed = 0.5;
+SELECT test_planner_guc_hash() <> :'hash_before'::int8 AS changed;
+ changed 
+---------
+ t
+(1 row)
+
+RESET enable_mergejoin;
+RESET cpu_tuple_cost;
+RESET from_collapse_limit;
+RESET geqo_seed;
+SELECT test_planner_guc_hash() = :'hash_before'::int8 AS restored;
+ restored 
+----------
+ t
+(1 row)
+
