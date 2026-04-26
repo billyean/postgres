@@ -165,6 +165,16 @@ static char epoch_bridge_query_api_last_source = 'n';
 static char epoch_bridge_context_last_source = 'n';
 
 /*
+ * Test-only instrumentation (Patch 23): records whether the consumer
+ * used the EpochBridgeMVCCDecision decision contract.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'd' = EpochBridgeMVCCDecision was called
+ */
+static char epoch_decision_last_source = 'n';
+
+/*
  * Test-only instrumentation: records which call site last invoked
  * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
  * the function, via EpochMVCCSetCaller().
@@ -1717,6 +1727,144 @@ FullXidInMVCCSnapshot(FullTransactionId fxid, Snapshot snapshot)
  *	caller (heap_fetch) falls back to native HeapTupleSatisfiesVisibility.
  * ----------------------------------------------------------------
  */
+
+/*
+ * EpochBridgeMVCCDecision -- bounded tuple-visibility decision (Patch 23).
+ *
+ * Given a bridge context (Patch 22), a Phase 3 interpretation result,
+ * the tuple header, and the snapshot, returns VISIBLE/INVISIBLE/
+ * CANNOT_DETERMINE.
+ *
+ * Encapsulates:
+ *   - Phase 4 classification (horizon fast-reject + hint bits + CLOG)
+ *   - MultiXact effective-updater resolution
+ *   - Full MVCC visibility decision tree with CID checks
+ *   - Phase 5 membership queries via EpochBridgeXidInSnapshot
+ */
+static EpochMVCCResult
+EpochBridgeMVCCDecision(const EpochBridgeContext *bctx,
+						const EpochTupleInterpResult *interp,
+						HeapTupleHeader tuple,
+						Snapshot snapshot)
+{
+	EpochXidStatus	xmin_status,
+					xmax_status;
+	TransactionId	xmin_xid,
+					xmax_xid,
+					effective_xmax;
+
+	epoch_decision_last_source = 'd';
+
+	xmin_xid = XidFromFullTransactionId(interp->full_xmin);
+
+	/*
+	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
+	 *
+	 * The epoch_horizon for fast-reject is obtained through
+	 * EpochBridgeContextHorizon, which returns InvalidFullTransactionId
+	 * when the 64-bit path is not active (no consumer branching needed).
+	 */
+	{
+		FullTransactionId epoch_horizon = EpochBridgeContextHorizon(bctx);
+		bool		use_64 = EpochBridgeContextUses64Bit(bctx);
+
+		xmin_status = EpochClassifyXidStatus(xmin_xid,
+						use_64 ? interp->full_xmin : InvalidFullTransactionId,
+						epoch_horizon,
+						tuple, true, NULL);
+		xmax_status = EpochClassifyXidStatus(
+						HeapTupleHeaderGetRawXmax(tuple),
+						use_64 ? interp->full_xmax : InvalidFullTransactionId,
+						epoch_horizon,
+						tuple, false,
+						&effective_xmax);
+	}
+
+	/* Unresolvable MultiXact: fall back to native path */
+	if (xmax_status == EPOCH_XID_MULTIXACT_UNSUPPORTED)
+	{
+		epoch_mvcc_last_path = 'u';
+		return EPOCH_MVCC_CANNOT_DETERMINE;
+	}
+
+	/*
+	 * Determine the xmax XID to use for snapshot comparison.
+	 * For MultiXact: use the effective updater from Phase 4 decomposition.
+	 * For regular xmax: use the epoch-reconstructed XID from Phase 3.
+	 */
+	if (interp->xmax_interp == EPOCH_INTERP_MULTIXACT)
+		xmax_xid = effective_xmax;
+	else
+		xmax_xid = XidFromFullTransactionId(interp->full_xmax);
+
+	/* Test-only: record which internal path was taken */
+	if (interp->xmin_interp == EPOCH_INTERP_MATERIALIZED)
+		epoch_mvcc_last_path = EpochBridgeContextUses64Bit(bctx) ? 's' : 'm';
+	else
+		epoch_mvcc_last_path = 'd';
+
+	/* --- xmin checks --- */
+
+	if (xmin_status == EPOCH_XID_FROZEN)
+		goto check_xmax;
+
+	if (xmin_status == EPOCH_XID_ABORTED)
+		return EPOCH_MVCC_INVISIBLE;
+
+	if (xmin_status == EPOCH_XID_IN_PROGRESS)
+	{
+		if (TransactionIdIsCurrentTransactionId(xmin_xid))
+		{
+			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid)
+				return EPOCH_MVCC_INVISIBLE;	/* inserted after scan started */
+			goto check_xmax;
+		}
+		return EPOCH_MVCC_INVISIBLE;	/* other xact's uncommitted insert */
+	}
+
+	Assert(xmin_status == EPOCH_XID_COMMITTED);
+
+	if (EpochBridgeXidInSnapshot(bctx, interp->full_xmin, xmin_xid))
+		return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
+
+check_xmax:
+
+	if (xmax_status == EPOCH_XID_INVALID_UNSET ||
+		xmax_status == EPOCH_XID_ABORTED ||
+		xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
+		return EPOCH_MVCC_VISIBLE;
+
+	if (xmax_status == EPOCH_XID_IN_PROGRESS)
+	{
+		if (TransactionIdIsCurrentTransactionId(xmax_xid))
+		{
+			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
+				return EPOCH_MVCC_VISIBLE;	/* deleted after scan started */
+			return EPOCH_MVCC_INVISIBLE;	/* deleted before scan started */
+		}
+		return EPOCH_MVCC_VISIBLE;	/* other xact's uncommitted delete */
+	}
+
+	Assert(xmax_status == EPOCH_XID_COMMITTED);
+
+	{
+		FullTransactionId full_xmax_for_snap = interp->full_xmax;
+		TransactionId xmax_xid32 = xmax_xid;
+
+		if (interp->xmax_interp == EPOCH_INTERP_MULTIXACT &&
+			EpochBridgeContextUses64Bit(bctx))
+		{
+			full_xmax_for_snap = EpochBridgeContextPromoteXid(bctx,
+															  effective_xmax);
+			xmax_xid32 = effective_xmax;
+		}
+
+		if (EpochBridgeXidInSnapshot(bctx, full_xmax_for_snap, xmax_xid32))
+			return EPOCH_MVCC_VISIBLE;	/* deleter committed after snapshot */
+	}
+
+	return EPOCH_MVCC_INVISIBLE;	/* deleter committed, visible in snapshot */
+}
 EpochMVCCResult
 EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 							Snapshot snapshot, Buffer heapbuf)
@@ -1728,11 +1876,6 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	EpochSlotData *slot = NULL;
 	Buffer		epochbuf = InvalidBuffer;
 	EpochTupleInterpResult interp;
-	EpochXidStatus xmin_status,
-				xmax_status;
-	TransactionId xmin_xid,
-				xmax_xid,
-				effective_xmax;
 	EpochBridgeContext bctx;
 
 	Assert(snapshot != NULL);
@@ -1745,6 +1888,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	epoch_membership_last_source = 'n';
 	epoch_bridge_query_api_last_source = 'n';
 	epoch_bridge_context_last_source = 'n';
+	epoch_decision_last_source = 'n';
 
 	/* Read epoch slot data (read-only: no create/extend/dirty) */
 	is_materialized = EpochRelationIsMaterialized(rel);
@@ -1779,21 +1923,9 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 		UnlockReleaseBuffer(epochbuf);
 
 	/*
-	 * Use the epoch-reconstructed XIDs for the MVCC logic below.
-	 * For non-MultiXact xmax, the XID comes from Phase 3 reconstruction.
-	 * For MultiXact xmax, Phase 4 decomposes to find the effective updater.
-	 */
-	xmin_xid = XidFromFullTransactionId(interp.full_xmin);
-
-	/*
-	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 22).
+	 * Stage 1 bounded guard (Patch 11, unchanged through Patch 23).
 	 *
-	 * Patch 22: the consumer now uses a bridge context bundle instead of
-	 * separate accessors.  EpochBridgeContextInit resolves the guard once.
-	 * The consumer never reads context fields directly — it uses the
-	 * five context functions (Init, XidInSnapshot, Horizon, Uses64Bit,
-	 * PromoteXid) exclusively.
-	 *
+	 * EpochBridgeContextInit resolves the guard once.
 	 * Two production runtime modes (unchanged from Patch 20):
 	 *   Mode 1: EpochBridgeContextUses64Bit == true  -> view path
 	 *   Mode 2: EpochBridgeContextUses64Bit == false -> native 32-bit
@@ -1801,129 +1933,10 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 	EpochBridgeContextInit(&bctx, snapshot);
 
 	/*
-	 * Phase 4: classify xmin and xmax status (hint bits + CLOG).
-	 *
-	 * Patch 22: the epoch_horizon for fast-reject is obtained through
-	 * EpochBridgeContextHorizon, which returns InvalidFullTransactionId
-	 * when the 64-bit path is not active (no consumer branching needed).
+	 * Patch 23: one decision call replaces the former inline Phase 4
+	 * classification + MVCC decision tree + CID checks + membership queries.
 	 */
-	{
-		FullTransactionId epoch_horizon = EpochBridgeContextHorizon(&bctx);
-		bool		use_64 = EpochBridgeContextUses64Bit(&bctx);
-
-		xmin_status = EpochClassifyXidStatus(xmin_xid,
-						use_64 ? interp.full_xmin : InvalidFullTransactionId,
-						epoch_horizon,
-						tuple, true, NULL);
-		xmax_status = EpochClassifyXidStatus(
-						HeapTupleHeaderGetRawXmax(tuple),
-						use_64 ? interp.full_xmax : InvalidFullTransactionId,
-						epoch_horizon,
-						tuple, false,
-						&effective_xmax);
-	}
-
-	/* Unresolvable MultiXact: fall back to native path */
-	if (xmax_status == EPOCH_XID_MULTIXACT_UNSUPPORTED)
-	{
-		epoch_mvcc_last_path = 'u';
-		return EPOCH_MVCC_CANNOT_DETERMINE;
-	}
-
-	/*
-	 * Determine the xmax XID to use for snapshot comparison.
-	 * For MultiXact: use the effective updater from Phase 4 decomposition.
-	 * For regular xmax: use the epoch-reconstructed XID from Phase 3.
-	 */
-	if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT)
-		xmax_xid = effective_xmax;
-	else
-		xmax_xid = XidFromFullTransactionId(interp.full_xmax);
-
-	/* Test-only: record which internal path was taken */
-	if (interp.xmin_interp == EPOCH_INTERP_MATERIALIZED)
-		epoch_mvcc_last_path = EpochBridgeContextUses64Bit(&bctx) ? 's' : 'm';
-	else
-		epoch_mvcc_last_path = 'd';
-
-	/*
-	 * MVCC visibility logic with complete CID checks.
-	 * Uses epoch-reconstructed xmin_xid and xmax_xid from above.
-	 */
-
-	/* --- xmin checks --- */
-
-	if (xmin_status == EPOCH_XID_FROZEN)
-		goto check_xmax;
-
-	if (xmin_status == EPOCH_XID_ABORTED)
-		return EPOCH_MVCC_INVISIBLE;
-
-	if (xmin_status == EPOCH_XID_IN_PROGRESS)
-	{
-		if (TransactionIdIsCurrentTransactionId(xmin_xid))
-		{
-			if (HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid)
-				return EPOCH_MVCC_INVISIBLE;	/* inserted after scan started */
-			goto check_xmax;
-		}
-		return EPOCH_MVCC_INVISIBLE;	/* other xact's uncommitted insert */
-	}
-
-	/*
-	 * xmin committed: snapshot membership check.
-	 *
-	 * Patch 22: unified via EpochBridgeXidInSnapshot, which handles
-	 * both the view path and native 32-bit path internally.
-	 */
-	Assert(xmin_status == EPOCH_XID_COMMITTED);
-
-	if (EpochBridgeXidInSnapshot(&bctx, interp.full_xmin, xmin_xid))
-		return EPOCH_MVCC_INVISIBLE;	/* inserter committed after snapshot */
-
-check_xmax:
-
-	if (xmax_status == EPOCH_XID_INVALID_UNSET ||
-		xmax_status == EPOCH_XID_ABORTED ||
-		xmax_status == EPOCH_XID_MULTIXACT_LOCKERS_ONLY)
-		return EPOCH_MVCC_VISIBLE;
-
-	if (xmax_status == EPOCH_XID_IN_PROGRESS)
-	{
-		if (TransactionIdIsCurrentTransactionId(xmax_xid))
-		{
-			if (HeapTupleHeaderGetCmax(tuple) >= snapshot->curcid)
-				return EPOCH_MVCC_VISIBLE;	/* deleted after scan started */
-			return EPOCH_MVCC_INVISIBLE;	/* deleted before scan started */
-		}
-		return EPOCH_MVCC_VISIBLE;	/* other xact's uncommitted delete */
-	}
-
-	/*
-	 * xmax committed: snapshot membership check.
-	 *
-	 * Patch 22: unified via EpochBridgeXidInSnapshot, with MultiXact
-	 * xmax promotion handled through EpochBridgeContextPromoteXid.
-	 */
-	Assert(xmax_status == EPOCH_XID_COMMITTED);
-
-	{
-		FullTransactionId full_xmax_for_snap = interp.full_xmax;
-		TransactionId xmax_xid32 = xmax_xid;
-
-		if (interp.xmax_interp == EPOCH_INTERP_MULTIXACT &&
-			EpochBridgeContextUses64Bit(&bctx))
-		{
-			full_xmax_for_snap = EpochBridgeContextPromoteXid(&bctx,
-															  effective_xmax);
-			xmax_xid32 = effective_xmax;
-		}
-
-		if (EpochBridgeXidInSnapshot(&bctx, full_xmax_for_snap, xmax_xid32))
-			return EPOCH_MVCC_VISIBLE;	/* deleter committed after snapshot */
-	}
-
-	return EPOCH_MVCC_INVISIBLE;	/* deleter committed, visible in snapshot */
+	return EpochBridgeMVCCDecision(&bctx, &interp, tuple, snapshot);
 }
 
 
@@ -3936,6 +3949,37 @@ epoch_xid_bridge_context_source(PG_FUNCTION_ARGS)
 	{
 		case 'c':
 			result = "context";
+			break;
+		default:
+			result = "not_reached";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
+ * epoch_xid_bridge_decision_source() -> text
+ *
+ * TEST-ONLY function (Patch 23).  Returns whether the last
+ * EpochHeapTupleSatisfiesMVCC invocation used the EpochBridgeMVCCDecision
+ * decision contract.
+ *
+ * Returns:
+ *   'decision'     - EpochBridgeMVCCDecision was called
+ *   'not_reached'  - decision contract was not invoked (initial state)
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_decision_source);
+
+Datum
+epoch_xid_bridge_decision_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_decision_last_source)
+	{
+		case 'd':
+			result = "decision";
 			break;
 		default:
 			result = "not_reached";

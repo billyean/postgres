@@ -2432,3 +2432,90 @@ CLOSE epoch_p22_cur;
 COMMIT;
 
 DROP TABLE epoch_p22;
+
+-- ================================================================
+-- Patch 23: Bounded tuple-visibility decision contract
+--
+-- Tests that the consumer now goes through EpochBridgeMVCCDecision,
+-- that the runtime-mode split is unchanged, and that earlier bounded
+-- behavior is preserved.
+-- ================================================================
+
+CREATE TABLE epoch_p23 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p23 VALUES (1, 'decision_contract_test');
+
+-- P23_a: TID scan consumer uses the decision contract (view path)
+
+BEGIN;
+
+SELECT * FROM epoch_p23 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+-- P23_b: Index scan consumer uses the decision contract (view path)
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p23 WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P23_c: Guard disabled -> decision contract still called, native fallback mode
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p23 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- P23_d: View path restores after re-enabling guard
+
+BEGIN;
+
+SELECT * FROM epoch_p23 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+-- P23_e: Copied snapshot preserves decision contract usage
+
+BEGIN;
+
+DECLARE epoch_p23_cur CURSOR FOR
+    SELECT * FROM epoch_p23 WHERE ctid = '(0,1)';
+
+FETCH NEXT FROM epoch_p23_cur;
+
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+CLOSE epoch_p23_cur;
+
+COMMIT;
+
+DROP TABLE epoch_p23;

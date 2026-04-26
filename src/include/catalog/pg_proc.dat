@@ -12956,4 +12956,9 @@
   proname => 'epoch_xid_bridge_context_source', provolatile => 'v',
   prorettype => 'text', proargtypes => '',
   prosrc => 'epoch_xid_bridge_context_source' },
+{ oid => '9932',
+  descr => 'TEST-ONLY: report whether consumer used the decision contract',
+  proname => 'epoch_xid_bridge_decision_source', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_decision_source' },
 ]
