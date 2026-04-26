@@ -1,0 +1,41 @@
+CREATE EXTENSION test_shared_plan_cache_shmem;
+-- T1/T2: Default startup: backend attached and active
+SELECT test_shared_plan_cache_attached() AS attached;
+ attached 
+----------
+ t
+(1 row)
+
+SELECT test_shared_plan_cache_active() AS active;
+ active 
+--------
+ t
+(1 row)
+
+-- T3: dshash handles are valid
+SELECT test_shared_plan_cache_handles_valid() AS handles_valid;
+ handles_valid 
+---------------
+ t
+(1 row)
+
+-- T9: No entries yet
+SELECT test_shared_plan_cache_current_entries() AS current_entries;
+ current_entries 
+-----------------
+               0
+(1 row)
+
+-- T7: Repeated attach is idempotent
+SELECT test_shared_plan_cache_force_attach() AS still_attached;
+ still_attached 
+----------------
+ t
+(1 row)
+
+SELECT test_shared_plan_cache_active() AS still_active;
+ still_active 
+--------------
+ t
+(1 row)
+

@@ -10,6 +10,7 @@ backend_sources += files(
   'partcache.c',
   'plancache.c',
   'planner_guc_hash.c',
+  'shared_plancache.c',
   'relcache.c',
   'relfilenumbermap.c',
   'relmapper.c',

@@ -1,0 +1,4 @@
+comment = 'Test code for shared plan cache shmem setup'
+default_version = '1.0'
+module_pathname = '$libdir/test_shared_plan_cache_shmem'
+relocatable = true

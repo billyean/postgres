@@ -22,6 +22,7 @@ OBJS = \
 	partcache.o \
 	plancache.o \
 	planner_guc_hash.o \
+	shared_plancache.o \
 	relcache.o \
 	relfilenumbermap.o \
 	relmapper.o \

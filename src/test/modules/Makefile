@@ -52,6 +52,7 @@ SUBDIRS = \
 		  test_rls_hooks \
 		  test_saslprep \
 		  test_search_path_hash \
+		  test_shared_plan_cache_shmem \
 		  test_shmem \
 		  test_shm_mq \
 		  test_slru \

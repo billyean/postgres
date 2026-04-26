@@ -67,6 +67,7 @@
 #include "utils/pg_locale.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
+#include "utils/shared_plancache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
@@ -842,6 +843,9 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	RelationCacheInitialize();
 	InitCatalogCache();
 	InitPlanCache();
+
+	/* Attach to the shared plan cache if available */
+	SharedPlanCacheAttach();
 
 	/* Initialize portal manager */
 	EnablePortalManager();

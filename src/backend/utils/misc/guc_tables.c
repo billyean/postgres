@@ -103,6 +103,7 @@
 #include "utils/plancache.h"
 #include "utils/planner_guc_hash.h"
 #include "utils/ps_status.h"
+#include "utils/shared_plancache.h"
 #include "utils/rls.h"
 #include "utils/xml.h"
 
