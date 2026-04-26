@@ -552,6 +552,16 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	CurrentSnapshot->snapXactCompletionCount = 0;
 
 	/*
+	 * Patch 26: re-derive bridge state from the imported 32-bit fields.
+	 *
+	 * GetSnapshotData (line 531) populated the bridge from this backend's
+	 * ProcArray state.  The overwrite above replaced xmin/xmax/xip[]/subxip[]
+	 * with the imported snapshot's values, leaving bridge state stale.
+	 * Re-derive now using the anchor from the preceding GetSnapshotData.
+	 */
+	EpochBridgeReDerive(CurrentSnapshot);
+
+	/*
 	 * Now we have to fix what GetSnapshotData did with MyProc->xmin and
 	 * TransactionXmin.  There is a race condition: to make sure we are not
 	 * causing the global xmin to go backwards, we have to test that the
@@ -593,6 +603,16 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 		/* Mark it as "registered" in FirstXactSnapshot */
 		FirstXactSnapshot->regd_count++;
 		pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+
+		/*
+		 * Patch 26: CopySnapshot validated the copied bridge with source
+		 * 'copy'.  Re-tag as 'import' so the final observable source
+		 * reflects that this snapshot originated from an import, not a
+		 * normal in-transaction copy.  The contract invariants were already
+		 * validated by both EpochBridgeReDerive ("import") and
+		 * CopySnapshot's EpochBridgeAcquisitionComplete ("copy").
+		 */
+		EpochBridgeAcquisitionComplete(CurrentSnapshot, "import");
 	}
 
 	FirstSnapshotSet = true;

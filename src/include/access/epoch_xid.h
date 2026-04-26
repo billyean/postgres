@@ -569,4 +569,9 @@ EpochBridgeContextPromoteXid(const EpochBridgeContext *ctx,
 extern void EpochBridgeAcquisitionComplete(Snapshot snap,
 										   const char *caller_tag);
 
+/* Patch 26: re-derive bridge state for imported snapshots.
+   Called after SetTransactionSnapshot overwrites 32-bit fields from import.
+   Re-promotes arrays, re-derives scalars, rebuilds view, validates I1-I6. */
+extern void EpochBridgeReDerive(Snapshot snap);
+
 #endif							/* EPOCH_XID_H */

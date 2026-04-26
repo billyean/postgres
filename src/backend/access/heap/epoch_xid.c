@@ -3687,6 +3687,8 @@ EpochBridgeAcquisitionComplete(Snapshot snap, const char *caller_tag)
 	/* Record which producer site called us */
 	if (caller_tag[0] == 'a')
 		epoch_acquisition_contract_last_source = 'a';
+	else if (caller_tag[0] == 'i')
+		epoch_acquisition_contract_last_source = 'i';
 	else
 		epoch_acquisition_contract_last_source = 'c';
 
@@ -3729,6 +3731,54 @@ EpochBridgeAcquisitionComplete(Snapshot snap, const char *caller_tag)
 	Assert(!snap->epoch_bridge.membership.valid ||
 		   (snap->epoch_bridge.membership.subxcnt == snap->subxcnt &&
 			snap->epoch_bridge.membership.suboverflowed == snap->suboverflowed));
+}
+
+/*
+ * EpochBridgeReDerive -- re-derive bridge state for imported snapshots.
+ *
+ * Called after SetTransactionSnapshot overwrites 32-bit fields (xmin,
+ * xmax, xip[], subxip[]) from an imported snapshot.  Re-promotes the
+ * per-entry arrays, re-derives scalar bridge state, rebuilds the
+ * membership view, and validates invariants I1-I6 via the acquisition
+ * contract checkpoint.
+ *
+ * Reuses the anchor from snap->epoch_bridge.anchor, which was set by the
+ * preceding GetSnapshotData call.  Within epoch 0, this anchor is valid
+ * for promoting any 32-bit XID in the imported snapshot.
+ */
+void
+EpochBridgeReDerive(Snapshot snap)
+{
+	FullTransactionId anchor = snap->epoch_bridge.anchor;
+	uint32		i;
+
+	if (!FullTransactionIdIsValid(anchor))
+		return;
+
+	/* Re-promote full_xip[] from the imported xip[] using the anchor */
+	if (snap->epoch_bridge.full_xip != NULL)
+	{
+		for (i = 0; i < snap->xcnt; i++)
+			snap->epoch_bridge.full_xip[i] =
+				EpochFullXidRelativeTo(anchor, snap->xip[i]);
+	}
+
+	/* Re-promote full_subxip[] from the imported subxip[] using the anchor */
+	if (snap->epoch_bridge.full_subxip != NULL && snap->subxcnt > 0)
+	{
+		for (i = 0; i < (uint32) snap->subxcnt; i++)
+			snap->epoch_bridge.full_subxip[i] =
+				EpochFullXidRelativeTo(anchor, snap->subxip[i]);
+	}
+
+	/* Re-derive scalar bridge state (anchor, active, full_xmin, full_xmax) */
+	EpochBridgePopulate(snap, anchor, snap->xmin, snap->xmax);
+
+	/* Rebuild membership view from the re-derived bridge state */
+	EpochMembershipViewPopulate(&snap->epoch_bridge.membership, snap);
+
+	/* Validate I1-I6 with the "import" producer tag */
+	EpochBridgeAcquisitionComplete(snap, "import");
 }
 
 /*
@@ -4082,6 +4132,7 @@ epoch_xid_bridge_decision_source(PG_FUNCTION_ARGS)
  * Returns:
  *   'acquire'     - called from GetSnapshotData
  *   'copy'        - called from CopySnapshot
+ *   'import'      - called from SetTransactionSnapshot (Patch 26)
  *   'not_called'  - not yet executed
  */
 PG_FUNCTION_INFO_V1(epoch_xid_acquisition_contract_source);
@@ -4098,6 +4149,9 @@ epoch_xid_acquisition_contract_source(PG_FUNCTION_ARGS)
 			break;
 		case 'c':
 			result = "copy";
+			break;
+		case 'i':
+			result = "import";
 			break;
 		default:
 			result = "not_called";
