@@ -2519,3 +2519,96 @@ CLOSE epoch_p23_cur;
 COMMIT;
 
 DROP TABLE epoch_p23;
+
+-- ================================================================
+-- Patch 24: Third real internal consumer — heapam_tuple_satisfies_snapshot
+--
+-- Tests that the bounded bridge / context / decision stack is now
+-- used by a third distinct consumer path: heapam_tuple_satisfies_snapshot(),
+-- exercised via ON CONFLICT under SERIALIZABLE isolation.
+-- ================================================================
+
+CREATE TABLE epoch_p24 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p24 VALUES (1, 'third_consumer_test');
+
+-- P24_a: ON CONFLICT exercises heapam_tuple_satisfies_snapshot (view path)
+--
+-- Under SERIALIZABLE isolation, INSERT ... ON CONFLICT DO UPDATE triggers
+-- ExecCheckTupleVisible() which dispatches to heapam_tuple_satisfies_snapshot().
+
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+INSERT INTO epoch_p24 VALUES (1, 'conflict_update')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_mvcc_last_path();
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+-- Verify the update took effect
+SELECT * FROM epoch_p24 WHERE id = 1;
+
+-- Reset for next test
+UPDATE epoch_p24 SET val = 'third_consumer_test' WHERE id = 1;
+
+-- P24_b: TID scan still reports heap_fetch (caller distinction)
+
+BEGIN;
+
+SELECT * FROM epoch_p24 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_mvcc_last_caller();
+
+COMMIT;
+
+-- P24_c: Index scan still reports heap_hot_search_buffer (caller distinction)
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p24 WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_caller();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P24_d: Guard disabled -> third caller reached but native path used
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+INSERT INTO epoch_p24 VALUES (1, 'guard_off_update')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+-- Reset value
+UPDATE epoch_p24 SET val = 'third_consumer_test' WHERE id = 1;
+
+-- P24_e: View path restores after re-enabling guard
+
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+INSERT INTO epoch_p24 VALUES (1, 'restore_update')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+DROP TABLE epoch_p24;

@@ -400,6 +400,7 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
  */
 #define EPOCH_CALLER_HEAP_FETCH				'f'
 #define EPOCH_CALLER_HEAP_HOT_SEARCH		'h'
+#define EPOCH_CALLER_TUPLE_SATISFIES		't'
 
 extern void EpochMVCCSetCaller(char caller);
 

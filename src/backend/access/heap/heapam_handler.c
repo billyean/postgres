@@ -134,8 +134,33 @@ heapam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 	 * Caller should be holding pin, but not lock.
 	 */
 	LockBuffer(bslot->buffer, BUFFER_LOCK_SHARE);
-	res = HeapTupleSatisfiesVisibility(bslot->base.tuple, snapshot,
-									   bslot->buffer);
+
+	/*
+	 * Patch 24: third real epoch-aware consumer.  For materialized
+	 * relations with MVCC snapshots, use the epoch path first.
+	 * The integration pattern is identical to the heap_fetch() (Patch 10)
+	 * and heap_hot_search_buffer() (Patch 16) branches.
+	 */
+	if (EpochRelationIsMaterialized(rel) &&
+		snapshot->snapshot_type == SNAPSHOT_MVCC)
+	{
+		EpochMVCCResult epoch_result;
+
+		EpochMVCCSetCaller(EPOCH_CALLER_TUPLE_SATISFIES);
+		epoch_result = EpochHeapTupleSatisfiesMVCC(rel, bslot->base.tuple,
+												   snapshot, bslot->buffer);
+		if (epoch_result == EPOCH_MVCC_CANNOT_DETERMINE)
+			res = HeapTupleSatisfiesVisibility(bslot->base.tuple, snapshot,
+											   bslot->buffer);
+		else
+			res = (epoch_result == EPOCH_MVCC_VISIBLE);
+	}
+	else
+	{
+		res = HeapTupleSatisfiesVisibility(bslot->base.tuple, snapshot,
+										   bslot->buffer);
+	}
+
 	LockBuffer(bslot->buffer, BUFFER_LOCK_UNLOCK);
 
 	return res;

@@ -3424,11 +3424,12 @@ epoch_xid_horizon_last_source(PG_FUNCTION_ARGS)
  * via EpochMVCCSetCaller() before calling the function.
  *
  * Returns:
- *   'heap_fetch'               - Patch 10 consumer (TID scan)
- *   'heap_hot_search_buffer'   - Patch 16 consumer (index scan HOT chain)
- *   'not_called'               - epoch path not entered
+ *   'heap_fetch'                       - Patch 10 consumer (TID scan)
+ *   'heap_hot_search_buffer'           - Patch 16 consumer (index scan HOT chain)
+ *   'heapam_tuple_satisfies_snapshot'  - Patch 24 consumer (table AM callback)
+ *   'not_called'                       - epoch path not entered
  *
- * This is the direct proof mechanism for Patch 16: it identifies which
+ * This is the direct proof mechanism for Patches 16/24: it identifies which
  * real internal consumer path exercised the epoch bridge, without
  * relying on query-plan inference.
  */
@@ -3446,6 +3447,9 @@ epoch_xid_mvcc_last_caller(PG_FUNCTION_ARGS)
 			break;
 		case 'h':
 			result = "heap_hot_search_buffer";
+			break;
+		case 't':
+			result = "heapam_tuple_satisfies_snapshot";
 			break;
 		default:
 			result = "not_called";

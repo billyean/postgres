@@ -2558,3 +2558,146 @@ SELECT epoch_xid_membership_last_source();
 CLOSE CURSOR
 COMMIT
 DROP TABLE
+-- ================================================================
+-- Patch 24: Third real internal consumer — heapam_tuple_satisfies_snapshot
+--
+-- Tests that the bounded bridge / context / decision stack is now
+-- used by a third distinct consumer path: heapam_tuple_satisfies_snapshot(),
+-- exercised via ON CONFLICT under SERIALIZABLE isolation.
+-- ================================================================
+CREATE TABLE epoch_p24 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p24 VALUES (1, 'third_consumer_test');
+-- P24_a: ON CONFLICT exercises heapam_tuple_satisfies_snapshot (view path)
+--
+-- Under SERIALIZABLE isolation, INSERT ... ON CONFLICT DO UPDATE triggers
+-- ExecCheckTupleVisible() which dispatches to heapam_tuple_satisfies_snapshot().
+BEGIN ISOLATION LEVEL SERIALIZABLE
+INSERT INTO epoch_p24 VALUES (1, 'conflict_update')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT epoch_xid_mvcc_last_caller();
+ epoch_xid_mvcc_last_caller
+----------------------------
+ heapam_tuple_satisfies_snapshot
+(1 row)
+
+SELECT epoch_xid_mvcc_last_path();
+ epoch_xid_mvcc_last_path
+--------------------------
+ snapshot_bridge
+(1 row)
+
+SELECT epoch_xid_bridge_decision_source();
+ epoch_xid_bridge_decision_source
+----------------------------------
+ decision
+(1 row)
+
+SELECT epoch_xid_bridge_context_source();
+ epoch_xid_bridge_context_source
+---------------------------------
+ context
+(1 row)
+
+SELECT epoch_xid_membership_last_source();
+ epoch_xid_membership_last_source
+----------------------------------
+ view
+(1 row)
+
+COMMIT
+-- Verify the update took effect
+SELECT * FROM epoch_p24 WHERE id = 1;
+ id |       val
+----+-----------------
+  1 | conflict_update
+(1 row)
+
+-- Reset for next test
+UPDATE epoch_p24 SET val = 'third_consumer_test' WHERE id = 1;
+-- P24_b: TID scan still reports heap_fetch (caller distinction)
+BEGIN
+SELECT * FROM epoch_p24 WHERE ctid = '(0,1)';
+ id |         val
+----+---------------------
+  1 | third_consumer_test
+(1 row)
+
+SELECT epoch_xid_mvcc_last_caller();
+ epoch_xid_mvcc_last_caller
+----------------------------
+ heap_fetch
+(1 row)
+
+COMMIT
+-- P24_c: Index scan still reports heap_hot_search_buffer (caller distinction)
+SET enable_seqscan = off;
+BEGIN
+SELECT * FROM epoch_p24 WHERE id = 1;
+ id |         val
+----+---------------------
+  1 | third_consumer_test
+(1 row)
+
+SELECT epoch_xid_mvcc_last_caller();
+ epoch_xid_mvcc_last_caller
+----------------------------
+ heap_hot_search_buffer
+(1 row)
+
+COMMIT
+RESET enable_seqscan;
+-- P24_d: Guard disabled -> third caller reached but native path used
+SELECT epoch_xid_stage1_force_disable(true);
+ epoch_xid_stage1_force_disable
+--------------------------------
+
+(1 row)
+
+BEGIN ISOLATION LEVEL SERIALIZABLE
+INSERT INTO epoch_p24 VALUES (1, 'guard_off_update')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT epoch_xid_mvcc_last_caller();
+ epoch_xid_mvcc_last_caller
+----------------------------
+ heapam_tuple_satisfies_snapshot
+(1 row)
+
+SELECT epoch_xid_membership_last_source();
+ epoch_xid_membership_last_source
+----------------------------------
+ native_fallback
+(1 row)
+
+COMMIT
+SELECT epoch_xid_stage1_force_disable(false);
+ epoch_xid_stage1_force_disable
+--------------------------------
+
+(1 row)
+
+-- Reset value
+UPDATE epoch_p24 SET val = 'third_consumer_test' WHERE id = 1;
+-- P24_e: View path restores after re-enabling guard
+BEGIN ISOLATION LEVEL SERIALIZABLE
+INSERT INTO epoch_p24 VALUES (1, 'restore_update')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+SELECT epoch_xid_mvcc_last_caller();
+ epoch_xid_mvcc_last_caller
+----------------------------
+ heapam_tuple_satisfies_snapshot
+(1 row)
+
+SELECT epoch_xid_bridge_decision_source();
+ epoch_xid_bridge_decision_source
+----------------------------------
+ decision
+(1 row)
+
+SELECT epoch_xid_membership_last_source();
+ epoch_xid_membership_last_source
+----------------------------------
+ view
+(1 row)
+
+COMMIT
+DROP TABLE
