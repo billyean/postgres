@@ -2612,3 +2612,69 @@ SELECT epoch_xid_membership_last_source();
 COMMIT;
 
 DROP TABLE epoch_p24;
+
+-- ================================================================
+-- Patch 25: Bounded snapshot acquisition contract
+--
+-- Tests that the producer-side contract checkpoint
+-- (EpochBridgeAcquisitionComplete) is called at both GetSnapshotData
+-- and CopySnapshot sites, and that the I1-I6 invariants hold.
+-- ================================================================
+
+-- P25_a: Contract check passes after normal acquisition, source is 'acquire'
+
+BEGIN;
+
+SELECT epoch_xid_acquisition_contract_check();
+SELECT epoch_xid_acquisition_contract_source();
+
+COMMIT;
+
+-- P25_b: Contract check passes after snapshot copy, source is 'copy'
+
+CREATE TABLE epoch_p25 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p25 VALUES (1, 'acquisition_contract_test');
+
+BEGIN;
+
+DECLARE epoch_p25_cur CURSOR FOR
+    SELECT * FROM epoch_p25 WHERE ctid = '(0,1)';
+
+FETCH NEXT FROM epoch_p25_cur;
+
+SELECT epoch_xid_acquisition_contract_check();
+SELECT epoch_xid_acquisition_contract_source();
+
+CLOSE epoch_p25_cur;
+
+COMMIT;
+
+-- P25_c: Acquisition source is distinguishable from copy source
+
+BEGIN;
+
+SELECT epoch_xid_acquisition_contract_source();
+
+DECLARE epoch_p25_src_cur CURSOR FOR SELECT 1;
+
+FETCH NEXT FROM epoch_p25_src_cur;
+
+SELECT epoch_xid_acquisition_contract_source();
+
+CLOSE epoch_p25_src_cur;
+
+COMMIT;
+
+-- P25_d: Existing bounded bridge behavior remains unchanged (via TID scan)
+
+BEGIN;
+
+SELECT * FROM epoch_p25 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+DROP TABLE epoch_p25;

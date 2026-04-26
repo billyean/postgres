@@ -563,4 +563,10 @@ extern FullTransactionId
 EpochBridgeContextPromoteXid(const EpochBridgeContext *ctx,
 							 TransactionId xid);
 
+/* Patch 25: bounded acquisition-contract checkpoint.
+   Called at end of bridge production (GetSnapshotData) and copy (CopySnapshot).
+   Validates I1-I6 coherence invariants via Assert in debug builds. */
+extern void EpochBridgeAcquisitionComplete(Snapshot snap,
+										   const char *caller_tag);
+
 #endif							/* EPOCH_XID_H */

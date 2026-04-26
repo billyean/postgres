@@ -175,6 +175,23 @@ static char epoch_bridge_context_last_source = 'n';
 static char epoch_decision_last_source = 'n';
 
 /*
+ * Test-only instrumentation (Patch 25): records which producer site
+ * last executed EpochBridgeAcquisitionComplete.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'a' = acquisition: called from GetSnapshotData
+ *   'c' = copy: called from CopySnapshot
+ */
+static char epoch_acquisition_contract_last_source = 'n';
+
+/*
+ * Test-only: snapshot pointer saved by EpochBridgeAcquisitionComplete
+ * so epoch_xid_acquisition_contract_check() can re-validate invariants.
+ */
+static Snapshot epoch_acquisition_contract_last_snap = NULL;
+
+/*
  * Test-only instrumentation: records which call site last invoked
  * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
  * the function, via EpochMVCCSetCaller().
@@ -3652,6 +3669,69 @@ EpochMembershipViewPopulate(EpochMembershipView *view, Snapshot snap)
 }
 
 /*
+ * EpochBridgeAcquisitionComplete -- bounded acquisition-contract checkpoint.
+ *
+ * Called once at the end of bridge production in GetSnapshotData (after
+ * EpochMembershipViewPopulate) and once at the end of bridge copying in
+ * CopySnapshot (after EpochBridgeCopyArrays).  Validates that the producer
+ * fulfilled the bounded acquisition contract: invariants I1-I6.
+ *
+ * In debug builds, checks via Assert.  In production, compiles to nothing
+ * except the instrumentation marker (which is test-only state, no cost).
+ *
+ * caller_tag: "acquire" from GetSnapshotData, "copy" from CopySnapshot.
+ */
+void
+EpochBridgeAcquisitionComplete(Snapshot snap, const char *caller_tag)
+{
+	/* Record which producer site called us */
+	if (caller_tag[0] == 'a')
+		epoch_acquisition_contract_last_source = 'a';
+	else
+		epoch_acquisition_contract_last_source = 'c';
+
+	/* Save snapshot pointer for the test-only SQL check function */
+	epoch_acquisition_contract_last_snap = snap;
+
+	/* I1: Anchor validity — active implies valid epoch-0 anchor */
+	Assert(!snap->epoch_bridge.active ||
+		   (FullTransactionIdIsValid(snap->epoch_bridge.anchor) &&
+			EpochFromFullTransactionId(snap->epoch_bridge.anchor) == 0));
+
+	/* I2: Boundary derivation — active implies boundaries match anchor */
+	Assert(!snap->epoch_bridge.active ||
+		   (FullTransactionIdEquals(snap->epoch_bridge.full_xmin,
+									EpochFullXidRelativeTo(snap->epoch_bridge.anchor,
+														   snap->xmin)) &&
+			FullTransactionIdEquals(snap->epoch_bridge.full_xmax,
+									EpochFullXidRelativeTo(snap->epoch_bridge.anchor,
+														   snap->xmax))));
+
+	/* I3: Array presence — active implies full_xip is allocated */
+	Assert(!snap->epoch_bridge.active ||
+		   snap->epoch_bridge.full_xip != NULL);
+
+	/* I4: View-bridge coherence — valid view borrows correct pointers */
+	Assert(!snap->epoch_bridge.membership.valid ||
+		   (FullTransactionIdEquals(snap->epoch_bridge.membership.full_xmin,
+									snap->epoch_bridge.full_xmin) &&
+			FullTransactionIdEquals(snap->epoch_bridge.membership.anchor,
+									snap->epoch_bridge.anchor) &&
+			snap->epoch_bridge.membership.full_xip ==
+			snap->epoch_bridge.full_xip &&
+			snap->epoch_bridge.membership.xcnt == snap->xcnt));
+
+	/* I5: Inactive propagation — inactive bridge implies invalid view */
+	Assert(snap->epoch_bridge.active ||
+		   !snap->epoch_bridge.membership.valid);
+
+	/* I6: Count coherence — valid view has matching counts */
+	Assert(!snap->epoch_bridge.membership.valid ||
+		   (snap->epoch_bridge.membership.subxcnt == snap->subxcnt &&
+			snap->epoch_bridge.membership.suboverflowed == snap->suboverflowed));
+}
+
+/*
  * Patch 21: bounded bridge-query API accessors.
  *
  * These three functions, together with EpochMembershipContains() (Patch 20),
@@ -3991,4 +4071,114 @@ epoch_xid_bridge_decision_source(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
+ * epoch_xid_acquisition_contract_source() -> text
+ *
+ * TEST-ONLY function (Patch 25).  Returns which producer site last
+ * executed EpochBridgeAcquisitionComplete.
+ *
+ * Returns:
+ *   'acquire'     - called from GetSnapshotData
+ *   'copy'        - called from CopySnapshot
+ *   'not_called'  - not yet executed
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_acquisition_contract_source);
+
+Datum
+epoch_xid_acquisition_contract_source(PG_FUNCTION_ARGS)
+{
+	const char *result;
+
+	switch (epoch_acquisition_contract_last_source)
+	{
+		case 'a':
+			result = "acquire";
+			break;
+		case 'c':
+			result = "copy";
+			break;
+		default:
+			result = "not_called";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
+ * epoch_xid_acquisition_contract_check() -> bool
+ *
+ * TEST-ONLY function (Patch 25).  Performs the I1-I6 invariant checks
+ * explicitly (not via Assert) on the last snapshot that was validated
+ * by EpochBridgeAcquisitionComplete.  Returns true if all invariants
+ * hold, false otherwise.
+ *
+ * This provides regression-test-visible contract validation independent
+ * of USE_ASSERT_CHECKING.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_acquisition_contract_check);
+
+Datum
+epoch_xid_acquisition_contract_check(PG_FUNCTION_ARGS)
+{
+	Snapshot	snap = epoch_acquisition_contract_last_snap;
+
+	if (snap == NULL)
+		PG_RETURN_BOOL(false);
+
+	/* I1: Anchor validity */
+	if (snap->epoch_bridge.active &&
+		(!FullTransactionIdIsValid(snap->epoch_bridge.anchor) ||
+		 EpochFromFullTransactionId(snap->epoch_bridge.anchor) != 0))
+		PG_RETURN_BOOL(false);
+
+	/* I2: Boundary derivation */
+	if (snap->epoch_bridge.active)
+	{
+		FullTransactionId expected_xmin =
+			EpochFullXidRelativeTo(snap->epoch_bridge.anchor, snap->xmin);
+		FullTransactionId expected_xmax =
+			EpochFullXidRelativeTo(snap->epoch_bridge.anchor, snap->xmax);
+
+		if (!FullTransactionIdEquals(snap->epoch_bridge.full_xmin,
+									 expected_xmin) ||
+			!FullTransactionIdEquals(snap->epoch_bridge.full_xmax,
+									 expected_xmax))
+			PG_RETURN_BOOL(false);
+	}
+
+	/* I3: Array presence */
+	if (snap->epoch_bridge.active &&
+		snap->epoch_bridge.full_xip == NULL)
+		PG_RETURN_BOOL(false);
+
+	/* I4: View-bridge coherence */
+	if (snap->epoch_bridge.membership.valid)
+	{
+		if (!FullTransactionIdEquals(snap->epoch_bridge.membership.full_xmin,
+									 snap->epoch_bridge.full_xmin) ||
+			!FullTransactionIdEquals(snap->epoch_bridge.membership.anchor,
+									 snap->epoch_bridge.anchor) ||
+			snap->epoch_bridge.membership.full_xip !=
+			snap->epoch_bridge.full_xip ||
+			snap->epoch_bridge.membership.xcnt != snap->xcnt)
+			PG_RETURN_BOOL(false);
+	}
+
+	/* I5: Inactive propagation */
+	if (!snap->epoch_bridge.active &&
+		snap->epoch_bridge.membership.valid)
+		PG_RETURN_BOOL(false);
+
+	/* I6: Count coherence */
+	if (snap->epoch_bridge.membership.valid)
+	{
+		if (snap->epoch_bridge.membership.subxcnt != snap->subxcnt ||
+			snap->epoch_bridge.membership.suboverflowed != snap->suboverflowed)
+			PG_RETURN_BOOL(false);
+	}
+
+	PG_RETURN_BOOL(true);
 }

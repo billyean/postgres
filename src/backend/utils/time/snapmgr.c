@@ -667,6 +667,12 @@ CopySnapshot(Snapshot snapshot)
 		 */
 		EpochBridgeCopyArrays(newsnap, snapshot, (char *) newsnap,
 							  full_xip_off);
+
+		/*
+		 * Patch 25: acquisition-contract checkpoint for copied snapshot.
+		 * Validates that the deep-copy preserved bridge coherence (I1-I6).
+		 */
+		EpochBridgeAcquisitionComplete(newsnap, "copy");
 	}
 
 	return newsnap;

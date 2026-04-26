@@ -2474,6 +2474,13 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	EpochMembershipViewPopulate(&snapshot->epoch_bridge.membership, snapshot);
 
+	/*
+	 * Patch 25: acquisition-contract checkpoint.  Validates that the
+	 * producer sequence (alloc + promote loops + populate + view) left
+	 * the bridge in a coherent state satisfying invariants I1-I6.
+	 */
+	EpochBridgeAcquisitionComplete(snapshot, "acquire");
+
 	snapshot->curcid = GetCurrentCommandId(false);
 
 	/*

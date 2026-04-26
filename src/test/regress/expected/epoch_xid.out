@@ -2701,3 +2701,101 @@ SELECT epoch_xid_membership_last_source();
 
 COMMIT
 DROP TABLE
+-- ================================================================
+-- Patch 25: Bounded snapshot acquisition contract
+--
+-- Tests that the producer-side contract checkpoint
+-- (EpochBridgeAcquisitionComplete) is called at both GetSnapshotData
+-- and CopySnapshot sites, and that the I1-I6 invariants hold.
+-- ================================================================
+-- P25_a: Contract check passes after normal acquisition, source is 'acquire'
+BEGIN
+SELECT epoch_xid_acquisition_contract_check();
+ epoch_xid_acquisition_contract_check
+--------------------------------------
+ t
+(1 row)
+
+SELECT epoch_xid_acquisition_contract_source();
+ epoch_xid_acquisition_contract_source
+---------------------------------------
+ acquire
+(1 row)
+
+COMMIT
+-- P25_b: Contract check passes after snapshot copy, source is 'copy'
+CREATE TABLE epoch_p25 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p25 VALUES (1, 'acquisition_contract_test');
+BEGIN
+DECLARE CURSOR
+FETCH NEXT FROM epoch_p25_cur;
+ id |            val
+----+---------------------------
+  1 | acquisition_contract_test
+(1 row)
+
+SELECT epoch_xid_acquisition_contract_check();
+ epoch_xid_acquisition_contract_check
+--------------------------------------
+ t
+(1 row)
+
+SELECT epoch_xid_acquisition_contract_source();
+ epoch_xid_acquisition_contract_source
+---------------------------------------
+ copy
+(1 row)
+
+CLOSE CURSOR
+COMMIT
+-- P25_c: Acquisition source is distinguishable from copy source
+BEGIN
+SELECT epoch_xid_acquisition_contract_source();
+ epoch_xid_acquisition_contract_source
+---------------------------------------
+ acquire
+(1 row)
+
+DECLARE CURSOR
+FETCH NEXT FROM epoch_p25_src_cur;
+ ?column?
+----------
+        1
+(1 row)
+
+SELECT epoch_xid_acquisition_contract_source();
+ epoch_xid_acquisition_contract_source
+---------------------------------------
+ copy
+(1 row)
+
+CLOSE CURSOR
+COMMIT
+-- P25_d: Existing bounded bridge behavior remains unchanged (via TID scan)
+BEGIN
+SELECT * FROM epoch_p25 WHERE ctid = '(0,1)';
+ id |            val
+----+---------------------------
+  1 | acquisition_contract_test
+(1 row)
+
+SELECT epoch_xid_bridge_context_source();
+ epoch_xid_bridge_context_source
+---------------------------------
+ context
+(1 row)
+
+SELECT epoch_xid_bridge_decision_source();
+ epoch_xid_bridge_decision_source
+----------------------------------
+ decision
+(1 row)
+
+SELECT epoch_xid_membership_last_source();
+ epoch_xid_membership_last_source
+----------------------------------
+ view
+(1 row)
+
+COMMIT
+DROP TABLE
