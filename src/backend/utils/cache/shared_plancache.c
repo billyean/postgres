@@ -20,11 +20,16 @@
 
 #include "lib/dshash.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/nodes.h"
+#include "nodes/plannodes.h"
 #include "nodes/queryjumble.h"
+#include "nodes/readfuncs.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/dsa.h"
+#include "utils/memutils.h"
 #include "utils/shared_plancache.h"
 
 /* GUC variables */
@@ -328,4 +333,230 @@ SharedPlanCacheCurrentEntries(void)
 	if (shared_plan_ctl == NULL)
 		return 0;
 	return pg_atomic_read_u32(&shared_plan_ctl->current_entries);
+}
+
+/* ---- Plan Serialization (Patch 0005) ---- */
+
+SharedPlanSerializeStatus
+SharedPlanSerializeStmtList(List *stmt_list,
+							Size max_total_size,
+							char **out_data,
+							Size *out_len)
+{
+	char	   *text;
+	Size		text_len;
+	Size		total_len;
+	char	   *buf;
+	SharedPlanSerializedHeader *hdr;
+
+	Assert(out_data != NULL);
+	Assert(out_len != NULL);
+
+	*out_data = NULL;
+	*out_len = 0;
+
+	text = nodeToString(stmt_list);
+	text_len = strlen(text);
+
+	if (text_len > PG_UINT32_MAX)
+	{
+		pfree(text);
+		return SHARED_PLAN_SERIALIZE_OVERSIZE;
+	}
+
+	total_len = add_size(sizeof(SharedPlanSerializedHeader), text_len);
+
+	if (total_len > max_total_size)
+	{
+		pfree(text);
+		return SHARED_PLAN_SERIALIZE_OVERSIZE;
+	}
+
+	buf = (char *) palloc(total_len);
+	hdr = (SharedPlanSerializedHeader *) buf;
+	hdr->magic = SHARED_PLAN_SERIAL_MAGIC;
+	hdr->version = SHARED_PLAN_SERIAL_VERSION;
+	hdr->format = SHARED_PLAN_FORMAT_TEXT;
+	hdr->payload_len = (uint32) text_len;
+	hdr->num_stmts = (uint32) list_length(stmt_list);
+
+	memcpy(buf + sizeof(SharedPlanSerializedHeader), text, text_len);
+	pfree(text);
+
+	*out_data = buf;
+	*out_len = total_len;
+	return SHARED_PLAN_SERIALIZE_OK;
+}
+
+SharedPlanSerializeStatus
+SharedPlanSerializeCachedPlan(CachedPlanSource *plansource,
+							  CachedPlan *plan,
+							  bool is_generic_plan,
+							  Size max_total_size,
+							  char **out_data,
+							  Size *out_len,
+							  SharedPlanRejectReason *reject_reason)
+{
+	SharedPlanSerializeStatus status;
+
+	Assert(out_data != NULL);
+	Assert(out_len != NULL);
+	Assert(reject_reason != NULL);
+
+	*out_data = NULL;
+	*out_len = 0;
+
+	if (!PlanIsShareable(plansource, plan, is_generic_plan, reject_reason))
+		return SHARED_PLAN_SERIALIZE_NOT_SHAREABLE;
+
+	Assert(plan != NULL);
+
+	status = SharedPlanSerializeStmtList(plan->stmt_list,
+										 max_total_size,
+										 out_data, out_len);
+
+	if (status == SHARED_PLAN_SERIALIZE_OK)
+		*reject_reason = SHARED_PLAN_REJECT_NONE;
+	else if (status == SHARED_PLAN_SERIALIZE_OVERSIZE)
+		*reject_reason = SHARED_PLAN_REJECT_OVERSIZE;
+
+	return status;
+}
+
+SharedPlanSerializeStatus
+SharedPlanSerializeToDSA(List *stmt_list,
+						 Size max_total_size,
+						 dsa_area *area,
+						 dsa_pointer *out_ptr,
+						 Size *out_len)
+{
+	SharedPlanSerializeStatus status;
+	char	   *local_buf;
+	Size		local_len;
+	dsa_pointer dp;
+
+	Assert(area != NULL);
+	Assert(out_ptr != NULL);
+	Assert(out_len != NULL);
+
+	*out_ptr = InvalidDsaPointer;
+	*out_len = 0;
+
+	status = SharedPlanSerializeStmtList(stmt_list, max_total_size,
+										 &local_buf, &local_len);
+	if (status != SHARED_PLAN_SERIALIZE_OK)
+		return status;
+
+	dp = dsa_allocate_extended(area, local_len, DSA_ALLOC_NO_OOM);
+	if (!DsaPointerIsValid(dp))
+	{
+		pfree(local_buf);
+		return SHARED_PLAN_SERIALIZE_OOM;
+	}
+
+	memcpy(dsa_get_address(area, dp), local_buf, local_len);
+	pfree(local_buf);
+
+	*out_ptr = dp;
+	*out_len = local_len;
+	return SHARED_PLAN_SERIALIZE_OK;
+}
+
+/*
+ * SharedPlanDeserialize - deserialize a buffer into a List of PlannedStmt.
+ *
+ * Header-level corruption returns INVALID_INPUT without ERROR.
+ * stringToNode() may elog(ERROR) on corrupt payload text; the context switch
+ * is restored via PG_CATCH before re-throwing so CurrentMemoryContext is
+ * always correct on the caller's error path.
+ * Post-parse validation returns INVALID_INPUT without ERROR.
+ */
+SharedPlanSerializeStatus
+SharedPlanDeserialize(const char *data,
+					  Size len,
+					  MemoryContext target_context,
+					  List **out_stmt_list)
+{
+	const SharedPlanSerializedHeader *hdr;
+	char	   *payload_buf;
+	void	   *result;
+	MemoryContext oldcontext;
+	ListCell   *lc;
+
+	Assert(data != NULL);
+	Assert(target_context != NULL);
+	Assert(out_stmt_list != NULL);
+
+	*out_stmt_list = NIL;
+
+	/* Header validation, returns status without ERROR */
+	if (len < sizeof(SharedPlanSerializedHeader))
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+
+	hdr = (const SharedPlanSerializedHeader *) data;
+
+	if (hdr->magic != SHARED_PLAN_SERIAL_MAGIC)
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+	if (hdr->version != SHARED_PLAN_SERIAL_VERSION)
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+	if (hdr->format != SHARED_PLAN_FORMAT_TEXT)
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+	if (hdr->payload_len != len - sizeof(SharedPlanSerializedHeader))
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+
+	/* Copy payload to NUL-terminated buffer */
+	payload_buf = (char *) palloc(add_size((Size) hdr->payload_len, 1));
+	memcpy(payload_buf, data + sizeof(SharedPlanSerializedHeader),
+		   hdr->payload_len);
+	payload_buf[hdr->payload_len] = '\0';
+
+	/* Deserialize into target context; clean up payload_buf on ERROR */
+	oldcontext = MemoryContextSwitchTo(target_context);
+	PG_TRY();
+	{
+		result = stringToNode(payload_buf);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcontext);
+		pfree(payload_buf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(oldcontext);
+
+	pfree(payload_buf);
+
+	/* Post-parse validation, returns status without ERROR */
+	if (result == NULL || !IsA(result, List))
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+	if (list_length((List *) result) != (int) hdr->num_stmts)
+		return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+
+	foreach(lc, (List *) result)
+	{
+		if (!IsA(lfirst(lc), PlannedStmt))
+			return SHARED_PLAN_SERIALIZE_INVALID_INPUT;
+	}
+
+	*out_stmt_list = (List *) result;
+	return SHARED_PLAN_SERIALIZE_OK;
+}
+
+SharedPlanSerializeStatus
+SharedPlanDeserializeFromDSA(dsa_area *area,
+							 dsa_pointer ptr,
+							 Size len,
+							 MemoryContext target_context,
+							 List **out_stmt_list)
+{
+	const char *addr;
+
+	Assert(area != NULL);
+	Assert(DsaPointerIsValid(ptr));
+	Assert(out_stmt_list != NULL);
+
+	addr = (const char *) dsa_get_address(area, ptr);
+
+	return SharedPlanDeserialize(addr, len, target_context, out_stmt_list);
 }

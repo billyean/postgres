@@ -1,0 +1,4 @@
+comment = 'Test code for shared plan cache serialization'
+default_version = '1.0'
+module_pathname = '$libdir/test_shared_plan_cache_serialization'
+relocatable = true
