@@ -571,7 +571,12 @@ extern void EpochBridgeAcquisitionComplete(Snapshot snap,
 
 /* Patch 26: re-derive bridge state for imported snapshots.
    Called after SetTransactionSnapshot overwrites 32-bit fields from import.
-   Re-promotes arrays, re-derives scalars, rebuilds view, validates I1-I6. */
+   Patch 27: now guarded by import-side enforcement precondition. */
 extern void EpochBridgeReDerive(Snapshot snap);
+
+/* Patch 27: export-side observability predicate.
+   Records whether the snapshot was bridge-eligible at export time.
+   Observability only — does not gate export or influence import decisions. */
+extern bool EpochBridgeExportEligible(Snapshot snap);
 
 #endif							/* EPOCH_XID_H */

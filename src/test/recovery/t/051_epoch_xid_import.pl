@@ -2,6 +2,8 @@
 # Copyright (c) 2024-2026, PostgreSQL Global Development Group
 
 # Test Patch 26: imported-snapshot bridge re-derivation.
+# Test Patch 27: import-side bounded bridge enforcement with
+#                export-side observability.
 #
 # Validates that after SET TRANSACTION SNAPSHOT, the bounded bridge
 # state is re-derived from the imported 32-bit fields, the acquisition
@@ -154,6 +156,90 @@ SELECT epoch_xid_acquisition_contract_source();
 @lines = split /\n/, $copy_source;
 is($lines[-1], 'copy',
 	'P26: cursor copy still reports copy');
+
+# ============================================================
+# Patch 27: Import-side enforcement + export-side observability
+# ============================================================
+
+# P27 Test 1: Import precondition passes (bounded bridge-compatible)
+my $precond = $node->safe_psql('postgres', qq{
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT '$snap_id';
+SELECT epoch_xid_import_precondition();
+});
+is($precond, 't',
+	'P27: import precondition passes (bounded bridge-compatible)');
+
+# P27 Test 2: Full import-side proof surface
+my $p27_full = $node->safe_psql('postgres', qq{
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT '$snap_id';
+SELECT epoch_xid_import_precondition();
+SELECT epoch_xid_acquisition_contract_source();
+SELECT epoch_xid_acquisition_contract_check();
+});
+@lines = split /\n/, $p27_full;
+is($lines[0], 't',
+	'P27: precondition passes for bridge-compatible import');
+is($lines[1], 'import',
+	'P27: contract source is import');
+is($lines[2], 't',
+	'P27: contract check passes after import');
+
+# P27 Test 3: Bridge path used on bridge-compatible import
+my $p27_path = $node->safe_psql('postgres', qq{
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION SNAPSHOT '$snap_id';
+SELECT * FROM epoch_p26 WHERE ctid = '(0,1)';
+SELECT epoch_xid_mvcc_last_path();
+});
+@lines = split /\n/, $p27_path;
+is($lines[-1], 'snapshot_bridge',
+	'P27: bridge-compatible import uses bounded bridge path');
+
+# P27 Test 4: Export-side observability
+my $export_elig = $node->safe_psql('postgres', qq{
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_export_snapshot();
+SELECT epoch_xid_export_eligible();
+});
+@lines = split /\n/, $export_elig;
+# Export eligibility depends on whether bridge is active in the copied
+# snapshot.  Record the result — the key proof is that the function is
+# callable and returns a boolean, not NULL.
+like($lines[-1], qr/^[tf]$/,
+	'P27: export eligibility returns a boolean (observability recorded)');
+
+# P27 Test 5: Precondition failure (not bounded bridge-compatible)
+my $p27_fail = $node->safe_psql('postgres', qq{
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT epoch_xid_stage1_force_disable(true);
+SET TRANSACTION SNAPSHOT '$snap_id';
+SELECT epoch_xid_import_precondition();
+});
+@lines = split /\n/, $p27_fail;
+is($lines[-1], 'f',
+	'P27: precondition fails when guard disabled (not bridge-compatible)');
+
+# Restore guard
+$node->safe_psql('postgres', qq{
+SELECT epoch_xid_stage1_force_disable(false);
+});
+
+# P27 Test 6: Visibility still works after precondition failure
+my $p27_fallback = $node->safe_psql('postgres', qq{
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT epoch_xid_stage1_force_disable(true);
+SET TRANSACTION SNAPSHOT '$snap_id';
+SELECT * FROM epoch_p26 WHERE ctid = '(0,1)';
+});
+@lines = split /\n/, $p27_fallback;
+is($lines[-1], '1|exported_row',
+	'P27: visibility correct when not bridge-compatible (native fallback)');
+
+$node->safe_psql('postgres', qq{
+SELECT epoch_xid_stage1_force_disable(false);
+});
 
 # Clean up session A
 $export_psql->query_safe("COMMIT");

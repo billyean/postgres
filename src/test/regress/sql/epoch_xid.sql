@@ -2678,3 +2678,53 @@ SELECT epoch_xid_membership_last_source();
 COMMIT;
 
 DROP TABLE epoch_p25;
+
+-- ================================================================
+-- Patch 27: Import-side bounded bridge enforcement with
+-- export-side observability
+-- ================================================================
+
+-- P27_a: Export eligibility SQL function is callable
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+
+SELECT pg_export_snapshot() IS NOT NULL AS exported;
+
+SELECT epoch_xid_export_eligible() IS NOT NULL AS eligible_recorded;
+
+COMMIT;
+
+-- P27_b: Import precondition SQL function is callable (not yet called → NULL)
+
+SELECT epoch_xid_import_precondition() IS NULL AS not_yet_called;
+
+-- P27_c: Existing bounded bridge behavior unchanged after P27
+
+CREATE TABLE epoch_p27 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p27 VALUES (1, 'p27_contract_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p27 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_membership_last_source();
+SELECT epoch_xid_acquisition_contract_check();
+
+COMMIT;
+
+-- P27_d: Acquisition source surface still distinguishes acquire vs copy
+
+BEGIN;
+
+SELECT epoch_xid_acquisition_contract_source();
+
+DECLARE epoch_p27_cur CURSOR FOR SELECT 1;
+FETCH NEXT FROM epoch_p27_cur;
+SELECT epoch_xid_acquisition_contract_source();
+
+CLOSE epoch_p27_cur;
+COMMIT;
+
+DROP TABLE epoch_p27;

@@ -1220,6 +1220,13 @@ ExportSnapshot(Snapshot snapshot)
 	 */
 	snapshot = CopySnapshot(snapshot);
 
+	/*
+	 * Patch 27: record export-side bridge eligibility (observability only).
+	 * Does not gate the export — snapshot is always exported regardless.
+	 * Does not influence import-side bridge-compatibility decisions.
+	 */
+	EpochBridgeExportEligible(snapshot);
+
 	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
 	esnap = palloc_object(ExportedSnapshot);
 	esnap->snapfile = pstrdup(path);

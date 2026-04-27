@@ -192,6 +192,35 @@ static char epoch_acquisition_contract_last_source = 'n';
 static Snapshot epoch_acquisition_contract_last_snap = NULL;
 
 /*
+ * Test-only instrumentation (Patch 27): records the result of the
+ * import-side bridge-compatibility precondition check.
+ *
+ * This is the sole authority for whether an imported snapshot is treated
+ * as bounded bridge-compatible.  Export format remains 32-bit-only;
+ * no foreign bridge state is trusted.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'p' = passed: precondition satisfied (bounded bridge-compatible)
+ *   'f' = failed: precondition not satisfied (not bounded bridge-compatible)
+ */
+static char epoch_import_precondition_last = 'n';
+
+/*
+ * Test-only instrumentation (Patch 27): records the result of the
+ * export-side bridge-eligibility observability predicate.
+ *
+ * This is observability only — it does not influence import-side
+ * decisions and is not part of the bridge-compatibility contract.
+ *
+ * Values:
+ *   'n' = not yet called (initial)
+ *   'e' = eligible: snapshot was bridge-eligible at export time
+ *   'x' = ineligible: snapshot was not bridge-eligible at export time
+ */
+static char epoch_export_eligible_last = 'n';
+
+/*
  * Test-only instrumentation: records which call site last invoked
  * EpochHeapTupleSatisfiesMVCC.  Set by each call site before calling
  * the function, via EpochMVCCSetCaller().
@@ -3746,14 +3775,79 @@ EpochBridgeAcquisitionComplete(Snapshot snap, const char *caller_tag)
  * preceding GetSnapshotData call.  Within epoch 0, this anchor is valid
  * for promoting any 32-bit XID in the imported snapshot.
  */
+
+/*
+ * EpochBridgeImportPrecondition -- import-side enforcement precondition.
+ *
+ * Evaluates whether the importing backend's local state permits safe
+ * bridge re-derivation for an imported snapshot.  This is the sole
+ * authority for whether an imported snapshot is treated as bounded
+ * bridge-compatible.  Two-state outcome:
+ *
+ *   true  -> bounded bridge-compatible (re-derivation proceeds)
+ *   false -> not bounded bridge-compatible (bridge set to inactive)
+ *
+ * Conditions checked (all must hold):
+ *   1. Anchor is valid
+ *   2. Anchor is in epoch 0 (bounded regime), and not test-overridden
+ *   3. Pre-promoted arrays are allocated
+ *
+ * The epoch_stage1_force_disabled test override simulates a post-epoch-0
+ * environment, causing the precondition to fail.
+ *
+ * Export format remains 32-bit-only.  No foreign bridge state is trusted.
+ * Bridge compatibility is decided locally on import.
+ */
+static bool
+EpochBridgeImportPrecondition(Snapshot snap)
+{
+	FullTransactionId anchor = snap->epoch_bridge.anchor;
+
+	if (!FullTransactionIdIsValid(anchor))
+	{
+		epoch_import_precondition_last = 'f';
+		return false;
+	}
+
+	if (epoch_stage1_force_disabled ||
+		EpochFromFullTransactionId(anchor) != 0)
+	{
+		epoch_import_precondition_last = 'f';
+		return false;
+	}
+
+	if (snap->epoch_bridge.full_xip == NULL)
+	{
+		epoch_import_precondition_last = 'f';
+		return false;
+	}
+
+	epoch_import_precondition_last = 'p';
+	return true;
+}
+
 void
 EpochBridgeReDerive(Snapshot snap)
 {
-	FullTransactionId anchor = snap->epoch_bridge.anchor;
+	FullTransactionId anchor;
 	uint32		i;
 
-	if (!FullTransactionIdIsValid(anchor))
+	/*
+	 * Patch 27: import-side enforcement.  The precondition is the sole
+	 * authority for bridge compatibility of imported snapshots.
+	 *
+	 * Not bounded bridge-compatible: set bridge to clean inactive state.
+	 * Consumers will use the native 32-bit path.
+	 */
+	if (!EpochBridgeImportPrecondition(snap))
+	{
+		snap->epoch_bridge.active = false;
+		EpochMembershipViewPopulate(&snap->epoch_bridge.membership, snap);
 		return;
+	}
+
+	/* Precondition passed — bounded bridge-compatible, proceed */
+	anchor = snap->epoch_bridge.anchor;
 
 	/* Re-promote full_xip[] from the imported xip[] using the anchor */
 	if (snap->epoch_bridge.full_xip != NULL)
@@ -4235,4 +4329,102 @@ epoch_xid_acquisition_contract_check(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_BOOL(true);
+}
+
+/*
+ * EpochBridgeExportEligible -- export-side observability predicate.
+ *
+ * Evaluates whether the snapshot was bridge-eligible at export time.
+ * This is observability only — it does not gate the export and does not
+ * influence import-side decisions.  Export format remains 32-bit-only;
+ * no foreign bridge state is serialized.
+ *
+ * Bridge compatibility is decided locally on import by
+ * EpochBridgeImportPrecondition, not here.
+ */
+bool
+EpochBridgeExportEligible(Snapshot snap)
+{
+	if (!snap->epoch_bridge.active)
+	{
+		epoch_export_eligible_last = 'x';
+		return false;
+	}
+
+	if (!FullTransactionIdIsValid(snap->epoch_bridge.anchor))
+	{
+		epoch_export_eligible_last = 'x';
+		return false;
+	}
+
+	if (EpochFromFullTransactionId(snap->epoch_bridge.anchor) != 0)
+	{
+		epoch_export_eligible_last = 'x';
+		return false;
+	}
+
+	if (!snap->epoch_bridge.membership.valid)
+	{
+		epoch_export_eligible_last = 'x';
+		return false;
+	}
+
+	epoch_export_eligible_last = 'e';
+	return true;
+}
+
+/*
+ * epoch_xid_import_precondition() -> bool
+ *
+ * TEST-ONLY function (Patch 27).  Returns the result of the last
+ * import-side bridge-compatibility precondition check.
+ *
+ * This is the sole authority for whether an imported snapshot is treated
+ * as bounded bridge-compatible.  Two-state outcome:
+ *   true  = precondition passed (bounded bridge-compatible)
+ *   false = precondition failed (not bounded bridge-compatible)
+ *   NULL  = not yet called
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_import_precondition);
+
+Datum
+epoch_xid_import_precondition(PG_FUNCTION_ARGS)
+{
+	switch (epoch_import_precondition_last)
+	{
+		case 'p':
+			PG_RETURN_BOOL(true);
+		case 'f':
+			PG_RETURN_BOOL(false);
+		default:
+			PG_RETURN_NULL();
+	}
+}
+
+/*
+ * epoch_xid_export_eligible() -> bool
+ *
+ * TEST-ONLY function (Patch 27).  Returns the result of the last
+ * export-side bridge-eligibility observability check.
+ *
+ * This is observability only — it does not influence import-side
+ * bridge-compatibility decisions.
+ *   true  = snapshot was bridge-eligible at export time
+ *   false = snapshot was not bridge-eligible at export time
+ *   NULL  = not yet called
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_export_eligible);
+
+Datum
+epoch_xid_export_eligible(PG_FUNCTION_ARGS)
+{
+	switch (epoch_export_eligible_last)
+	{
+		case 'e':
+			PG_RETURN_BOOL(true);
+		case 'x':
+			PG_RETURN_BOOL(false);
+		default:
+			PG_RETURN_NULL();
+	}
 }
