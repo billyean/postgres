@@ -84,6 +84,85 @@ typedef struct MTTargetRelLookup
 } MTTargetRelLookup;
 
 /*
+ * Flush callback context for buffered INSERT INTO ... SELECT.
+ *
+ * These are the parameters required by the three callback operations
+ * (ExecInsertIndexTuples, ExecARInsertTriggers, es_processed++):
+ *
+ * - estate, resultRelInfo: required by ExecInsertIndexTuples/ExecARInsertTriggers.
+ * - transition_capture: 5th parameter of ExecARInsertTriggers; the non-buffered
+ *   path passes mtstate->mt_transition_capture for CMD_INSERT.  NULL would
+ *   silently break statement-level triggers with REFERENCING NEW TABLE.
+ * - canSetTag: the non-buffered path gates es_processed++ on this after the
+ *   insert; the buffered return-NULL bypasses that gate, so the callback
+ *   replicates it.
+ */
+typedef struct ExecBufferedInsertFlushState
+{
+	EState	   *estate;
+	ResultRelInfo *resultRelInfo;
+	TransitionCaptureState *transition_capture;
+	bool		canSetTag;
+} ExecBufferedInsertFlushState;
+
+/*
+ * Flush callback for buffered INSERT INTO ... SELECT.
+ *
+ * Called once per flushed tuple after heap_multi_insert() completes a batch.
+ * Performs index maintenance, AFTER ROW trigger firing, and tuple counting.
+ */
+static void
+ExecBufferedInsertFlushCb(void *context, TupleTableSlot *slot)
+{
+	ExecBufferedInsertFlushState *ctx = (ExecBufferedInsertFlushState *) context;
+	ResultRelInfo *resultRelInfo = ctx->resultRelInfo;
+	EState	   *estate = ctx->estate;
+	List	   *recheckIndexes = NIL;
+
+	if (resultRelInfo->ri_NumIndices > 0)
+		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, estate, 0,
+											   slot, NIL, NULL);
+
+	ExecARInsertTriggers(estate, resultRelInfo, slot, recheckIndexes,
+						 ctx->transition_capture);
+
+	list_free(recheckIndexes);
+
+	if (ctx->canSetTag)
+		(estate->es_processed)++;
+}
+
+/*
+ * Check whether a relation has volatile default expressions.
+ *
+ * Conservative target-side restriction: if any column default contains a
+ * volatile function (excluding nextval), the buffered-insert path is not used.
+ * This mirrors COPY FROM's volatile_defexprs check.
+ */
+static bool
+ExecRelHasVolatileDefaults(Relation rel)
+{
+	TupleConstr *constr = RelationGetDescr(rel)->constr;
+
+	if (constr == NULL || constr->num_defval == 0)
+		return false;
+
+	for (int i = 0; i < constr->num_defval; i++)
+	{
+		Node	   *expr;
+
+		if (constr->defval[i].adbin == NULL)
+			continue;
+
+		expr = stringToNode(constr->defval[i].adbin);
+
+		if (contain_volatile_functions_not_nextval(expr))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Context struct for a ModifyTable operation, containing basic execution
  * state and some output variables populated by ExecUpdateAct() and
  * ExecDeleteAct() to report the result of their actions to callers.
@@ -1269,6 +1348,49 @@ ExecInsert(ModifyTableContext *context,
 		}
 		else
 		{
+			/*
+			 * Buffered-insert path: lazily open the session on first call,
+			 * then submit tuples via put() instead of single-row insert.
+			 * Post-insert work (indexes, triggers) fires in the flush callback.
+			 */
+			if (mtstate->mt_buffered_insert_eligible &&
+				mtstate->mt_bi_state == NULL)
+			{
+				ExecBufferedInsertFlushState *flush_ctx;
+
+				flush_ctx = palloc(sizeof(ExecBufferedInsertFlushState));
+				flush_ctx->estate = estate;
+				flush_ctx->resultRelInfo = resultRelInfo;
+				flush_ctx->transition_capture = mtstate->mt_transition_capture;
+				flush_ctx->canSetTag = canSetTag;
+				mtstate->mt_bi_flush_ctx = flush_ctx;
+
+				mtstate->mt_bi_state =
+					table_buffered_insert_begin(resultRelationDesc,
+												estate->es_output_cid,
+												TABLE_INSERT_BAS_BULKWRITE,
+												ExecBufferedInsertFlushCb,
+												flush_ctx);
+				if (mtstate->mt_bi_state == NULL)
+					mtstate->mt_buffered_insert_eligible = false;
+			}
+
+			if (mtstate->mt_bi_state != NULL)
+			{
+				/*
+				 * Pre-insert validation already ran in this else-branch
+				 * above the ON CONFLICT test — specifically:
+				 *   tts_tableOid init, ExecComputeStoredGenerated,
+				 *   ExecWithCheckOptions (RLS), ExecConstraints,
+				 *   ExecPartitionCheck.
+				 * This inner else-branch (no ON CONFLICT) is reached only
+				 * after all of those.  Submit the validated tuple to the
+				 * AM buffer; post-insert work fires in the flush callback.
+				 */
+				table_buffered_insert_put(mtstate->mt_bi_state, slot);
+				return NULL;
+			}
+
 			/* insert the tuple normally */
 			table_tuple_insert(resultRelationDesc, slot,
 							   estate->es_output_cid,
@@ -5028,6 +5150,15 @@ ExecModifyTable(PlanState *pstate)
 		ExecPendingInserts(estate);
 
 	/*
+	 * Flush and clean up buffered-insert session if active.
+	 */
+	if (node->mt_bi_state != NULL)
+	{
+		table_buffered_insert_end(node->mt_bi_state);
+		node->mt_bi_state = NULL;
+	}
+
+	/*
 	 * We're done, but fire AFTER STATEMENT triggers before exiting.
 	 */
 	fireASTriggers(node);
@@ -5774,6 +5905,30 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	}
 
 	/*
+	 * For CMD_INSERT without ON CONFLICT/RETURNING/partitioning/BEFORE ROW
+	 * triggers, determine if the restricted buffered-insert path is eligible.
+	 * AM support is resolved lazily at first ExecInsert() call.
+	 */
+	if (operation == CMD_INSERT)
+	{
+		ModifyTable *mtnode = (ModifyTable *) mtstate->ps.plan;
+
+		resultRelInfo = mtstate->resultRelInfo;
+		mtstate->mt_buffered_insert_eligible =
+			(mtnode->onConflictAction == ONCONFLICT_NONE &&
+			 resultRelInfo->ri_projectReturning == NULL &&
+			 resultRelInfo->ri_RelationDesc->rd_rel->relkind !=
+			 RELKIND_PARTITIONED_TABLE &&
+			 !(resultRelInfo->ri_TrigDesc &&
+			   resultRelInfo->ri_TrigDesc->trig_insert_before_row) &&
+			 !(resultRelInfo->ri_TrigDesc &&
+			   resultRelInfo->ri_TrigDesc->trig_insert_instead_row) &&
+			 resultRelInfo->ri_FdwRoutine == NULL &&
+			 mtstate->operation == CMD_INSERT &&
+			 !ExecRelHasVolatileDefaults(resultRelInfo->ri_RelationDesc));
+	}
+
+	/*
 	 * Lastly, if this is not the primary (canSetTag) ModifyTable node, add it
 	 * to estate->es_auxmodifytables so that it will be run to completion by
 	 * ExecPostprocessPlan.  (It'd actually work fine to add the primary
@@ -5801,6 +5956,15 @@ void
 ExecEndModifyTable(ModifyTableState *node)
 {
 	int			i;
+
+	/*
+	 * Defensive: clean up buffered-insert if end() was not reached above.
+	 */
+	if (node->mt_bi_state != NULL)
+	{
+		table_buffered_insert_end(node->mt_bi_state);
+		node->mt_bi_state = NULL;
+	}
 
 	/*
 	 * Allow any FDWs to shut down

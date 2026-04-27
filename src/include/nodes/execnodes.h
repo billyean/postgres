@@ -1508,6 +1508,11 @@ typedef struct ModifyTableState
 	List	   *mt_updateColnosLists;
 	List	   *mt_mergeActionLists;
 	List	   *mt_mergeJoinConditions;
+
+	/* Buffered-insert state for restricted INSERT INTO ... SELECT */
+	bool		mt_buffered_insert_eligible;
+	struct TableBufferedInsertStateData *mt_bi_state;
+	void	   *mt_bi_flush_ctx;	/* private to nodeModifyTable.c */
 } ModifyTableState;
 
 /* ----------------
