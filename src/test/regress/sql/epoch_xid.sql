@@ -2813,3 +2813,128 @@ SELECT epoch_xid_membership_last_source();
 SELECT epoch_xid_stage1_force_disable(false);
 
 DROP TABLE epoch_p28;
+
+-- ================================================================
+-- Patch 29: Snapshot-level same-epoch bridge admission
+--
+-- Tests that the bounded bridge admission rule is now evaluated via
+-- EpochBridgeSnapshotAdmitted instead of the old epoch-0-only check.
+-- The predicate admits any epoch where the snapshot window (xmin..xmax)
+-- stays within the anchor's epoch after promotion.
+--
+-- Proof model: one positive case (epoch-1, admitted), one negative case
+-- (cross-epoch, not-admitted), backward compatibility, and force-disable.
+-- ================================================================
+
+-- P29_a: Epoch-1 anchor with same-epoch xmin/xmax → admitted (positive proof)
+--
+-- epoch=1, xid=1000, xmin_offset=-100, xmax_offset=+100
+-- Both promoted endpoints land in epoch 1 → admitted.
+
+SELECT epoch_xid_test_admission(1, 1000, -100, 100);
+SELECT epoch_xid_bridge_admitted();
+
+-- P29_b: Cross-epoch snapshot → not admitted (negative proof)
+--
+-- epoch=0, xid=4294967290 (near 0xFFFFFFFA), xmin_offset=-10, xmax_offset=+10
+-- Promoted xmax wraps into epoch 1 → not admitted.
+
+SELECT epoch_xid_test_admission(0, 4294967290, -10, 10);
+SELECT epoch_xid_bridge_admitted();
+
+-- P29_c: Epoch-0 with normal values → admitted (backward compatibility)
+--
+-- epoch=0, xid=1000, xmin_offset=-100, xmax_offset=+100
+-- All in epoch 0 → admitted (same as old epoch-0-only rule).
+
+SELECT epoch_xid_test_admission(0, 1000, -100, 100);
+SELECT epoch_xid_bridge_admitted();
+
+-- P29_d: Higher epoch (epoch=5) → admitted when window is same-epoch
+
+SELECT epoch_xid_test_admission(5, 500000, -1000, 2000);
+SELECT epoch_xid_bridge_admitted();
+
+-- P29_e: Epoch-0 backward compatibility — existing bridge still works
+--
+-- Existing epoch-0 table operations must still activate the bridge.
+
+CREATE TABLE epoch_p29 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p29 VALUES (1, 'p29_test');
+
+BEGIN;
+
+SELECT * FROM epoch_p29 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_bridge_admitted();
+SELECT epoch_xid_stage1_bridge_enabled();
+
+COMMIT;
+
+-- P29_f: Real operational positive case — epoch-1 admitted, bridge used
+--
+-- Shift the anchor epoch by +1 so real snapshots get an epoch-1 anchor.
+-- Then do a real TID scan on an epoch-materialized table.
+-- The full bridge lifecycle (populate, membership view, acquisition, consumer)
+-- runs at epoch 1.  This proves the operational relaxation, not just the
+-- predicate in isolation.
+
+SELECT epoch_xid_set_anchor_epoch_offset(1, 0);
+
+BEGIN;
+
+SELECT * FROM epoch_p29 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_mvcc_last_path();
+SELECT epoch_xid_bridge_admitted();
+SELECT epoch_xid_stage1_bridge_enabled();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+COMMIT;
+
+SELECT epoch_xid_set_anchor_epoch_offset(0, 0);
+
+-- P29_g: Real operational negative case — admission rejected, bridge not used
+--
+-- Override the anchor's 32-bit XID to 0xFFFFFFF0 (near top of range) while
+-- keeping epoch 0.  The real snapshot's xmin/xmax (small normal XIDs like ~750)
+-- promoted via this anchor land in epoch 1, while the anchor is in epoch 0.
+-- EpochBridgeSnapshotAdmitted detects the epoch mismatch and rejects the
+-- snapshot.  The bridge is inactive; the native 32-bit path handles visibility.
+--
+-- This proves the admission rule itself rejects a real snapshot object — not
+-- just a synthetic predicate test, and not just the force-disable override.
+
+SELECT epoch_xid_set_anchor_epoch_offset(0, -16);
+
+BEGIN;
+
+SELECT * FROM epoch_p29 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_mvcc_last_path();
+SELECT epoch_xid_bridge_admitted();
+SELECT epoch_xid_stage1_bridge_enabled();
+
+COMMIT;
+
+SELECT epoch_xid_set_anchor_epoch_offset(0, 0);
+
+-- P29_h: Force-disable still works (non-regression)
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+BEGIN;
+
+SELECT * FROM epoch_p29 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_stage1_bridge_enabled();
+
+COMMIT;
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+DROP TABLE epoch_p29;

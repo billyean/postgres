@@ -12981,4 +12981,22 @@
   proname => 'epoch_xid_export_eligible', provolatile => 'v',
   prorettype => 'bool', proargtypes => '',
   prosrc => 'epoch_xid_export_eligible' },
+
+{ oid => '9937',
+  descr => 'TEST-ONLY: snapshot-level bridge admission result (Patch 29)',
+  proname => 'epoch_xid_bridge_admitted', provolatile => 'v',
+  prorettype => 'bool', proargtypes => '',
+  prosrc => 'epoch_xid_bridge_admitted' },
+
+{ oid => '9938',
+  descr => 'TEST-ONLY: directly test admission predicate with constructed anchor (Patch 29)',
+  proname => 'epoch_xid_test_admission', provolatile => 'v',
+  prorettype => 'bool', proargtypes => 'int4 int4 int4 int4',
+  prosrc => 'epoch_xid_test_admission' },
+
+{ oid => '9939',
+  descr => 'TEST-ONLY: set epoch offset and xid override for anchor in EpochBridgePopulate (Patch 29)',
+  proname => 'epoch_xid_set_anchor_epoch_offset', provolatile => 'v',
+  prorettype => 'void', proargtypes => 'int4 int4',
+  prosrc => 'epoch_xid_set_anchor_epoch_offset' },
 ]

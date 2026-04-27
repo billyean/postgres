@@ -61,6 +61,33 @@ static char epoch_mvcc_last_path = 'n';
 static bool epoch_stage1_force_disabled = false;
 
 /*
+ * Test-only override (Patch 29): when non-zero, EpochBridgePopulate shifts
+ * the anchor's epoch by this amount before computing bridge state.  This
+ * allows tests to exercise the snapshot-level admission predicate on real
+ * snapshot objects at arbitrary epochs without requiring ~4B transactions.
+ *
+ * Positive values simulate higher epochs (e.g., +1 = epoch 1 after wrap).
+ * The value (uint32)-1 with an anchor near xid=0 simulates a cross-epoch
+ * wrap scenario where promoted xmin would land in a different epoch.
+ *
+ * Set via epoch_xid_set_anchor_epoch_offset(int).  Reset to 0 after use.
+ */
+static uint32 epoch_test_anchor_epoch_offset = 0;
+
+/*
+ * Test-only override (Patch 29): when non-zero, EpochBridgePopulate replaces
+ * the anchor's 32-bit XID portion with this value (keeping the epoch as
+ * shifted by epoch_test_anchor_epoch_offset).  This allows tests to place the
+ * anchor's XID near the top of the 32-bit range (e.g., 0xFFFFFFF0), causing
+ * the real xmin/xmax (which are small normal XIDs) to promote into a
+ * different epoch — triggering a genuine admission rejection on a real
+ * snapshot object.
+ *
+ * Set via epoch_xid_set_anchor_epoch_offset(int, int).  Reset to 0 after use.
+ */
+static uint32 epoch_test_anchor_xid_override = 0;
+
+/*
  * Test-only instrumentation: records which active-transaction membership
  * function was last used by EpochClassifyXidStatus.
  *
@@ -3263,14 +3290,14 @@ epoch_xid_classify_last_horizon(PG_FUNCTION_ARGS)
 /*
  * epoch_xid_stage1_bridge_enabled() -> bool
  *
- * TEST-ONLY function.  Returns true if the Stage 1 snapshot bridge guard
- * would pass for the current active snapshot: epoch_anchor is valid AND
- * the anchor's epoch is 0 (pre-wrap).
+ * TEST-ONLY function.  Returns true if the snapshot bridge guard
+ * would pass for the current active snapshot: anchor is valid AND
+ * the snapshot passes admission (same-epoch window, Patch 29).
  *
- * Returns false if no active snapshot, epoch_anchor is invalid, or
- * epoch_anchor has epoch > 0 (system crossed into epoch 1+).
+ * Returns false if no active snapshot, anchor is invalid, or
+ * snapshot window spans a wrap boundary.
  *
- * This makes the Stage 1 operational boundary observable in tests.
+ * This makes the bounded bridge operational boundary observable in tests.
  */
 PG_FUNCTION_INFO_V1(epoch_xid_stage1_bridge_enabled);
 
@@ -3304,6 +3331,31 @@ Datum
 epoch_xid_stage1_force_disable(PG_FUNCTION_ARGS)
 {
 	epoch_stage1_force_disabled = PG_GETARG_BOOL(0);
+	PG_RETURN_VOID();
+}
+
+/*
+ * epoch_xid_set_anchor_epoch_offset(epoch_offset int, xid_override int) -> void
+ *
+ * TEST-ONLY function (Patch 29).  Sets the epoch offset and optional XID
+ * override applied to the anchor in EpochBridgePopulate.
+ *
+ * epoch_offset: added to the anchor's epoch (0 = no shift, 1 = epoch 1, etc.)
+ * xid_override: if non-zero, replaces the anchor's 32-bit XID portion.
+ *   Setting this to a value near 0xFFFFFFF0 places the anchor near the top
+ *   of the 32-bit range, causing the real xmin/xmax (small normal XIDs) to
+ *   promote into a different epoch — triggering a genuine admission rejection
+ *   on a real snapshot object.
+ *
+ * Pass (0, 0) to reset to normal operation.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_set_anchor_epoch_offset);
+
+Datum
+epoch_xid_set_anchor_epoch_offset(PG_FUNCTION_ARGS)
+{
+	epoch_test_anchor_epoch_offset = (uint32) PG_GETARG_INT32(0);
+	epoch_test_anchor_xid_override = (uint32) PG_GETARG_INT32(1);
 	PG_RETURN_VOID();
 }
 
@@ -3527,6 +3579,61 @@ epoch_xid_mvcc_last_caller(PG_FUNCTION_ARGS)
 static char epoch_bridge_last_populate_source = 'n';
 
 /*
+ * Test-only instrumentation (Patch 29): records the last result of
+ * EpochBridgeSnapshotAdmitted, the snapshot-level bridge admission predicate.
+ *
+ * Values:
+ *   'n' = not yet evaluated
+ *   'a' = admitted (predicate returned true)
+ *   'r' = rejected (predicate returned false)
+ */
+static char epoch_admission_last = 'n';
+
+/*
+ * EpochBridgeSnapshotAdmitted -- snapshot-level bridge admission predicate.
+ *
+ * Patch 29: replaces the old hard-coded epoch-0 check with an anchor-relative
+ * same-epoch admission rule.  Returns true if and only if:
+ *   1. The anchor is valid.
+ *   2. Promoting xmin via the anchor produces a 64-bit XID in the anchor's epoch.
+ *   3. Promoting xmax via the anchor produces a 64-bit XID in the anchor's epoch.
+ *
+ * This is the single snapshot-level admission authority for bounded cross-epoch
+ * bridge use.  If this returns true, the bridge may be active.  If false, the
+ * bridge is inactive and the native 32-bit path is used.
+ *
+ * The old epoch-0 rule is a strict subset: every epoch-0 snapshot with normal
+ * xmin/xmax also passes this check.
+ */
+static bool
+EpochBridgeSnapshotAdmitted(FullTransactionId anchor,
+							TransactionId xmin, TransactionId xmax)
+{
+	uint32		anchor_epoch;
+	FullTransactionId full_xmin, full_xmax;
+
+	if (!FullTransactionIdIsValid(anchor))
+	{
+		epoch_admission_last = 'r';
+		return false;
+	}
+
+	anchor_epoch = EpochFromFullTransactionId(anchor);
+	full_xmin = EpochFullXidRelativeTo(anchor, xmin);
+	full_xmax = EpochFullXidRelativeTo(anchor, xmax);
+
+	if (EpochFromFullTransactionId(full_xmin) != anchor_epoch ||
+		EpochFromFullTransactionId(full_xmax) != anchor_epoch)
+	{
+		epoch_admission_last = 'r';
+		return false;
+	}
+
+	epoch_admission_last = 'a';
+	return true;
+}
+
+/*
  * Test-only instrumentation: records whether the last bridge array copy
  * was performed by the EpochBridgeCopyArrays helper ('h') or not yet
  * called ('n').  Exposed via epoch_xid_bridge_copy_source().
@@ -3563,11 +3670,45 @@ EpochBridgeAlloc(Snapshot snap)
  * latestCompletedXid and snapshot boundaries.  Does NOT populate per-entry
  * full_xip[i]/full_subxip[j] -- those stay inline in the GetSnapshotData
  * loop for locality and performance.
+ *
+ * Patch 29: the active flag is now set by EpochBridgeSnapshotAdmitted,
+ * which admits any epoch where the snapshot window stays within the
+ * anchor's epoch (replacing the old epoch-0-only check).
+ *
+ * When epoch_test_anchor_epoch_offset is non-zero (test-only), the anchor's
+ * epoch is shifted before computing bridge state, allowing tests to exercise
+ * the real admission path at simulated higher epochs.
  */
 void
 EpochBridgePopulate(Snapshot snap, FullTransactionId latest_completed,
 					TransactionId xmin, TransactionId xmax)
 {
+	/*
+	 * Test-only: shift the anchor epoch and/or override its 32-bit XID portion
+	 * if the test overrides are active.  This affects all downstream bridge
+	 * state (anchor, boundaries, active, membership view) so the full snapshot
+	 * lifecycle runs at the shifted anchor — not just the predicate in
+	 * isolation.
+	 *
+	 * epoch_test_anchor_epoch_offset: adds N to the epoch portion.
+	 * epoch_test_anchor_xid_override: replaces the 32-bit XID portion.
+	 *   When the override places the anchor's XID far from the real xmin/xmax,
+	 *   promoted boundaries land in a different epoch, causing the admission
+	 *   predicate to reject the snapshot on a real snapshot object.
+	 */
+	if ((epoch_test_anchor_epoch_offset != 0 ||
+		 epoch_test_anchor_xid_override != 0) &&
+		FullTransactionIdIsValid(latest_completed))
+	{
+		uint32		new_epoch = EpochFromFullTransactionId(latest_completed) +
+			epoch_test_anchor_epoch_offset;
+		uint32		new_xid = (epoch_test_anchor_xid_override != 0) ?
+			epoch_test_anchor_xid_override :
+			XidFromFullTransactionId(latest_completed);
+
+		latest_completed = FullTransactionIdFromEpochAndXid(new_epoch, new_xid);
+	}
+
 	snap->epoch_bridge.anchor = latest_completed;
 
 	if (FullTransactionIdIsValid(snap->epoch_bridge.anchor))
@@ -3577,7 +3718,7 @@ EpochBridgePopulate(Snapshot snap, FullTransactionId latest_completed,
 		snap->epoch_bridge.full_xmax =
 			EpochFullXidRelativeTo(latest_completed, xmax);
 		snap->epoch_bridge.active =
-			(EpochFromFullTransactionId(latest_completed) == 0);
+			EpochBridgeSnapshotAdmitted(latest_completed, xmin, xmax);
 	}
 	else
 	{
@@ -3729,10 +3870,10 @@ EpochBridgeAcquisitionComplete(Snapshot snap, const char *caller_tag)
 	/* Save snapshot pointer for the test-only SQL check function */
 	epoch_acquisition_contract_last_snap = snap;
 
-	/* I1: Anchor validity — active implies valid epoch-0 anchor */
+	/* I1: Anchor validity — active implies snapshot-admitted (Patch 29) */
 	Assert(!snap->epoch_bridge.active ||
-		   (FullTransactionIdIsValid(snap->epoch_bridge.anchor) &&
-			EpochFromFullTransactionId(snap->epoch_bridge.anchor) == 0));
+		   EpochBridgeSnapshotAdmitted(snap->epoch_bridge.anchor,
+									   snap->xmin, snap->xmax));
 
 	/* I2: Boundary derivation — active implies boundaries match anchor */
 	Assert(!snap->epoch_bridge.active ||
@@ -3794,10 +3935,10 @@ EpochBridgeAcquisitionComplete(Snapshot snap, const char *caller_tag)
  *
  * Conditions checked (all must hold):
  *   1. Anchor is valid
- *   2. Anchor is in epoch 0 (bounded regime), and not test-overridden
+ *   2. Snapshot passes admission (same-epoch window), and not test-overridden
  *   3. Pre-promoted arrays are allocated
  *
- * The epoch_stage1_force_disabled test override simulates a post-epoch-0
+ * The epoch_stage1_force_disabled test override simulates a disabled bridge
  * environment, causing the precondition to fail.
  *
  * Export format remains 32-bit-only.  No foreign bridge state is trusted.
@@ -3815,7 +3956,7 @@ EpochBridgeImportPrecondition(Snapshot snap)
 	}
 
 	if (epoch_stage1_force_disabled ||
-		EpochFromFullTransactionId(anchor) != 0)
+		!EpochBridgeSnapshotAdmitted(anchor, snap->xmin, snap->xmax))
 	{
 		epoch_import_precondition_last = 'f';
 		return false;
@@ -4362,7 +4503,8 @@ EpochBridgeExportEligible(Snapshot snap)
 		return false;
 	}
 
-	if (EpochFromFullTransactionId(snap->epoch_bridge.anchor) != 0)
+	if (!EpochBridgeSnapshotAdmitted(snap->epoch_bridge.anchor,
+									 snap->xmin, snap->xmax))
 	{
 		epoch_export_eligible_last = 'x';
 		return false;
@@ -4432,4 +4574,69 @@ epoch_xid_export_eligible(PG_FUNCTION_ARGS)
 		default:
 			PG_RETURN_NULL();
 	}
+}
+
+
+/*
+ * epoch_xid_bridge_admitted() -> bool
+ *
+ * TEST-ONLY function (Patch 29).  Returns the last result of
+ * EpochBridgeSnapshotAdmitted: true if the snapshot was admitted under
+ * the bounded cross-epoch rule, false if rejected.
+ *
+ * This is the direct proof surface for Patch 29.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_bridge_admitted);
+
+Datum
+epoch_xid_bridge_admitted(PG_FUNCTION_ARGS)
+{
+	switch (epoch_admission_last)
+	{
+		case 'a':
+			PG_RETURN_BOOL(true);
+		case 'r':
+			PG_RETURN_BOOL(false);
+		default:
+			PG_RETURN_NULL();
+	}
+}
+
+
+/*
+ * epoch_xid_test_admission(epoch int, xid int, xmin_offset int, xmax_offset int) -> bool
+ *
+ * TEST-ONLY function (Patch 29).  Directly invokes EpochBridgeSnapshotAdmitted
+ * with a constructed anchor and offset-derived xmin/xmax, allowing tests to
+ * exercise the admission predicate at arbitrary epochs without requiring an
+ * actual XID wrap (~4B transactions).
+ *
+ * Parameters:
+ *   epoch       - epoch number for the anchor (0, 1, 2, ...)
+ *   xid         - 32-bit XID portion of the anchor
+ *   xmin_offset - signed offset from anchor xid to construct xmin
+ *   xmax_offset - signed offset from anchor xid to construct xmax
+ *
+ * Returns true if admitted, false if rejected.
+ */
+PG_FUNCTION_INFO_V1(epoch_xid_test_admission);
+
+Datum
+epoch_xid_test_admission(PG_FUNCTION_ARGS)
+{
+	uint32		epoch = PG_GETARG_UINT32(0);
+	uint32		xid = PG_GETARG_UINT32(1);
+	int32		xmin_offset = PG_GETARG_INT32(2);
+	int32		xmax_offset = PG_GETARG_INT32(3);
+	FullTransactionId anchor;
+	TransactionId test_xmin, test_xmax;
+	bool		result;
+
+	anchor = FullTransactionIdFromEpochAndXid(epoch, xid);
+	test_xmin = (TransactionId) ((int64) xid + xmin_offset);
+	test_xmax = (TransactionId) ((int64) xid + xmax_offset);
+
+	result = EpochBridgeSnapshotAdmitted(anchor, test_xmin, test_xmax);
+
+	PG_RETURN_BOOL(result);
 }
