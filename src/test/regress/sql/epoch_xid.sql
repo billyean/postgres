@@ -2728,3 +2728,88 @@ CLOSE epoch_p27_cur;
 COMMIT;
 
 DROP TABLE epoch_p27;
+
+-- ================================================================
+-- Patch 28: Fourth real internal consumer — heap_get_latest_tid
+--
+-- Tests that the bounded bridge / context / decision stack is now
+-- used by a fourth distinct consumer path: heap_get_latest_tid(),
+-- exercised via currtid2() which follows t_ctid chains across pages.
+--
+-- Proof model: identical to Patch 24.  The caller tag 'l' maps to
+-- the string 'heap_get_latest_tid' in epoch_xid_mvcc_last_caller().
+-- currtid2() is used as the proof path because it reaches
+-- heap_get_latest_tid() exclusively, with no subsequent heap_fetch()
+-- that would overwrite the caller tag.
+-- ================================================================
+
+CREATE TABLE epoch_p28 (id int PRIMARY KEY, val text);
+INSERT INTO epoch_p28 VALUES (1, 'initial');
+
+-- Create a t_ctid chain: original tuple at (0,1) points to updated version
+UPDATE epoch_p28 SET val = 'updated' WHERE id = 1;
+
+-- P28_a: currtid2 exercises heap_get_latest_tid (view path, positive proof)
+--
+-- currtid2() calls table_tuple_get_latest_tid -> heap_get_latest_tid
+-- and does NOT call heap_fetch afterward, so the caller tag 'l' survives.
+
+SELECT currtid2('epoch_p28', '(0,1)'::tid);
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_mvcc_last_path();
+SELECT epoch_xid_bridge_decision_source();
+SELECT epoch_xid_bridge_context_source();
+SELECT epoch_xid_membership_last_source();
+
+-- P28_b: TID scan still reports heap_fetch (caller distinction)
+
+UPDATE epoch_p28 SET val = 'fourth_consumer_test' WHERE id = 1;
+
+BEGIN;
+
+SELECT * FROM epoch_p28 WHERE ctid = '(0,1)';
+
+SELECT epoch_xid_mvcc_last_caller();
+
+COMMIT;
+
+-- P28_c: Index scan still reports heap_hot_search_buffer (caller distinction)
+
+SET enable_seqscan = off;
+
+BEGIN;
+
+SELECT * FROM epoch_p28 WHERE id = 1;
+
+SELECT epoch_xid_mvcc_last_caller();
+
+COMMIT;
+
+RESET enable_seqscan;
+
+-- P28_d: ON CONFLICT still reports heapam_tuple_satisfies_snapshot (caller distinction)
+
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+INSERT INTO epoch_p28 VALUES (1, 'conflict_test')
+    ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val;
+
+SELECT epoch_xid_mvcc_last_caller();
+
+COMMIT;
+
+-- P28_e: Guard disabled -> caller tag still heap_get_latest_tid, native path
+
+SELECT epoch_xid_stage1_force_disable(true);
+
+UPDATE epoch_p28 SET val = 'guard_off_test' WHERE id = 1;
+
+SELECT currtid2('epoch_p28', '(0,1)'::tid);
+
+SELECT epoch_xid_mvcc_last_caller();
+SELECT epoch_xid_membership_last_source();
+
+SELECT epoch_xid_stage1_force_disable(false);
+
+DROP TABLE epoch_p28;

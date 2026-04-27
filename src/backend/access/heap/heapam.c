@@ -1902,8 +1902,33 @@ heap_get_latest_tid(TableScanDesc sscan,
 		/*
 		 * Check tuple visibility; if visible, set it as the new result
 		 * candidate.
+		 *
+		 * Patch 28: fourth bounded bridge consumer.  Uses the same guarded
+		 * integration pattern as heap_fetch (Patch 10),
+		 * heap_hot_search_buffer (Patch 16), and
+		 * heapam_tuple_satisfies_snapshot (Patch 24).
+		 * Falls back to native HeapTupleSatisfiesVisibility when:
+		 *   - relation is not epoch-materialized, or
+		 *   - snapshot is not MVCC, or
+		 *   - epoch path returns CANNOT_DETERMINE.
 		 */
-		valid = HeapTupleSatisfiesVisibility(&tp, snapshot, buffer);
+		if (EpochRelationIsMaterialized(relation) &&
+			snapshot->snapshot_type == SNAPSHOT_MVCC)
+		{
+			EpochMVCCResult epoch_result;
+
+			EpochMVCCSetCaller(EPOCH_CALLER_GET_LATEST_TID);
+			epoch_result = EpochHeapTupleSatisfiesMVCC(relation, &tp,
+													   snapshot, buffer);
+			if (epoch_result == EPOCH_MVCC_CANNOT_DETERMINE)
+				valid = HeapTupleSatisfiesVisibility(&tp, snapshot, buffer);
+			else
+				valid = (epoch_result == EPOCH_MVCC_VISIBLE);
+		}
+		else
+		{
+			valid = HeapTupleSatisfiesVisibility(&tp, snapshot, buffer);
+		}
 		HeapCheckForSerializableConflictOut(valid, relation, &tp, buffer, snapshot);
 		if (valid)
 			*tid = ctid;

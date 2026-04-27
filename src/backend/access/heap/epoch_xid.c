@@ -229,6 +229,7 @@ static char epoch_export_eligible_last = 'n';
  *   'n' = not called (initial)
  *   'f' = heap_fetch (Patch 10 consumer: TID scan)
  *   'h' = heap_hot_search_buffer (Patch 16 consumer: index scan HOT chain)
+ *   'l' = heap_get_latest_tid (Patch 28 consumer: t_ctid chain traversal)
  */
 static char epoch_mvcc_last_caller = 'n';
 
@@ -3473,9 +3474,10 @@ epoch_xid_horizon_last_source(PG_FUNCTION_ARGS)
  *   'heap_fetch'                       - Patch 10 consumer (TID scan)
  *   'heap_hot_search_buffer'           - Patch 16 consumer (index scan HOT chain)
  *   'heapam_tuple_satisfies_snapshot'  - Patch 24 consumer (table AM callback)
+ *   'heap_get_latest_tid'              - Patch 28 consumer (t_ctid chain)
  *   'not_called'                       - epoch path not entered
  *
- * This is the direct proof mechanism for Patches 16/24: it identifies which
+ * This is the direct proof mechanism for Patches 16/24/28: it identifies which
  * real internal consumer path exercised the epoch bridge, without
  * relying on query-plan inference.
  */
@@ -3496,6 +3498,9 @@ epoch_xid_mvcc_last_caller(PG_FUNCTION_ARGS)
 			break;
 		case 't':
 			result = "heapam_tuple_satisfies_snapshot";
+			break;
+		case 'l':
+			result = "heap_get_latest_tid";
 			break;
 		default:
 			result = "not_called";

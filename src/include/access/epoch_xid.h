@@ -391,16 +391,19 @@ EpochHeapTupleSatisfiesMVCC(Relation rel, HeapTuple htup,
 							Snapshot snapshot, Buffer heapbuf);
 
 /*
- * Test-only caller instrumentation (Patch 16).
+ * Test-only caller instrumentation (Patch 16, extended Patch 28).
  * Each call site sets the caller tag before invoking
  * EpochHeapTupleSatisfiesMVCC, so tests can directly prove which
  * real internal consumer path exercised the epoch bridge.
  *
- * Caller tags: 'f' = heap_fetch, 'h' = heap_hot_search_buffer.
+ * Caller tags: 'f' = heap_fetch, 'h' = heap_hot_search_buffer,
+ *              't' = heapam_tuple_satisfies_snapshot,
+ *              'l' = heap_get_latest_tid.
  */
 #define EPOCH_CALLER_HEAP_FETCH				'f'
 #define EPOCH_CALLER_HEAP_HOT_SEARCH		'h'
 #define EPOCH_CALLER_TUPLE_SATISFIES		't'
+#define EPOCH_CALLER_GET_LATEST_TID			'l'
 
 extern void EpochMVCCSetCaller(char caller);
 
