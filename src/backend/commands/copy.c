@@ -66,6 +66,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 {
 	bool		is_from = stmt->is_from;
 	bool		pipe = (stmt->filename == NULL);
+	bool		rls_enabled = false;
 	Relation	rel;
 	Oid			relid;
 	RawStmt    *query = NULL;
@@ -248,13 +249,35 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			List	   *targetList = NIL;
 
 			if (is_from)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("COPY FROM not supported with row-level security"),
-						 errhint("Use INSERT statements instead.")));
+			{
+				if (rel->rd_rel->relkind == RELKIND_RELATION)
+				{
+					/*
+					 * Plain heap table with RLS enabled: mark this COPY FROM
+					 * for RLS enforcement and fall through to the normal
+					 * execution path.  Policy setup happens in CopyFrom().
+					 */
+					rls_enabled = true;
+				}
+				else if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("COPY FROM with row-level security is not yet supported for partitioned tables"),
+							 errhint("Use INSERT statements instead.")));
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("COPY FROM not supported with row-level security"),
+							 errhint("Use INSERT statements instead.")));
+			}
 
-			/*
-			 * Build target list
+			if (!rls_enabled)
+			{
+				/*
+				 * COPY TO with RLS: convert to a SELECT query so normal
+				 * query processing applies RLS USING policies.
+				 *
+				 * Build target list
 			 *
 			 * If no columns are specified in the attribute list of the COPY
 			 * command, then the target list is 'all' columns. Therefore, '*'
@@ -339,6 +362,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 			 */
 			table_close(rel, NoLock);
 			rel = NULL;
+			}
 		}
 	}
 	else
@@ -366,7 +390,8 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 		cstate = BeginCopyFrom(pstate, rel, whereClause,
 							   stmt->filename, stmt->is_program,
-							   NULL, stmt->attlist, stmt->options);
+							   NULL, stmt->attlist, stmt->options,
+							   rls_enabled);
 		*processed = CopyFrom(cstate);	/* copy from file to database */
 		EndCopyFrom(cstate);
 	}

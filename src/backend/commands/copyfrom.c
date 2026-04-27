@@ -44,6 +44,7 @@
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
+#include "rewrite/rowsecurity.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/lsyscache.h"
@@ -775,6 +776,108 @@ CopyMultiInsertInfoStore(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri,
 }
 
 /*
+ * copy_from_wco_is_volatile
+ *
+ * Check whether any RLS WITH CHECK policy expression contains volatile
+ * functions.  This mirrors COPY's conservative treatment of volatile default
+ * expressions and volatile WHERE clauses for multi-insert disabling.
+ */
+static bool
+copy_from_wco_is_volatile(List *withCheckOptions)
+{
+	ListCell   *lc;
+
+	foreach(lc, withCheckOptions)
+	{
+		WithCheckOption *wco = lfirst_node(WithCheckOption, lc);
+
+		if (contain_volatile_functions((Node *) wco->qual))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * build_copy_from_wco_list
+ *
+ * Construct a minimal synthetic Query node just enough to call
+ * get_row_security_policies(), and return the withCheckOptions list
+ * for INSERT WITH CHECK policies on the COPY target relation.
+ *
+ * The 'rel' argument is used only for sanity-check assertions, not as
+ * a policy source.  Policy collection is driven entirely by the RTE
+ * in range_table and get_row_security_policies().
+ */
+static List *
+build_copy_from_wco_list(Relation rel,
+						 List *range_table,
+						 List *rteperminfos,
+						 bool *hasSubLinks)
+{
+	Query	   *query;
+	RangeTblEntry *rte;
+	List	   *securityQuals = NIL;
+	List	   *withCheckOptions = NIL;
+	bool		hasRowSecurity = false;
+
+	/*
+	 * Construct minimal Query.  Only the fields read by
+	 * get_row_security_policies() are populated.
+	 */
+	query = makeNode(Query);
+	query->commandType = CMD_INSERT;
+	query->resultRelation = 1;
+	query->rtable = range_table;
+	query->rteperminfos = rteperminfos;
+	query->onConflict = NULL;
+
+	rte = linitial_node(RangeTblEntry, range_table);
+
+	Assert(rte->relid == RelationGetRelid(rel));
+
+	get_row_security_policies(query, rte, 1,
+							  &securityQuals, &withCheckOptions,
+							  &hasRowSecurity, hasSubLinks);
+
+	return withCheckOptions;
+}
+
+/*
+ * init_copy_from_wco
+ *
+ * Compile WITH CHECK OPTION expressions and populate ResultRelInfo,
+ * mirroring the WCO initialization in ExecInitModifyTable().
+ */
+static void
+init_copy_from_wco(ResultRelInfo *resultRelInfo,
+				   List *withCheckOptions,
+				   PlanState *ps)
+{
+	List	   *wcoExprs = NIL;
+	ListCell   *lc;
+
+	foreach(lc, withCheckOptions)
+	{
+		WithCheckOption *wco = lfirst_node(WithCheckOption, lc);
+		ExprState  *wcoExpr;
+
+		/*
+		 * ExecInitQual() expects a List of implicit-AND qual clauses.  COPY
+		 * FROM receives a single WCO expression tree from RLS policy
+		 * collection, so wrap it in a one-element qual list, preserving the
+		 * ExprState list shape consumed by ExecWithCheckOptions().
+		 */
+		wcoExpr = ExecInitQual(list_make1(wco->qual), ps);
+
+		wcoExprs = lappend(wcoExprs, wcoExpr);
+	}
+
+	resultRelInfo->ri_WithCheckOptions = withCheckOptions;
+	resultRelInfo->ri_WithCheckOptionExprs = wcoExprs;
+}
+
+/*
  * Copy FROM file to relation.
  */
 uint64
@@ -987,6 +1090,20 @@ CopyFrom(CopyFromState cstate)
 										&mtstate->ps);
 
 	/*
+	 * If RLS is enabled, initialize WCO ExprStates from the policy list
+	 * collected during BeginCopyFrom().  Allocate in copycontext so they
+	 * survive for the entire COPY operation.
+	 */
+	if (cstate->rls_enabled && cstate->rls_wco_list != NIL)
+	{
+		MemoryContext oldcxt;
+
+		oldcxt = MemoryContextSwitchTo(cstate->copycontext);
+		init_copy_from_wco(resultRelInfo, cstate->rls_wco_list, &mtstate->ps);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	/*
 	 * It's generally more efficient to prepare a bunch of tuples for
 	 * insertion, and insert them in one
 	 * table_multi_insert()/ExecForeignBatchInsert() call, than call
@@ -1049,6 +1166,17 @@ CopyFrom(CopyFromState cstate)
 		 *
 		 * Note: the whereClause was already preprocessed in DoCopy(), so it's
 		 * okay to use contain_volatile_functions() directly.
+		 */
+		insertMethod = CIM_SINGLE;
+	}
+	else if (resultRelInfo->ri_WithCheckOptions != NIL &&
+			 copy_from_wco_is_volatile(resultRelInfo->ri_WithCheckOptions))
+	{
+		/*
+		 * Can't support multi-inserts if any RLS WITH CHECK policy expression
+		 * contains volatile functions.  Such expressions may query the table
+		 * we're inserting into and behave differently depending on visibility
+		 * of rows inserted earlier in the same COPY.
 		 */
 		insertMethod = CIM_SINGLE;
 	}
@@ -1352,6 +1480,16 @@ CopyFrom(CopyFromState cstate)
 											   CMD_INSERT);
 
 				/*
+				 * Check the tuple against RLS INSERT WITH CHECK policies.
+				 * This is done after BEFORE ROW triggers and generated column
+				 * computation, but before constraints and insertion, matching
+				 * the INSERT ordering in ExecInsert().
+				 */
+				if (resultRelInfo->ri_WithCheckOptions != NIL)
+					ExecWithCheckOptions(WCO_RLS_INSERT_CHECK,
+										 resultRelInfo, myslot, estate);
+
+				/*
 				 * If the target is a plain table, check the constraints of
 				 * the tuple.
 				 */
@@ -1539,7 +1677,8 @@ BeginCopyFrom(ParseState *pstate,
 			  bool is_program,
 			  copy_data_source_cb data_source_cb,
 			  List *attnamelist,
-			  List *options)
+			  List *options,
+			  bool rls_enabled)
 {
 	CopyFromState cstate;
 	bool		pipe = (filename == NULL);
@@ -1565,6 +1704,8 @@ BeginCopyFrom(ParseState *pstate,
 
 	/* Allocate workspace and zero all fields */
 	cstate = palloc0_object(CopyFromStateData);
+
+	cstate->rls_enabled = rls_enabled;
 
 	/*
 	 * We allocate everything used by a cstate in a new memory context. This
@@ -1861,6 +2002,40 @@ BeginCopyFrom(ParseState *pstate,
 	cstate->volatile_defexprs = volatile_defexprs;
 	cstate->num_defaults = num_defaults;
 	cstate->is_program = is_program;
+
+	/*
+	 * If RLS enforcement is required, collect INSERT WITH CHECK policies now,
+	 * before the COPY protocol begins.  SubLink policies must be rejected at
+	 * this point so the error is raised before the client enters COPY data
+	 * mode.
+	 *
+	 * RLS WCO trees must live for the whole COPY operation because the
+	 * ExprStates installed in ResultRelInfo reference them.  Allocate policy
+	 * collection under cstate->copycontext explicitly.  The synthetic Query
+	 * used by build_copy_from_wco_list() does not need individual freeing
+	 * because it is allocated in this COPY-lifetime context and released when
+	 * EndCopyFrom() destroys the context.
+	 */
+	if (cstate->rls_enabled)
+	{
+		bool		hasSubLinks = false;
+		MemoryContext oldcontext;
+
+		oldcontext = MemoryContextSwitchTo(cstate->copycontext);
+
+		cstate->rls_wco_list = build_copy_from_wco_list(cstate->rel,
+														cstate->range_table,
+														cstate->rteperminfos,
+														&hasSubLinks);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		if (hasSubLinks)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("COPY FROM cannot enforce row-level security policies containing subqueries"),
+					 errhint("Use INSERT statements instead, or rewrite the applicable row-level security policies to avoid subqueries.")));
+	}
 
 	if (data_source_cb)
 	{

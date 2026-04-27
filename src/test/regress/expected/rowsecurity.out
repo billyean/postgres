@@ -4173,9 +4173,10 @@ SET row_security TO OFF;
 COPY copy_t FROM STDIN; --fail - would be affected by RLS.
 ERROR:  query would be affected by row-level security policy for table "copy_t"
 SET row_security TO ON;
-COPY copy_t FROM STDIN; --fail - COPY FROM not supported by RLS.
-ERROR:  COPY FROM not supported with row-level security
-HINT:  Use INSERT statements instead.
+COPY copy_t FROM STDIN; --ok (RLS allows a % 2 = 0)
+COPY copy_t FROM STDIN; --fail - RLS violation
+ERROR:  new row violates row-level security policy for table "copy_t"
+CONTEXT:  COPY copy_t, line 1: "1	abc"
 -- Check COPY FROM as user with permissions and BYPASSRLS
 SET SESSION AUTHORIZATION regress_rls_exempt_user;
 SET row_security TO ON;
@@ -5194,6 +5195,318 @@ reset plan_cache_mode;
 reset rls_test.blah;
 drop function rls_f(text);
 drop table rls_t, test_t;
+--
+-- COPY FROM with RLS (Patch 1: plain heap tables only)
+--
+RESET SESSION AUTHORIZATION;
+SET search_path = regress_rls_schema, public;
+-- Setup: create test table
+CREATE TABLE copy_rls_test (id int, tenant_id int, data text);
+ALTER TABLE copy_rls_test ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_insert ON copy_rls_test FOR INSERT
+  WITH CHECK (tenant_id = 1);
+GRANT INSERT ON copy_rls_test TO regress_rls_bob;
+-- T1: Row satisfies policy -> COPY succeeds
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id | data  
+----+-----------+-------
+  1 |         1 | hello
+(1 row)
+
+TRUNCATE copy_rls_test;
+-- T2: Row violates policy -> COPY fails with RLS error
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_test FROM stdin;
+ERROR:  new row violates row-level security policy for table "copy_rls_test"
+CONTEXT:  COPY copy_rls_test, line 1: "2	2	world"
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id | data 
+----+-----------+------
+(0 rows)
+
+TRUNCATE copy_rls_test;
+-- T3: Multiple permissive policies (OR semantics)
+RESET SESSION AUTHORIZATION;
+CREATE POLICY p_insert2 ON copy_rls_test FOR INSERT
+  WITH CHECK (tenant_id = 2);
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id |      data      
+----+-----------+----------------
+  3 |         2 | passes_policy2
+(1 row)
+
+TRUNCATE copy_rls_test;
+DROP POLICY p_insert2 ON copy_rls_test;
+-- T4: Restrictive policy (AND semantics)
+RESET SESSION AUTHORIZATION;
+CREATE POLICY p_restrict ON copy_rls_test AS RESTRICTIVE FOR INSERT
+  WITH CHECK (id > 0);
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- This should fail: restrictive policy requires id > 0
+COPY copy_rls_test FROM stdin;
+ERROR:  new row violates row-level security policy "p_restrict" for table "copy_rls_test"
+CONTEXT:  COPY copy_rls_test, line 1: "-1	1	negative_id"
+-- This should succeed: both policies satisfied
+COPY copy_rls_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id | data 
+----+-----------+------
+  1 |         1 | ok
+(1 row)
+
+TRUNCATE copy_rls_test;
+DROP POLICY p_restrict ON copy_rls_test;
+-- T5: FORCE ROW LEVEL SECURITY makes non-superuser owner subject to policy
+-- regress_rls_alice owns the table; she's not a superuser
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_force_test (id int, tenant_id int, data text);
+ALTER TABLE copy_rls_force_test OWNER TO regress_rls_alice;
+ALTER TABLE copy_rls_force_test ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_insert ON copy_rls_force_test FOR INSERT
+  WITH CHECK (tenant_id = 1);
+ALTER TABLE copy_rls_force_test FORCE ROW LEVEL SECURITY;
+GRANT INSERT ON copy_rls_force_test TO regress_rls_alice;
+SET SESSION AUTHORIZATION regress_rls_alice;
+COPY copy_rls_force_test FROM stdin;
+ERROR:  new row violates row-level security policy for table "copy_rls_force_test"
+CONTEXT:  COPY copy_rls_force_test, line 1: "11	99	owner_blocked"
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_force_test;
+ id | tenant_id | data 
+----+-----------+------
+(0 rows)
+
+TRUNCATE copy_rls_force_test;
+-- T6: Owner without FORCE RLS bypasses policy
+ALTER TABLE copy_rls_force_test NO FORCE ROW LEVEL SECURITY;
+SET SESSION AUTHORIZATION regress_rls_alice;
+COPY copy_rls_force_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_force_test;
+ id | tenant_id |     data     
+----+-----------+--------------
+ 10 |        99 | owner_bypass
+(1 row)
+
+DROP TABLE copy_rls_force_test;
+-- T7: BEFORE INSERT trigger modifies row from failing to passing
+CREATE FUNCTION copy_rls_fix_tenant() RETURNS trigger AS $$
+BEGIN
+  NEW.tenant_id := 1;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER tr_fix BEFORE INSERT ON copy_rls_test
+  FOR EACH ROW EXECUTE FUNCTION copy_rls_fix_tenant();
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id |     data      
+----+-----------+---------------
+ 20 |         1 | trigger_fixes
+(1 row)
+
+TRUNCATE copy_rls_test;
+-- T8: BEFORE INSERT trigger modifies row from passing to failing
+CREATE OR REPLACE FUNCTION copy_rls_fix_tenant() RETURNS trigger AS $$
+BEGIN
+  NEW.tenant_id := 99;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_test FROM stdin;
+ERROR:  new row violates row-level security policy for table "copy_rls_test"
+CONTEXT:  COPY copy_rls_test, line 1: "21	1	trigger_breaks"
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id | data 
+----+-----------+------
+(0 rows)
+
+TRUNCATE copy_rls_test;
+DROP TRIGGER tr_fix ON copy_rls_test;
+DROP FUNCTION copy_rls_fix_tenant();
+-- T9: Stored generated column referenced by policy
+CREATE TABLE copy_rls_gen_test (
+  id int,
+  base_val int,
+  computed_val int GENERATED ALWAYS AS (base_val * 10) STORED,
+  data text
+);
+ALTER TABLE copy_rls_gen_test ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON copy_rls_gen_test FOR INSERT
+  WITH CHECK (computed_val <= 100);
+GRANT INSERT ON copy_rls_gen_test TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- computed_val = 50 <= 100 -> succeeds
+COPY copy_rls_gen_test (id, base_val, data) FROM stdin;
+-- computed_val = 150 > 100 -> fails
+COPY copy_rls_gen_test (id, base_val, data) FROM stdin;
+ERROR:  new row violates row-level security policy for table "copy_rls_gen_test"
+CONTEXT:  COPY copy_rls_gen_test, line 1: "2	15	fails"
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_gen_test;
+ id | base_val | computed_val |  data  
+----+----------+--------------+--------
+  1 |        5 |           50 | passes
+(1 row)
+
+DROP TABLE copy_rls_gen_test;
+-- T10: Default column referenced by policy
+CREATE TABLE copy_rls_default_test (
+  id int,
+  status text DEFAULT 'active',
+  data text
+);
+ALTER TABLE copy_rls_default_test ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON copy_rls_default_test FOR INSERT
+  WITH CHECK (status = 'active');
+GRANT INSERT ON copy_rls_default_test TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- T11: COPY FROM with explicit column list; status defaults to 'active'
+COPY copy_rls_default_test (id, data) FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_default_test;
+ id | status | data 
+----+--------+------
+  1 | active | test
+(1 row)
+
+DROP TABLE copy_rls_default_test;
+-- T12: COPY FROM with DEFAULT token
+CREATE TABLE copy_rls_deftoken (
+  id int,
+  tenant_id int DEFAULT 1,
+  data text
+);
+ALTER TABLE copy_rls_deftoken ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON copy_rls_deftoken FOR INSERT
+  WITH CHECK (tenant_id = 1);
+GRANT INSERT ON copy_rls_deftoken TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_deftoken FROM stdin WITH (default '\D');
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_deftoken;
+ id | tenant_id |     data     
+----+-----------+--------------
+  1 |         1 | default_test
+(1 row)
+
+DROP TABLE copy_rls_deftoken;
+-- T13: CHECK constraint and RLS both fail -> RLS error wins
+CREATE TABLE copy_rls_order_test (
+  id int CHECK (id > 0),
+  tenant_id int
+);
+ALTER TABLE copy_rls_order_test ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON copy_rls_order_test FOR INSERT
+  WITH CHECK (tenant_id = 1);
+GRANT INSERT ON copy_rls_order_test TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Both CHECK (id > 0) and RLS (tenant_id = 1) fail; RLS error should appear
+COPY copy_rls_order_test FROM stdin;
+ERROR:  new row violates row-level security policy for table "copy_rls_order_test"
+CONTEXT:  COPY copy_rls_order_test, line 1: "-1	99"
+RESET SESSION AUTHORIZATION;
+DROP TABLE copy_rls_order_test;
+-- T14: SubLink policy -> setup-time error
+CREATE TABLE copy_rls_sublink_test (id int, dept_id int);
+ALTER TABLE copy_rls_sublink_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE allowed_depts (dept_id int);
+INSERT INTO allowed_depts VALUES (1), (2);
+CREATE POLICY p ON copy_rls_sublink_test FOR INSERT
+  WITH CHECK (dept_id IN (SELECT dept_id FROM allowed_depts));
+GRANT INSERT ON copy_rls_sublink_test TO regress_rls_bob;
+GRANT SELECT ON allowed_depts TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_sublink_test FROM stdin;
+ERROR:  COPY FROM cannot enforce row-level security policies containing subqueries
+HINT:  Use INSERT statements instead, or rewrite the applicable row-level security policies to avoid subqueries.
+-- T15: INSERT with same SubLink policy succeeds
+INSERT INTO copy_rls_sublink_test VALUES (1, 1);
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_sublink_test;
+ id | dept_id 
+----+---------
+  1 |       1
+(1 row)
+
+DROP TABLE copy_rls_sublink_test;
+DROP TABLE allowed_depts;
+-- T16: Table without RLS behaves as before
+CREATE TABLE copy_no_rls_test (id int, data text);
+GRANT INSERT ON copy_no_rls_test TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_no_rls_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_no_rls_test;
+ id | data  
+----+-------
+  1 | works
+(1 row)
+
+DROP TABLE copy_no_rls_test;
+-- T17: ON_ERROR IGNORE does not skip RLS violation
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_test FROM stdin WITH (ON_ERROR ignore);
+ERROR:  new row violates row-level security policy for table "copy_rls_test"
+CONTEXT:  COPY copy_rls_test, line 1: "2	2	should_still_fail"
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id | data 
+----+-----------+------
+(0 rows)
+
+TRUNCATE copy_rls_test;
+-- T18: Partitioned table with RLS enabled -> Patch 1 fail-closed error
+CREATE TABLE copy_rls_part (id int, region text, data text)
+  PARTITION BY LIST (region);
+CREATE TABLE copy_rls_part_us PARTITION OF copy_rls_part FOR VALUES IN ('us');
+ALTER TABLE copy_rls_part ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON copy_rls_part FOR INSERT WITH CHECK (region = 'us');
+GRANT INSERT ON copy_rls_part TO regress_rls_bob;
+GRANT INSERT ON copy_rls_part_us TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Should fail with feature-not-supported for partitioned tables
+COPY copy_rls_part FROM stdin;
+ERROR:  COPY FROM with row-level security is not yet supported for partitioned tables
+HINT:  Use INSERT statements instead.
+-- Non-RLS partitioned COPY FROM remains unchanged (owner bypasses RLS)
+RESET SESSION AUTHORIZATION;
+COPY copy_rls_part FROM stdin;
+SELECT * FROM copy_rls_part;
+ id | region |   data   
+----+--------+----------
+  1 | us     | owner_ok
+(1 row)
+
+DROP TABLE copy_rls_part;
+-- Optional: BYPASSRLS role bypass
+RESET SESSION AUTHORIZATION;
+GRANT INSERT ON copy_rls_test TO regress_rls_exempt_user;
+SET SESSION AUTHORIZATION regress_rls_exempt_user;
+COPY copy_rls_test FROM stdin;
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_test;
+ id | tenant_id |    data     
+----+-----------+-------------
+ 50 |        99 | bypass_user
+(1 row)
+
+TRUNCATE copy_rls_test;
+-- Cleanup COPY FROM RLS test objects
+RESET SESSION AUTHORIZATION;
+DROP TABLE copy_rls_test;
 --
 -- Clean up objects
 --

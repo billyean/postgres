@@ -117,6 +117,8 @@ typedef struct CopyFromStateData
 	bool	   *domain_with_constraint;
 
 	bool		volatile_defexprs;	/* is any of defexprs volatile? */
+	bool		rls_enabled;		/* must enforce RLS for COPY FROM? */
+	List	   *rls_wco_list;		/* collected RLS WITH CHECK options */
 	List	   *range_table;	/* single element list of RangeTblEntry */
 	List	   *rteperminfos;	/* single element list of RTEPermissionInfo */
 	ExprState  *qualexpr;
