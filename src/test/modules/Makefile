@@ -54,6 +54,7 @@ SUBDIRS = \
 		  test_search_path_hash \
 		  test_shared_plan_cache_shmem \
 		  test_shared_plan_cache_serialization \
+		  test_shared_plan_cache_store \
 		  test_shmem \
 		  test_shm_mq \
 		  test_slru \

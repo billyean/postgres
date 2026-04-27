@@ -186,4 +186,37 @@ extern SharedPlanSerializeStatus SharedPlanDeserializeFromDSA(dsa_area *area,
 															  MemoryContext target_context,
 															  List **out_stmt_list);
 
+/* ---- Key Computation + Store (Patch 0006) ---- */
+
+typedef enum SharedPlanStoreStatus
+{
+	SHARED_PLAN_STORE_OK = 0,
+	SHARED_PLAN_STORE_DISABLED,
+	SHARED_PLAN_STORE_NOT_SHAREABLE,
+	SHARED_PLAN_STORE_OVERSIZE,
+	SHARED_PLAN_STORE_OOM,
+	SHARED_PLAN_STORE_DUPLICATE,
+	SHARED_PLAN_STORE_FULL,
+} SharedPlanStoreStatus;
+
+extern bool ComputeSharedPlanKey(CachedPlanSource *plansource,
+								 CachedPlan *plan,
+								 bool is_generic_plan,
+								 SharedPlanKey *key,
+								 SharedPlanRejectReason *reject_reason);
+
+extern SharedPlanStoreStatus SharedPlanCacheStore(CachedPlanSource *plansource,
+												   CachedPlan *plan,
+												   bool is_generic_plan,
+												   SharedPlanKey *out_key,
+												   SharedPlanRejectReason *reject_reason);
+
+/*
+ * Test-module-only accessors; not part of production shared plan cache API.
+ * Used by test_shared_plan_cache_store for entry inspection and reset.
+ */
+extern dsa_area *SharedPlanCacheGetDSA(void);
+extern dshash_table *SharedPlanCacheGetHash(void);
+extern SharedPlanCacheControl *SharedPlanCacheGetControl(void);
+
 #endif							/* SHARED_PLANCACHE_H */

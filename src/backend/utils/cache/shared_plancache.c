@@ -18,11 +18,14 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
+#include "common/hashfn.h"
 #include "lib/dshash.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/plannodes.h"
+#include "nodes/primnodes.h"
 #include "nodes/queryjumble.h"
 #include "nodes/readfuncs.h"
 #include "storage/ipc.h"
@@ -30,6 +33,7 @@
 #include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/memutils.h"
+#include "utils/planner_guc_hash.h"
 #include "utils/shared_plancache.h"
 
 /* GUC variables */
@@ -559,4 +563,405 @@ SharedPlanDeserializeFromDSA(dsa_area *area,
 	addr = (const char *) dsa_get_address(area, ptr);
 
 	return SharedPlanDeserialize(addr, len, target_context, out_stmt_list);
+}
+
+/* ---- Key Computation + Store (Patch 0006) ---- */
+
+/*
+ * Test-module-only accessors; not part of production shared plan cache API.
+ * These expose internal state for the test_shared_plan_cache_store module.
+ */
+
+dsa_area *
+SharedPlanCacheGetDSA(void)
+{
+	return shared_plan_dsa;
+}
+
+dshash_table *
+SharedPlanCacheGetHash(void)
+{
+	return shared_plan_hash;
+}
+
+SharedPlanCacheControl *
+SharedPlanCacheGetControl(void)
+{
+	return shared_plan_ctl;
+}
+
+/* Collation hash walker context */
+typedef struct CollationHashContext
+{
+	uint64		hash;
+	bool		has_collation;
+} CollationHashContext;
+
+#define HASH_COLLATION_OID(ctx, oid) \
+	do { \
+		if (OidIsValid(oid)) \
+		{ \
+			(ctx)->hash = hash_combine64((ctx)->hash, \
+				hash_bytes_uint32_extended((uint32) (oid), UINT64CONST(0))); \
+			(ctx)->has_collation = true; \
+		} \
+	} while (0)
+
+static bool
+collation_hash_walker(Node *node, void *context)
+{
+	CollationHashContext *ctx = (CollationHashContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			HASH_COLLATION_OID(ctx, ((Var *) node)->varcollid);
+			break;
+		case T_Const:
+			HASH_COLLATION_OID(ctx, ((Const *) node)->constcollid);
+			break;
+		case T_Param:
+			HASH_COLLATION_OID(ctx, ((Param *) node)->paramcollid);
+			break;
+		case T_CollateExpr:
+			HASH_COLLATION_OID(ctx, ((CollateExpr *) node)->collOid);
+			break;
+		case T_FuncExpr:
+			HASH_COLLATION_OID(ctx, ((FuncExpr *) node)->funccollid);
+			HASH_COLLATION_OID(ctx, ((FuncExpr *) node)->inputcollid);
+			break;
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+			HASH_COLLATION_OID(ctx, ((OpExpr *) node)->opcollid);
+			HASH_COLLATION_OID(ctx, ((OpExpr *) node)->inputcollid);
+			break;
+		case T_ScalarArrayOpExpr:
+			HASH_COLLATION_OID(ctx, ((ScalarArrayOpExpr *) node)->inputcollid);
+			break;
+		case T_SubscriptingRef:
+			HASH_COLLATION_OID(ctx, ((SubscriptingRef *) node)->refcollid);
+			break;
+		case T_MergeSupportFunc:
+			HASH_COLLATION_OID(ctx, ((MergeSupportFunc *) node)->msfcollid);
+			break;
+		case T_Aggref:
+			HASH_COLLATION_OID(ctx, ((Aggref *) node)->aggcollid);
+			HASH_COLLATION_OID(ctx, ((Aggref *) node)->inputcollid);
+			break;
+		case T_WindowFunc:
+			HASH_COLLATION_OID(ctx, ((WindowFunc *) node)->wincollid);
+			HASH_COLLATION_OID(ctx, ((WindowFunc *) node)->inputcollid);
+			break;
+		case T_RelabelType:
+			HASH_COLLATION_OID(ctx, ((RelabelType *) node)->resultcollid);
+			break;
+		case T_CoerceViaIO:
+			HASH_COLLATION_OID(ctx, ((CoerceViaIO *) node)->resultcollid);
+			break;
+		case T_ArrayCoerceExpr:
+			HASH_COLLATION_OID(ctx, ((ArrayCoerceExpr *) node)->resultcollid);
+			break;
+		case T_FieldSelect:
+			HASH_COLLATION_OID(ctx, ((FieldSelect *) node)->resultcollid);
+			break;
+		case T_CaseExpr:
+			HASH_COLLATION_OID(ctx, ((CaseExpr *) node)->casecollid);
+			break;
+		case T_CoalesceExpr:
+			HASH_COLLATION_OID(ctx, ((CoalesceExpr *) node)->coalescecollid);
+			break;
+		case T_MinMaxExpr:
+			HASH_COLLATION_OID(ctx, ((MinMaxExpr *) node)->minmaxcollid);
+			HASH_COLLATION_OID(ctx, ((MinMaxExpr *) node)->inputcollid);
+			break;
+		case T_ArrayExpr:
+			HASH_COLLATION_OID(ctx, ((ArrayExpr *) node)->array_collid);
+			break;
+		case T_RowCompareExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((RowCompareExpr *) node)->inputcollids)
+					HASH_COLLATION_OID(ctx, lfirst_oid(lc));
+			}
+			break;
+		case T_SubPlan:
+			HASH_COLLATION_OID(ctx, ((SubPlan *) node)->firstColCollation);
+			break;
+		default:
+			break;
+	}
+
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node,
+								 collation_hash_walker,
+								 context, 0);
+	return expression_tree_walker(node, collation_hash_walker, context);
+}
+
+static uint64
+compute_collation_hash(List *query_list)
+{
+	CollationHashContext ctx;
+	ListCell   *lc;
+
+	ctx.hash = UINT64CONST(0);
+	ctx.has_collation = false;
+
+	foreach(lc, query_list)
+		collation_hash_walker((Node *) lfirst(lc), &ctx);
+
+	if (!ctx.has_collation)
+		return UINT64CONST(0);
+
+	return ctx.hash;
+}
+
+/*
+ * compute_param_signature_hash - hash the external parameter signature.
+ *
+ * v1 hashes parameter type OIDs and parameter count only.  It does not
+ * separately hash typmod or collation per-parameter, because CachedPlanSource
+ * stores only type OIDs in param_types[].  Expression-level typmod and
+ * collation effects are captured through query_tree_hash and collation_hash.
+ * Richer parameter metadata may be considered in v2 if needed.
+ */
+static uint64
+compute_param_signature_hash(CachedPlanSource *plansource)
+{
+	uint64		hash;
+	int			i;
+
+	if (plansource->num_params == 0)
+		return UINT64CONST(0x1);
+
+	Assert(plansource->param_types != NULL);
+
+	hash = hash_bytes_uint32_extended((uint32) plansource->num_params,
+									  UINT64CONST(0));
+
+	for (i = 0; i < plansource->num_params; i++)
+	{
+		uint64		type_hash;
+
+		type_hash = hash_bytes_uint32_extended((uint32) plansource->param_types[i],
+											   UINT64CONST(0));
+		hash = hash_combine64(hash, type_hash);
+	}
+
+	return hash;
+}
+
+static uint64
+compute_query_tree_hash(List *query_list)
+{
+	char	   *text;
+	Size		text_len;
+	uint64		hash;
+
+	if (query_list == NIL)
+		return UINT64CONST(0);
+
+	text = nodeToString(query_list);
+	text_len = strlen(text);
+
+	if (text_len > PG_INT32_MAX)
+	{
+		pfree(text);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("query tree serialization too large to hash (%zu bytes)",
+						text_len)));
+	}
+
+	hash = hash_bytes_extended((const unsigned char *) text,
+							   (int) text_len,
+							   UINT64CONST(0));
+	pfree(text);
+	return hash;
+}
+
+/*
+ * ComputeSharedPlanKey - compute a complete SharedPlanKey for the given plan.
+ *
+ * Returns true if a valid key was computed.  Returns false if the plan is
+ * not shareable; reject_reason is populated in that case.
+ *
+ * The key is always zero-initialized at entry regardless of return value.
+ */
+bool
+ComputeSharedPlanKey(CachedPlanSource *plansource,
+					 CachedPlan *plan,
+					 bool is_generic_plan,
+					 SharedPlanKey *key,
+					 SharedPlanRejectReason *reject_reason)
+{
+	Assert(plansource != NULL);
+	Assert(key != NULL);
+	Assert(reject_reason != NULL);
+
+	memset(key, 0, sizeof(SharedPlanKey));
+
+	if (!PlanIsShareable(plansource, plan, is_generic_plan, reject_reason))
+		return false;
+
+	Assert(plansource->query_list != NIL);
+	Assert(IsA(linitial(plansource->query_list), Query));
+
+	key->queryid = ((Query *) linitial(plansource->query_list))->queryId;
+	key->dbid = MyDatabaseId;
+	key->roleid = GetUserId();
+	key->num_params = plansource->num_params;
+	key->cursor_options = plansource->cursor_options;
+
+	key->param_signature_hash = compute_param_signature_hash(plansource);
+	key->query_tree_hash = compute_query_tree_hash(plansource->query_list);
+	key->search_path_hash = GetSearchPathHash();
+	key->planner_gucs_hash = GetPlannerGucHash();
+	key->collation_hash = compute_collation_hash(plansource->query_list);
+
+	return true;
+}
+
+/*
+ * SharedPlanCacheStore - store a serialized plan in the shared plan cache.
+ *
+ * DUPLICATE takes precedence over FULL.  The dshash partition lock is never
+ * held during serialization, DSA allocation, or memcpy.
+ *
+ * Returns the store status.  out_key is populated on all paths if non-NULL.
+ */
+SharedPlanStoreStatus
+SharedPlanCacheStore(CachedPlanSource *plansource,
+					 CachedPlan *plan,
+					 bool is_generic_plan,
+					 SharedPlanKey *out_key,
+					 SharedPlanRejectReason *reject_reason)
+{
+	SharedPlanKey key;
+	SharedPlanEntry *entry;
+	SharedPlanEntry *existing;
+	SharedPlanSerializeStatus ser_status;
+	char	   *local_buf = NULL;
+	Size		local_len = 0;
+	dsa_pointer dp = InvalidDsaPointer;
+	uint32		cur;
+	bool		found;
+
+	Assert(reject_reason != NULL);
+
+	*reject_reason = SHARED_PLAN_REJECT_NONE;
+
+	/* Step 1: Check preconditions */
+	if (!SharedPlanCacheIsActive())
+	{
+		if (out_key)
+			memset(out_key, 0, sizeof(SharedPlanKey));
+		return SHARED_PLAN_STORE_DISABLED;
+	}
+
+	/* Step 2: Compute key (includes PlanIsShareable check) */
+	if (!ComputeSharedPlanKey(plansource, plan, is_generic_plan,
+							  &key, reject_reason))
+	{
+		if (out_key)
+			memcpy(out_key, &key, sizeof(SharedPlanKey));
+		return SHARED_PLAN_STORE_NOT_SHAREABLE;
+	}
+
+	if (out_key)
+		memcpy(out_key, &key, sizeof(SharedPlanKey));
+
+	/* Step 3: Duplicate pre-check (shared lock, no reservation) */
+	existing = dshash_find(shared_plan_hash, &key, false);
+	if (existing != NULL)
+	{
+		dshash_release_lock(shared_plan_hash, existing);
+		return SHARED_PLAN_STORE_DUPLICATE;
+	}
+
+	/* Step 4: Racy FULL pre-check */
+	if (pg_atomic_read_u32(&shared_plan_ctl->current_entries) >=
+		(uint32) shared_plan_ctl->max_entries)
+		return SHARED_PLAN_STORE_FULL;
+
+	/* Step 5: Serialize to local buffer */
+	ser_status = SharedPlanSerializeStmtList(plan->stmt_list,
+											 mul_size((Size) shared_plan_ctl->max_entry_size_kb, 1024),
+											 &local_buf, &local_len);
+	switch (ser_status)
+	{
+		case SHARED_PLAN_SERIALIZE_OK:
+			break;
+		case SHARED_PLAN_SERIALIZE_OVERSIZE:
+			return SHARED_PLAN_STORE_OVERSIZE;
+		case SHARED_PLAN_SERIALIZE_OOM:
+			return SHARED_PLAN_STORE_OOM;
+		case SHARED_PLAN_SERIALIZE_NOT_SHAREABLE:
+		case SHARED_PLAN_SERIALIZE_INVALID_INPUT:
+			elog(ERROR, "unexpected serialization status %d from SharedPlanSerializeStmtList", ser_status);
+			return SHARED_PLAN_STORE_OOM;	/* unreachable, keeps compiler quiet */
+	}
+
+	/* Step 6: Allocate DSA payload and copy (no dshash lock held) */
+	dp = dsa_allocate_extended(shared_plan_dsa, local_len, DSA_ALLOC_NO_OOM);
+	if (!DsaPointerIsValid(dp))
+	{
+		pfree(local_buf);
+		return SHARED_PLAN_STORE_OOM;
+	}
+	memcpy(dsa_get_address(shared_plan_dsa, dp), local_buf, local_len);
+	pfree(local_buf);
+
+	/* Step 7: Reserve entry slot (atomic CAS loop) */
+	for (;;)
+	{
+		cur = pg_atomic_read_u32(&shared_plan_ctl->current_entries);
+		if (cur >= (uint32) shared_plan_ctl->max_entries)
+		{
+			dsa_free(shared_plan_dsa, dp);
+			return SHARED_PLAN_STORE_FULL;
+		}
+		if (pg_atomic_compare_exchange_u32(&shared_plan_ctl->current_entries,
+										   &cur, cur + 1))
+			break;
+	}
+
+	/* Step 8: Insert into dshash (acquires exclusive partition lock) */
+	entry = dshash_find_or_insert_extended(shared_plan_hash, &key, &found,
+										   DSHASH_INSERT_NO_OOM);
+	if (entry == NULL)
+	{
+		dsa_free(shared_plan_dsa, dp);
+		pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
+		return SHARED_PLAN_STORE_OOM;
+	}
+
+	if (found)
+	{
+		dshash_release_lock(shared_plan_hash, entry);
+		dsa_free(shared_plan_dsa, dp);
+		pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
+		return SHARED_PLAN_STORE_DUPLICATE;
+	}
+
+	/* Step 9: Initialize entry and commit (partition lock held) */
+	pg_atomic_init_u32(&entry->refcount, 0);
+	pg_atomic_init_u32(&entry->is_valid, 0);
+	entry->generation = pg_atomic_read_u64(&shared_plan_ctl->generation);
+	entry->serialized_plan = dp;
+	entry->serialized_plan_len = local_len;
+	entry->relation_oids = InvalidDsaPointer;
+	entry->num_relation_oids = 0;
+	entry->inval_items = InvalidDsaPointer;
+	entry->num_inval_items = 0;
+
+	pg_atomic_write_u32(&entry->is_valid, 1);
+	dshash_release_lock(shared_plan_hash, entry);
+
+	return SHARED_PLAN_STORE_OK;
 }

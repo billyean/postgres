@@ -1,0 +1,4 @@
+comment = 'Test code for shared plan cache key computation and store'
+default_version = '1.0'
+module_pathname = '$libdir/test_shared_plan_cache_store'
+relocatable = true

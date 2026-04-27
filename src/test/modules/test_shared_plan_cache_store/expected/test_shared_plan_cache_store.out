@@ -1,0 +1,232 @@
+CREATE EXTENSION test_shared_plan_cache_store;
+SET plan_cache_mode = force_generic_plan;
+-- ===== Reset shared state =====
+SELECT test_shared_plan_store_reset();
+ test_shared_plan_store_reset 
+------------------------------
+ 
+(1 row)
+
+-- ===== Key computation tests =====
+-- K1: Same prepared statement computes same key repeatedly
+PREPARE k1 AS SELECT 1;
+SELECT test_shared_plan_compute_key('k1') = test_shared_plan_compute_key('k1') AS k1_stable;
+ k1_stable 
+-----------
+ t
+(1 row)
+
+DEALLOCATE k1;
+-- K2: Different literal constants produce different query_tree_hash
+PREPARE k2a AS SELECT 1;
+PREPARE k2b AS SELECT 2;
+SELECT
+  test_shared_plan_key_field('k2a', 'query_tree_hash') !=
+  test_shared_plan_key_field('k2b', 'query_tree_hash') AS k2_different_query_tree_hash;
+ k2_different_query_tree_hash 
+------------------------------
+ t
+(1 row)
+
+DEALLOCATE k2a;
+DEALLOCATE k2b;
+-- K7: Different parameter type signatures change param_signature_hash
+PREPARE k7a(int) AS SELECT $1;
+PREPARE k7b(text) AS SELECT $1;
+SELECT
+  test_shared_plan_key_field('k7a', 'param_signature_hash') !=
+  test_shared_plan_key_field('k7b', 'param_signature_hash') AS k7_different_param_hash;
+ k7_different_param_hash 
+-------------------------
+ t
+(1 row)
+
+DEALLOCATE k7a;
+DEALLOCATE k7b;
+-- K6: Different planner GUC changes planner_gucs_hash
+PREPARE k6 AS SELECT 1;
+SELECT test_shared_plan_key_field('k6', 'planner_gucs_hash') AS k6_before \gset
+SET enable_seqscan = off;
+SELECT test_shared_plan_key_field('k6', 'planner_gucs_hash') AS k6_after \gset
+SELECT :'k6_before' != :'k6_after' AS k6_guc_changes_hash;
+ k6_guc_changes_hash 
+---------------------
+ t
+(1 row)
+
+RESET enable_seqscan;
+DEALLOCATE k6;
+-- K5: Different search_path changes search_path_hash
+CREATE SCHEMA test_sp_schema;
+PREPARE k5 AS SELECT 1;
+SELECT test_shared_plan_key_field('k5', 'search_path_hash') AS k5_before \gset
+SET search_path = test_sp_schema, public;
+SELECT test_shared_plan_key_field('k5', 'search_path_hash') AS k5_after \gset
+SELECT :'k5_before' != :'k5_after' AS k5_search_path_changes_hash;
+ k5_search_path_changes_hash 
+-----------------------------
+ t
+(1 row)
+
+RESET search_path;
+DEALLOCATE k5;
+DROP SCHEMA test_sp_schema;
+-- K9: Same shape different constants have same queryid but different query_tree_hash
+PREPARE k9a AS SELECT 100;
+PREPARE k9b AS SELECT 200;
+SELECT
+  test_shared_plan_key_field('k9a', 'queryid') = test_shared_plan_key_field('k9b', 'queryid') AS k9_same_queryid,
+  test_shared_plan_key_field('k9a', 'query_tree_hash') != test_shared_plan_key_field('k9b', 'query_tree_hash') AS k9_different_tree_hash;
+ k9_same_queryid | k9_different_tree_hash 
+-----------------+------------------------
+ t               | t
+(1 row)
+
+DEALLOCATE k9a;
+DEALLOCATE k9b;
+-- C2: Integer-only query has collation_hash = 0
+PREPARE c2 AS SELECT 1 + 2;
+SELECT test_shared_plan_key_field('c2', 'collation_hash') = '0' AS c2_int_no_collation;
+ c2_int_no_collation 
+---------------------
+ t
+(1 row)
+
+DEALLOCATE c2;
+-- C3: Text query has nonzero collation_hash
+PREPARE c3 AS SELECT 'hello'::text;
+SELECT test_shared_plan_key_field('c3', 'collation_hash') != '0' AS c3_text_has_collation;
+ c3_text_has_collation 
+-----------------------
+ t
+(1 row)
+
+DEALLOCATE c3;
+-- K8: SET ROLE changes roleid field
+DROP ROLE IF EXISTS regress_store_key_user;
+NOTICE:  role "regress_store_key_user" does not exist, skipping
+CREATE ROLE regress_store_key_user;
+PREPARE k8 AS SELECT 1;
+SELECT test_shared_plan_key_field('k8', 'roleid') AS k8_before \gset
+DEALLOCATE k8;
+SET ROLE regress_store_key_user;
+PREPARE k8 AS SELECT 1;
+SELECT test_shared_plan_key_field('k8', 'roleid') AS k8_after \gset
+DEALLOCATE k8;
+RESET ROLE;
+DROP ROLE regress_store_key_user;
+SELECT :'k8_before' != :'k8_after' AS k8_roleid_changes;
+ k8_roleid_changes 
+-------------------
+ t
+(1 row)
+
+-- ===== Store tests =====
+SELECT test_shared_plan_store_reset();
+ test_shared_plan_store_reset 
+------------------------------
+ 
+(1 row)
+
+-- S1: Store simple generic plan returns OK
+PREPARE s1 AS SELECT 1;
+SELECT test_shared_plan_store('s1') AS s1_store;
+ s1_store 
+----------
+ OK
+(1 row)
+
+-- S2: current_entries increments once
+SELECT test_shared_plan_store_count() AS s2_count;
+ s2_count 
+----------
+        1
+(1 row)
+
+-- S3: Duplicate store returns DUPLICATE
+SELECT test_shared_plan_store_duplicate('s1') AS s3_duplicate;
+ s3_duplicate 
+--------------
+ DUPLICATE
+(1 row)
+
+-- S4: current_entries unchanged after duplicate
+SELECT test_shared_plan_store_count() AS s4_count;
+ s4_count 
+----------
+        1
+(1 row)
+
+-- S10: Stored entry has is_valid = 1
+SELECT test_shared_plan_store_entry_valid('s1') AS s10_valid;
+ s10_valid 
+-----------
+ t
+(1 row)
+
+-- S11: Serialized plan size > 0
+SELECT test_shared_plan_store_serialized_size('s1') > 0 AS s11_size_positive;
+ s11_size_positive 
+-------------------
+ t
+(1 row)
+
+-- S12: Dependency arrays remain empty
+SELECT test_shared_plan_store_dependency_counts('s1') AS s12_deps;
+           s12_deps            
+-------------------------------
+ relation_oids=0 inval_items=0
+(1 row)
+
+DEALLOCATE s1;
+-- S5: Store temp table returns NOT_SHAREABLE (current_entries unchanged)
+SELECT test_shared_plan_store_count() AS count_before_temp \gset
+CREATE TEMP TABLE store_tmp (x int);
+PREPARE s5 AS SELECT * FROM store_tmp;
+SELECT test_shared_plan_store('s5') AS s5_temp;
+          s5_temp          
+---------------------------
+ NOT_SHAREABLE:TEMP_OBJECT
+(1 row)
+
+SELECT test_shared_plan_store_count() = :count_before_temp AS s5_count_unchanged;
+ s5_count_unchanged 
+--------------------
+ t
+(1 row)
+
+DEALLOCATE s5;
+DROP TABLE store_tmp;
+-- S6: Store RLS table returns NOT_SHAREABLE (current_entries unchanged)
+SELECT test_shared_plan_store_count() AS count_before_rls \gset
+CREATE TABLE store_rls (x int);
+ALTER TABLE store_rls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE store_rls FORCE ROW LEVEL SECURITY;
+CREATE POLICY p ON store_rls USING (true);
+DROP ROLE IF EXISTS regress_store_rls_user;
+NOTICE:  role "regress_store_rls_user" does not exist, skipping
+CREATE ROLE regress_store_rls_user;
+GRANT SELECT ON store_rls TO regress_store_rls_user;
+SET ROLE regress_store_rls_user;
+PREPARE s6 AS SELECT * FROM store_rls;
+SELECT test_shared_plan_store('s6') AS s6_rls;
+            s6_rls            
+------------------------------
+ NOT_SHAREABLE:DEPENDS_ON_RLS
+(1 row)
+
+SELECT test_shared_plan_store_count() = :count_before_rls AS s6_count_unchanged;
+ s6_count_unchanged 
+--------------------
+ t
+(1 row)
+
+DEALLOCATE s6;
+RESET ROLE;
+REVOKE SELECT ON store_rls FROM regress_store_rls_user;
+DROP ROLE regress_store_rls_user;
+DROP POLICY p ON store_rls;
+ALTER TABLE store_rls DISABLE ROW LEVEL SECURITY;
+ALTER TABLE store_rls NO FORCE ROW LEVEL SECURITY;
+DROP TABLE store_rls;
+RESET plan_cache_mode;
