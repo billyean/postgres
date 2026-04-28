@@ -2792,6 +2792,14 @@
   options => 'shared_memory_options',
 },
 
+{ name => 'shared_plan_cache_enabled', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Enables shared plan cache L2 lookup and store in GetCachedPlan().',
+  long_desc => 'Test/development use only. Do not enable in production until invalidation and race protection are implemented.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'shared_plan_cache_enabled',
+  boot_val => 'false',
+},
+
 { name => 'shared_plan_cache_max_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Maximum number of plans in the shared plan cache.',
   long_desc => 'Set to 0 to disable the shared plan cache entirely.',

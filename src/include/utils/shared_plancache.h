@@ -63,6 +63,9 @@ typedef struct SharedPlanEntry
 	dsa_pointer serialized_plan;
 	Size		serialized_plan_len;
 
+	/* Cost for custom-vs-generic decision (added by Patch 0007) */
+	double		generic_cost;
+
 	/* Validity and lifecycle */
 	pg_atomic_uint32 refcount;
 	pg_atomic_uint32 is_valid;		/* 0 = invalid, 1 = valid */
@@ -115,6 +118,7 @@ typedef struct SharedPlanCacheControl
 extern PGDLLIMPORT int shared_plan_cache_max_entries;
 extern PGDLLIMPORT int shared_plan_cache_max_memory;
 extern PGDLLIMPORT int shared_plan_cache_max_entry_size;
+extern PGDLLIMPORT bool shared_plan_cache_enabled;
 
 /* Shmem callbacks (registered via subsystemlist.h) */
 extern const ShmemCallbacks SharedPlanCacheShmemCallbacks;
@@ -210,6 +214,41 @@ extern SharedPlanStoreStatus SharedPlanCacheStore(CachedPlanSource *plansource,
 												   bool is_generic_plan,
 												   SharedPlanKey *out_key,
 												   SharedPlanRejectReason *reject_reason);
+
+/* ---- L2 Lookup (Patch 0007) ---- */
+
+typedef enum SharedPlanLookupStatus
+{
+	SHARED_PLAN_LOOKUP_NONE = 0,
+	SHARED_PLAN_LOOKUP_HIT,
+	SHARED_PLAN_LOOKUP_MISS,
+	SHARED_PLAN_LOOKUP_DISABLED,
+	SHARED_PLAN_LOOKUP_NOT_SHAREABLE,
+	SHARED_PLAN_LOOKUP_DESER_ERROR,
+	SHARED_PLAN_LOOKUP_INVALID,
+	SHARED_PLAN_LOOKUP_ERROR,
+} SharedPlanLookupStatus;
+
+extern bool ComputeSharedPlanKeyForLookup(CachedPlanSource *plansource,
+										   SharedPlanKey *key,
+										   SharedPlanRejectReason *reject_reason);
+
+extern SharedPlanLookupStatus SharedPlanCacheLookup(CachedPlanSource *plansource,
+													 MemoryContext target_mcxt,
+													 List **out_stmt_list,
+													 double *out_generic_cost);
+
+/*
+ * Backend-local test instrumentation for L2 counters and status.
+ * Not production stats APIs - these expose per-backend state for
+ * regression testing only.  Counters reset to zero on backend start.
+ */
+extern uint64 SharedPlanCacheL2HitCount(void);
+extern uint64 SharedPlanCacheL2MissCount(void);
+extern uint64 SharedPlanCacheL2StoreCount(void);
+extern uint64 SharedPlanCacheL2ErrorCount(void);
+extern void SharedPlanCacheL2CountError(void);
+extern const char *SharedPlanCacheLastL2StatusName(void);
 
 /*
  * Test-module-only accessors; not part of production shared plan cache API.

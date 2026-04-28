@@ -28,6 +28,7 @@
 #include "nodes/primnodes.h"
 #include "nodes/queryjumble.h"
 #include "nodes/readfuncs.h"
+#include "optimizer/planner.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -40,6 +41,7 @@
 int			shared_plan_cache_max_entries = 1000;
 int			shared_plan_cache_max_memory = 32768;	/* KB */
 int			shared_plan_cache_max_entry_size = 256;	/* KB */
+bool		shared_plan_cache_enabled = false;
 
 /* Shared control struct pointer (set by shmem framework) */
 static SharedPlanCacheControl *shared_plan_ctl = NULL;
@@ -52,6 +54,13 @@ static bool attach_warning_given = false;
 static dsa_area *shared_plan_dsa = NULL;
 static dshash_table *shared_plan_hash = NULL;
 static dshash_table *shared_plan_dep_hash = NULL;
+
+/* Backend-local test counters (Patch 0007) */
+static uint64 l2_hit_count = 0;
+static uint64 l2_miss_count = 0;
+static uint64 l2_store_count = 0;
+static uint64 l2_error_count = 0;
+static SharedPlanLookupStatus last_l2_status = SHARED_PLAN_LOOKUP_NONE;
 
 /*
  * dshash parameters (tranche_id set at runtime).
@@ -568,6 +577,41 @@ SharedPlanDeserializeFromDSA(dsa_area *area,
 /* ---- Key Computation + Store (Patch 0006) ---- */
 
 /*
+ * shared_plan_compute_generic_cost - compute generic_cost for a stmt_list.
+ *
+ * Mechanically matches cached_plan_cost(plan, false) from plancache.c:
+ * sums planTree->total_cost across non-utility PlannedStmts.
+ *
+ * Zero is valid: a utility-only stmt_list has zero execution cost.
+ * Returns -1 on invalid input: NaN, negative aggregate, or a non-utility
+ * PlannedStmt with NULL planTree (which would indicate corruption).
+ */
+static double
+shared_plan_compute_generic_cost(List *stmt_list)
+{
+	double		result = 0;
+	ListCell   *lc;
+
+	foreach(lc, stmt_list)
+	{
+		PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
+
+		if (pstmt->commandType == CMD_UTILITY)
+			continue;
+
+		if (pstmt->planTree == NULL)
+			return -1;
+
+		result += pstmt->planTree->total_cost;
+	}
+
+	if (isnan(result) || result < 0)
+		return -1;
+
+	return result;
+}
+
+/*
  * Test-module-only accessors; not part of production shared plan cache API.
  * These expose internal state for the test_shared_plan_cache_store module.
  */
@@ -849,6 +893,7 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 	char	   *local_buf = NULL;
 	Size		local_len = 0;
 	dsa_pointer dp = InvalidDsaPointer;
+	double		generic_cost;
 	uint32		cur;
 	bool		found;
 
@@ -876,7 +921,12 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 	if (out_key)
 		memcpy(out_key, &key, sizeof(SharedPlanKey));
 
-	/* Step 3: Duplicate pre-check (shared lock, no reservation) */
+	/* Step 3: Compute generic_cost before any shared resource commit */
+	generic_cost = shared_plan_compute_generic_cost(plan->stmt_list);
+	if (generic_cost < 0)
+		return SHARED_PLAN_STORE_NOT_SHAREABLE;
+
+	/* Step 4: Duplicate pre-check (shared lock, no reservation) */
 	existing = dshash_find(shared_plan_hash, &key, false);
 	if (existing != NULL)
 	{
@@ -884,12 +934,12 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 		return SHARED_PLAN_STORE_DUPLICATE;
 	}
 
-	/* Step 4: Racy FULL pre-check */
+	/* Step 5: Racy FULL pre-check */
 	if (pg_atomic_read_u32(&shared_plan_ctl->current_entries) >=
 		(uint32) shared_plan_ctl->max_entries)
 		return SHARED_PLAN_STORE_FULL;
 
-	/* Step 5: Serialize to local buffer */
+	/* Step 6: Serialize to local buffer */
 	ser_status = SharedPlanSerializeStmtList(plan->stmt_list,
 											 mul_size((Size) shared_plan_ctl->max_entry_size_kb, 1024),
 											 &local_buf, &local_len);
@@ -907,7 +957,7 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 			return SHARED_PLAN_STORE_OOM;	/* unreachable, keeps compiler quiet */
 	}
 
-	/* Step 6: Allocate DSA payload and copy (no dshash lock held) */
+	/* Step 7: Allocate DSA payload and copy (no dshash lock held) */
 	dp = dsa_allocate_extended(shared_plan_dsa, local_len, DSA_ALLOC_NO_OOM);
 	if (!DsaPointerIsValid(dp))
 	{
@@ -917,7 +967,7 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 	memcpy(dsa_get_address(shared_plan_dsa, dp), local_buf, local_len);
 	pfree(local_buf);
 
-	/* Step 7: Reserve entry slot (atomic CAS loop) */
+	/* Step 8: Reserve entry slot (atomic CAS loop) */
 	for (;;)
 	{
 		cur = pg_atomic_read_u32(&shared_plan_ctl->current_entries);
@@ -931,7 +981,7 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 			break;
 	}
 
-	/* Step 8: Insert into dshash (acquires exclusive partition lock) */
+	/* Step 9: Insert into dshash (acquires exclusive partition lock) */
 	entry = dshash_find_or_insert_extended(shared_plan_hash, &key, &found,
 										   DSHASH_INSERT_NO_OOM);
 	if (entry == NULL)
@@ -949,12 +999,13 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 		return SHARED_PLAN_STORE_DUPLICATE;
 	}
 
-	/* Step 9: Initialize entry and commit (partition lock held) */
+	/* Step 10: Initialize entry and commit (partition lock held) */
 	pg_atomic_init_u32(&entry->refcount, 0);
 	pg_atomic_init_u32(&entry->is_valid, 0);
 	entry->generation = pg_atomic_read_u64(&shared_plan_ctl->generation);
 	entry->serialized_plan = dp;
 	entry->serialized_plan_len = local_len;
+	entry->generic_cost = generic_cost;
 	entry->relation_oids = InvalidDsaPointer;
 	entry->num_relation_oids = 0;
 	entry->inval_items = InvalidDsaPointer;
@@ -963,5 +1014,242 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 	pg_atomic_write_u32(&entry->is_valid, 1);
 	dshash_release_lock(shared_plan_hash, entry);
 
+	if (shared_plan_cache_enabled)
+		l2_store_count++;
+
 	return SHARED_PLAN_STORE_OK;
+}
+
+/* ---- L2 Lookup (Patch 0007) ---- */
+
+/*
+ * ComputeSharedPlanKeyForLookup - compute SharedPlanKey from plansource only.
+ *
+ * This is a lookup-specific variant of ComputeSharedPlanKey() that does not
+ * require a CachedPlan.  It performs plansource-level prechecks only and
+ * computes the same 10 key dimensions.
+ *
+ * Returns true if a valid key was computed, false if plansource-level
+ * prechecks failed.  May raise ERROR from nodeToString/hash paths.
+ */
+bool
+ComputeSharedPlanKeyForLookup(CachedPlanSource *plansource,
+							   SharedPlanKey *key,
+							   SharedPlanRejectReason *reject_reason)
+{
+	Assert(plansource != NULL);
+	Assert(key != NULL);
+	Assert(reject_reason != NULL);
+
+	memset(key, 0, sizeof(SharedPlanKey));
+	*reject_reason = SHARED_PLAN_REJECT_NONE;
+
+	/* Plansource-level prechecks (no CachedPlan required) */
+	if (!plansource->is_complete)
+	{
+		*reject_reason = SHARED_PLAN_REJECT_INCOMPLETE;
+		return false;
+	}
+
+	if (plansource->is_oneshot)
+	{
+		*reject_reason = SHARED_PLAN_REJECT_ONESHOT;
+		return false;
+	}
+
+	if (plansource->postRewrite != NULL)
+	{
+		*reject_reason = SHARED_PLAN_REJECT_POST_REWRITE_HOOK;
+		return false;
+	}
+
+	if (HasUnsafePlannerHooks())
+	{
+		*reject_reason = SHARED_PLAN_REJECT_PLANNER_HOOK;
+		return false;
+	}
+
+	if (plansource->dependsOnRLS)
+	{
+		*reject_reason = SHARED_PLAN_REJECT_DEPENDS_ON_RLS;
+		return false;
+	}
+
+	if (plansource->query_list == NIL)
+	{
+		*reject_reason = SHARED_PLAN_REJECT_INCOMPLETE;
+		return false;
+	}
+
+	/* Compute key dimensions (same as ComputeSharedPlanKey) */
+	Assert(plansource->query_list != NIL);
+	Assert(IsA(linitial(plansource->query_list), Query));
+
+	key->queryid = ((Query *) linitial(plansource->query_list))->queryId;
+	key->dbid = MyDatabaseId;
+	key->roleid = GetUserId();
+	key->num_params = plansource->num_params;
+	key->cursor_options = plansource->cursor_options;
+
+	key->param_signature_hash = compute_param_signature_hash(plansource);
+	key->query_tree_hash = compute_query_tree_hash(plansource->query_list);
+	key->search_path_hash = GetSearchPathHash();
+	key->planner_gucs_hash = GetPlannerGucHash();
+	key->collation_hash = compute_collation_hash(plansource->query_list);
+
+	return true;
+}
+
+/*
+ * SharedPlanCacheLookup - low-level L2 lookup.
+ *
+ * Looks up a shared plan entry by key computed from plansource.
+ * On HIT, deserializes the entry into target_mcxt and returns the
+ * stmt_list and generic_cost.
+ *
+ * Does not increment refcount.  Does not mutate shared entries.
+ * DSA pointer remains valid after lock release (no-free guarantee).
+ */
+SharedPlanLookupStatus
+SharedPlanCacheLookup(CachedPlanSource *plansource,
+					   MemoryContext target_mcxt,
+					   List **out_stmt_list,
+					   double *out_generic_cost)
+{
+	SharedPlanKey key;
+	SharedPlanRejectReason reject;
+	SharedPlanEntry *entry;
+	dsa_pointer ser_plan;
+	Size		ser_len;
+	double		cost;
+	SharedPlanSerializeStatus deser_status;
+
+	Assert(out_stmt_list != NULL);
+	Assert(out_generic_cost != NULL);
+
+	*out_stmt_list = NIL;
+	*out_generic_cost = -1;
+
+	if (!SharedPlanCacheIsActive() ||
+		shared_plan_hash == NULL ||
+		shared_plan_dsa == NULL)
+	{
+		last_l2_status = SHARED_PLAN_LOOKUP_DISABLED;
+		return SHARED_PLAN_LOOKUP_DISABLED;
+	}
+
+	if (!ComputeSharedPlanKeyForLookup(plansource, &key, &reject))
+	{
+		last_l2_status = SHARED_PLAN_LOOKUP_NOT_SHAREABLE;
+		l2_miss_count++;
+		return SHARED_PLAN_LOOKUP_NOT_SHAREABLE;
+	}
+
+	/* Find entry under shared lock */
+	entry = dshash_find(shared_plan_hash, &key, false);
+	if (entry == NULL)
+	{
+		last_l2_status = SHARED_PLAN_LOOKUP_MISS;
+		l2_miss_count++;
+		return SHARED_PLAN_LOOKUP_MISS;
+	}
+
+	/* Check validity */
+	if (pg_atomic_read_u32(&entry->is_valid) == 0)
+	{
+		dshash_release_lock(shared_plan_hash, entry);
+		last_l2_status = SHARED_PLAN_LOOKUP_INVALID;
+		l2_miss_count++;
+		return SHARED_PLAN_LOOKUP_INVALID;
+	}
+
+	/* Copy fields while holding lock */
+	ser_plan = entry->serialized_plan;
+	ser_len = entry->serialized_plan_len;
+	cost = entry->generic_cost;
+
+	dshash_release_lock(shared_plan_hash, entry);
+
+	/* Validate generic_cost */
+	if (isnan(cost) || cost < 0)
+	{
+		last_l2_status = SHARED_PLAN_LOOKUP_MISS;
+		l2_miss_count++;
+		return SHARED_PLAN_LOOKUP_MISS;
+	}
+
+	/* Deserialize outside lock */
+	deser_status = SharedPlanDeserializeFromDSA(shared_plan_dsa,
+												ser_plan, ser_len,
+												target_mcxt,
+												out_stmt_list);
+	if (deser_status != SHARED_PLAN_SERIALIZE_OK)
+	{
+		last_l2_status = SHARED_PLAN_LOOKUP_DESER_ERROR;
+		l2_error_count++;
+		return SHARED_PLAN_LOOKUP_DESER_ERROR;
+	}
+
+	*out_generic_cost = cost;
+	last_l2_status = SHARED_PLAN_LOOKUP_HIT;
+	l2_hit_count++;
+	return SHARED_PLAN_LOOKUP_HIT;
+}
+
+/* Test-only counter accessors */
+
+uint64
+SharedPlanCacheL2HitCount(void)
+{
+	return l2_hit_count;
+}
+
+uint64
+SharedPlanCacheL2MissCount(void)
+{
+	return l2_miss_count;
+}
+
+uint64
+SharedPlanCacheL2StoreCount(void)
+{
+	return l2_store_count;
+}
+
+uint64
+SharedPlanCacheL2ErrorCount(void)
+{
+	return l2_error_count;
+}
+
+void
+SharedPlanCacheL2CountError(void)
+{
+	l2_error_count++;
+	last_l2_status = SHARED_PLAN_LOOKUP_ERROR;
+}
+
+const char *
+SharedPlanCacheLastL2StatusName(void)
+{
+	switch (last_l2_status)
+	{
+		case SHARED_PLAN_LOOKUP_NONE:
+			return "NONE";
+		case SHARED_PLAN_LOOKUP_HIT:
+			return "HIT";
+		case SHARED_PLAN_LOOKUP_MISS:
+			return "MISS";
+		case SHARED_PLAN_LOOKUP_DISABLED:
+			return "DISABLED";
+		case SHARED_PLAN_LOOKUP_NOT_SHAREABLE:
+			return "NOT_SHAREABLE";
+		case SHARED_PLAN_LOOKUP_DESER_ERROR:
+			return "DESER_ERROR";
+		case SHARED_PLAN_LOOKUP_INVALID:
+			return "INVALID";
+		case SHARED_PLAN_LOOKUP_ERROR:
+			return "ERROR";
+	}
+	return "UNKNOWN";
 }

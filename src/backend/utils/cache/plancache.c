@@ -76,6 +76,7 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/shared_plancache.h"
 
 
 /*
@@ -107,6 +108,21 @@ static void AcquireExecutorLocks(List *stmt_list, bool acquire);
 static void AcquirePlannerLocks(List *stmt_list, bool acquire);
 static void ScanQueryForLocks(Query *parsetree, bool acquire);
 static bool ScanQueryWalker(Node *node, bool *acquire);
+
+/*
+ * SharedPlanCacheTryLookup result struct, used only within GetCachedPlan().
+ */
+typedef struct SharedPlanCacheTryLookupResult
+{
+	CachedPlan *plan;
+	double		generic_cost;
+} SharedPlanCacheTryLookupResult;
+
+static CachedPlan *ReconstructCachedPlanFromShared(List *stmt_list,
+												   CachedPlanSource *plansource,
+												   MemoryContext plan_context);
+static SharedPlanCacheTryLookupResult SharedPlanCacheTryLookup(CachedPlanSource *plansource);
+static void SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid,
@@ -1328,46 +1344,72 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		}
 		else
 		{
-			/* Build a new generic plan */
-			plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv);
-			/* Just make real sure plansource->gplan is clear */
-			ReleaseGenericPlan(plansource);
-			/* Link the new generic plan into the plansource */
-			plansource->gplan = plan;
-			plan->refcount++;
-			/* Immediately reparent into appropriate context */
-			if (plansource->is_saved)
-			{
-				/* saved plans all live under CacheMemoryContext */
-				MemoryContextSetParent(plan->context, CacheMemoryContext);
-				plan->is_saved = true;
-			}
-			else
-			{
-				/* otherwise, it should be a sibling of the plansource */
-				MemoryContextSetParent(plan->context,
-									   MemoryContextGetParent(plansource->context));
-			}
-			/* Update generic_cost whenever we make a new generic plan */
-			plansource->generic_cost = cached_plan_cost(plan, false);
-
 			/*
-			 * If, based on the now-known value of generic_cost, we'd not have
-			 * chosen to use a generic plan, then forget it and make a custom
-			 * plan.  This is a bit of a wart but is necessary to avoid a
-			 * glitch in behavior when the custom plans are consistently big
-			 * winners; at some point we'll experiment with a generic plan and
-			 * find it's a loser, but we don't want to actually execute that
-			 * plan.
+			 * No valid L1 generic plan.  Try L2 shared cache first, then
+			 * fall back to local BuildCachedPlan if L2 misses or errors.
 			 */
-			customplan = choose_custom_plan(plansource, boundParams);
+			CachedPlan *l2_plan = NULL;
 
-			/*
-			 * If we choose to plan again, we need to re-copy the query_list,
-			 * since the planner probably scribbled on it.  We can force
-			 * BuildCachedPlan to do that by passing NIL.
-			 */
-			qlist = NIL;
+			if (shared_plan_cache_enabled && SharedPlanCacheIsActive())
+			{
+				SharedPlanCacheTryLookupResult l2_result;
+
+				l2_result = SharedPlanCacheTryLookup(plansource);
+				l2_plan = l2_result.plan;
+
+				if (l2_plan != NULL)
+				{
+					/* L2 hit: install as local generic plan */
+					ReleaseGenericPlan(plansource);
+					plansource->gplan = l2_plan;
+					l2_plan->refcount++;
+
+					if (plansource->is_saved)
+					{
+						MemoryContextSetParent(l2_plan->context,
+											   CacheMemoryContext);
+						l2_plan->is_saved = true;
+					}
+					else
+					{
+						MemoryContextSetParent(l2_plan->context,
+											   MemoryContextGetParent(plansource->context));
+					}
+
+					plansource->generic_cost = l2_result.generic_cost;
+					customplan = choose_custom_plan(plansource, boundParams);
+					qlist = NIL;
+					plan = l2_plan;
+				}
+			}
+
+			if (l2_plan == NULL)
+			{
+				/* L2 miss or disabled: build locally */
+				plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv);
+				ReleaseGenericPlan(plansource);
+				plansource->gplan = plan;
+				plan->refcount++;
+
+				if (plansource->is_saved)
+				{
+					MemoryContextSetParent(plan->context, CacheMemoryContext);
+					plan->is_saved = true;
+				}
+				else
+				{
+					MemoryContextSetParent(plan->context,
+										   MemoryContextGetParent(plansource->context));
+				}
+
+				plansource->generic_cost = cached_plan_cost(plan, false);
+				customplan = choose_custom_plan(plansource, boundParams);
+				qlist = NIL;
+
+				/* Store in L2 only if we kept the generic plan */
+				if (!customplan)
+					SharedPlanCacheTryStore(plansource, plan);
+			}
 		}
 	}
 
@@ -2658,4 +2700,132 @@ PlanIsShareable(CachedPlanSource *plansource,
 
 	*reason = SHARED_PLAN_REJECT_NONE;
 	return true;
+}
+
+/* ---- Shared Plan Cache L2 integration helpers (Patch 0007) ---- */
+
+/*
+ * ReconstructCachedPlanFromShared - build a CachedPlan from deserialized stmt_list.
+ *
+ * The stmt_list must already be allocated in plan_context.
+ * Fields are set to safe defaults matching BuildCachedPlan() output for
+ * shareable generic plans.
+ */
+static CachedPlan *
+ReconstructCachedPlanFromShared(List *stmt_list,
+								CachedPlanSource *plansource,
+								MemoryContext plan_context)
+{
+	CachedPlan *plan;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(plan_context);
+
+	plan = (CachedPlan *) palloc0(sizeof(CachedPlan));
+	plan->magic = CACHEDPLAN_MAGIC;
+	plan->stmt_list = stmt_list;
+	plan->is_oneshot = false;
+	plan->is_saved = false;
+	plan->is_valid = true;
+	plan->planRoleId = GetUserId();
+	plan->dependsOnRole = false;
+	plan->saved_xmin = InvalidTransactionId;
+	plan->generation = ++(plansource->generation);
+	plan->refcount = 0;
+	plan->context = plan_context;
+
+	MemoryContextSwitchTo(oldcxt);
+	return plan;
+}
+
+/*
+ * SharedPlanCacheTryLookup - wrapper for L2 lookup in GetCachedPlan().
+ *
+ * Returns a CachedPlan and generic_cost on HIT, or {NULL, -1} on
+ * miss/error.  Never lets L2 errors propagate to the user.
+ */
+static SharedPlanCacheTryLookupResult
+SharedPlanCacheTryLookup(CachedPlanSource *plansource)
+{
+	SharedPlanCacheTryLookupResult result = {NULL, -1};
+	MemoryContext oldcontext = CurrentMemoryContext;
+	MemoryContext l2_mcxt = NULL;
+
+	PG_TRY();
+	{
+		List	   *l2_stmts = NIL;
+		double		l2_cost = -1;
+		SharedPlanLookupStatus status;
+
+		l2_mcxt = AllocSetContextCreate(CurrentMemoryContext,
+										"CachedPlan",
+										ALLOCSET_START_SMALL_SIZES);
+		MemoryContextCopyAndSetIdentifier(l2_mcxt,
+										   plansource->query_string);
+
+		status = SharedPlanCacheLookup(plansource,
+									   l2_mcxt, &l2_stmts, &l2_cost);
+		if (status == SHARED_PLAN_LOOKUP_HIT)
+		{
+			result.plan = ReconstructCachedPlanFromShared(l2_stmts,
+														  plansource,
+														  l2_mcxt);
+			result.generic_cost = l2_cost;
+		}
+		else
+		{
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextDelete(l2_mcxt);
+			l2_mcxt = NULL;
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcontext);
+		if (l2_mcxt)
+			MemoryContextDelete(l2_mcxt);
+		FlushErrorState();
+
+		/* Track the wrapper-caught ERROR for test instrumentation */
+		SharedPlanCacheL2CountError();
+
+		result.plan = NULL;
+		result.generic_cost = -1;
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+/*
+ * SharedPlanCacheTryStore - fire-and-forget store into L2.
+ *
+ * Wraps SharedPlanCacheStore() in PG_TRY/PG_CATCH so that store failures
+ * never affect the caller.  The local plan is already valid regardless.
+ */
+static void
+SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan)
+{
+	MemoryContext oldcontext;
+
+	if (!shared_plan_cache_enabled)
+		return;
+	if (!SharedPlanCacheIsActive())
+		return;
+
+	oldcontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		SharedPlanKey key;
+		SharedPlanRejectReason reject;
+
+		SharedPlanCacheStore(plansource, plan, true, &key, &reject);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcontext);
+		FlushErrorState();
+	}
+	PG_END_TRY();
 }

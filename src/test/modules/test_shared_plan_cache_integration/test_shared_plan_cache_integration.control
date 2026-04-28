@@ -1,0 +1,4 @@
+comment = 'Test code for shared plan cache L2 integration'
+default_version = '1.0'
+module_pathname = '$libdir/test_shared_plan_cache_integration'
+relocatable = true
