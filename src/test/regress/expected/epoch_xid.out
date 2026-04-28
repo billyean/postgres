@@ -3265,3 +3265,81 @@ SELECT epoch_xid_stage1_force_disable(false);
 (1 row)
 
 DROP TABLE
+-- ======================================================
+-- Patch 30: Reused-LP fresh-insert epoch-slot authoritativeness
+-- ======================================================
+--
+-- One test proving the AR rule: when a fresh insert occupies a reused
+-- line pointer, the epoch slot is fully reset and rewritten so that
+-- only the new tuple's epoch metadata is authoritative.
+--
+-- Uses epoch_xid_inspect() (existing, LP_NORMAL-gated) to observe
+-- slot state before and after the reuse-on-insert transition.
+CREATE TABLE
+-- Keeper row at offset 1 prevents VACUUM from truncating the page.
+INSERT 0 1
+-- Tuple A at offset 2: materializes the epoch fork.
+INSERT 0 1
+-- After insert: slot 2 has XMIN_SET only (flags = 1), xmax_epoch = 0.
+SELECT offnum, xmin_epoch, xmax_epoch, epoch_flags
+FROM epoch_xid_inspect('epoch_p30'::regclass, 0) WHERE offnum = 2;
+ offnum | xmin_epoch | xmax_epoch | epoch_flags
+--------+------------+------------+-------------
+      2 |          0 |          0 |           1
+(1 row)
+
+-- Delete tuple A: EpochSlotSetXmax adds xmax on slot 2.
+DELETE 1
+-- After delete: slot 2 has XMIN_SET | XMAX_SET (flags = 3).
+-- This is the prior-occupant state that must NOT survive reuse.
+SELECT offnum, xmax_epoch, epoch_flags
+FROM epoch_xid_inspect('epoch_p30'::regclass, 0) WHERE offnum = 2;
+ offnum | xmax_epoch | epoch_flags
+--------+------------+-------------
+      2 |          0 |           3
+(1 row)
+
+-- VACUUM frees offset 2 (test setup, not the Patch 30 contract).
+VACUUM
+-- Fresh insert reuses offset 2: THIS IS THE PATCH 30 TRANSITION.
+-- EpochSlotInitForInsert (AR-at) fully overwrites the slot.
+INSERT 0 1
+-- AR-post: slot 2 is authoritative for the new tuple only.
+-- epoch_flags must be exactly 1 (XMIN_SET), not 3.
+-- xmax_epoch must be 0.  No prior-occupant field survived.
+SELECT offnum, xmin_epoch, xmax_epoch, epoch_flags,
+       CASE WHEN epoch_flags = 1 AND xmax_epoch = 0
+            THEN 'AR-post: authoritative for new tuple only'
+            ELSE 'BUG: prior-occupant residue survived reuse'
+       END AS ar_verdict
+FROM epoch_xid_inspect('epoch_p30'::regclass, 0) WHERE offnum = 2;
+ offnum | xmin_epoch | xmax_epoch | epoch_flags |                ar_verdict
+--------+------------+------------+-------------+-------------------------------------------
+      2 |          0 |          0 |           1 | AR-post: authoritative for new tuple only
+(1 row)
+
+-- Explicit boolean assertions.
+SELECT xmax_epoch = 0 AS xmax_cleared,
+       epoch_flags = 1 AS flags_xmin_only
+FROM epoch_xid_inspect('epoch_p30'::regclass, 0) WHERE offnum = 2;
+ xmax_cleared | flags_xmin_only
+--------------+-----------------
+ t            | t
+(1 row)
+
+-- Visibility: new tuple at reused offset is visible through epoch MVCC path.
+BEGIN
+SELECT * FROM epoch_p30 WHERE ctid = '(0,2)';
+ id
+----
+  2
+(1 row)
+
+SELECT epoch_xid_mvcc_last_path();
+ epoch_xid_mvcc_last_path
+--------------------------
+ materialized
+(1 row)
+
+COMMIT
+DROP TABLE

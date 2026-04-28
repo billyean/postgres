@@ -773,6 +773,12 @@ EpochGetSlot(Page epochPage, OffsetNumber offnum)
  * (LP_UNUSED -> LP_NORMAL) may contain stale xmax_epoch and
  * EPOCH_FLAG_XMAX_SET from a prior occupant.  Those must be cleared.
  *
+ * Patch 30 (AR-at): this function implements the authoritativeness
+ * transfer for fresh insert on a reused line pointer.  The complete
+ * overwrite ensures that after this call the slot is authoritative
+ * exclusively for the new tuple (AR-post), regardless of whatever
+ * residual state the prior occupant left behind (AR-pre).
+ *
  * Caller must hold exclusive lock on the epoch buffer.
  */
 void

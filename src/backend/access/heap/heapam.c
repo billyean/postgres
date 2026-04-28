@@ -2159,8 +2159,10 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 	/*
 	 * XID64 EPOCH FORK: Initialize the epoch slot for this tuple.
-	 * Uses whole-entry write to prevent stale state from a prior
-	 * occupant of this OffsetNumber (LP reuse after prune/vacuum).
+	 * Implements AR-at (Patch 30): whole-entry write resets the slot so
+	 * that only the new tuple's epoch metadata is authoritative.  Any
+	 * residual state from a prior occupant (LP reuse after prune/vacuum)
+	 * is fully overwritten.
 	 * Once the relation is in materialized epoch mode, every insert
 	 * must maintain epoch state; silent fallback is not allowed.
 	 */

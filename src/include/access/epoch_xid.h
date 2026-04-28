@@ -138,6 +138,53 @@ StaticAssertDecl(MaxEpochSlotsPerPage >= MaxHeapTuplesPerPage,
  */
 extern bool EpochRelationIsMaterialized(Relation rel);
 
+/* ---------- Reused-LP Fresh-Insert Authoritativeness (Patch 30) ---------- */
+
+/*
+ * Epoch-slot authoritativeness contract for fresh insert on a reused
+ * line pointer.
+ *
+ * When a heap line pointer has been freed by maintenance (VACUUM, pruning)
+ * and is subsequently reused by a fresh insert, the epoch slot at that
+ * offset transitions through three authoritativeness states:
+ *
+ * AR-pre  (before reuse):
+ *   The LP is not LP_NORMAL (it is LP_DEAD, LP_UNUSED, or LP_REDIRECT).
+ *   The epoch slot physically contains residual metadata from a prior
+ *   occupant.  This data is NON-AUTHORITATIVE: no consumer, visibility
+ *   function, or debug function may interpret it as describing any
+ *   current tuple.  Safety depends on SP-1 below.
+ *
+ * AR-at   (at reuse insertion):
+ *   EpochSlotInitForInsert() performs a complete, unconditional overwrite
+ *   of all four slot fields (xmin_epoch, xmax_epoch, epoch_flags, padding).
+ *   All fields are assigned, not merged.  No prior-occupant field survives.
+ *   The WAL record carries is_whole_entry_reset = true so that crash
+ *   recovery produces the same complete overwrite.  The overwrite must
+ *   complete before the tuple becomes visible to any snapshot.
+ *
+ * AR-post (after reuse insertion):
+ *   The slot contains exactly: xmin_epoch from the inserting transaction's
+ *   FullTransactionId, xmax_epoch = 0, epoch_flags = EPOCH_FLAG_XMIN_SET
+ *   only, padding = 0.  This state is authoritative for the new tuple and
+ *   only the new tuple.  It is indistinguishable from a slot that was
+ *   never previously occupied.
+ *
+ * Supporting precondition:
+ *
+ * SP-1 (LP_NORMAL gating):
+ *   Epoch-slot data at offset N is interpreted if and only if the heap
+ *   line pointer at offset N is LP_NORMAL.  All four real consumers
+ *   (heap_fetch, heap_hot_search_buffer, heapam_tuple_satisfies_snapshot,
+ *   heap_get_latest_tid) enforce this.  SP-1 is what makes residual data
+ *   in AR-pre state harmless — it is never read.
+ *
+ * Scope: this contract covers the fresh-insert-on-reused-LP boundary
+ * only.  It does NOT define epoch-slot behavior during the maintenance
+ * transitions that free the LP (prune-side LP_NORMAL -> LP_DEAD, or
+ * VACUUM-side LP_DEAD -> LP_UNUSED).  Those are explicitly deferred.
+ */
+
 /* ---------- Public API ---------- */
 
 /* Fork and page management */
@@ -186,6 +233,11 @@ extern EpochSlotData *EpochGetSlot(Page epochPage, OffsetNumber offnum);
  * padding.  This is the ONLY correct way to initialize a slot on
  * insert, because the slot may have been previously occupied by a
  * different tuple whose stale xmax_epoch/flags must not survive.
+ *
+ * This function implements AR-at of the Patch 30 reused-LP fresh-insert
+ * authoritativeness contract: a complete, unconditional overwrite that
+ * transfers slot authoritativeness from residual (prior occupant) to
+ * authoritative (new tuple).  See the contract block above.
  *
  * Caller must hold exclusive lock on the epoch buffer.
  */
