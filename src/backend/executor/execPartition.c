@@ -553,6 +553,78 @@ IsIndexCompatibleAsArbiter(Relation arbiterIndexRelation,
 }
 
 /*
+ * ExecInitPartitionWithCheckOptions
+ *		Map root-table WITH CHECK OPTION expressions to a leaf partition's
+ *		tuple descriptor and compile them into ExprStates.
+ *
+ * This is used by both INSERT (via ExecInitPartitionInfo) and COPY FROM
+ * to initialize per-leaf WCO state.  The caller must have already switched
+ * to a suitably long-lived MemoryContext before calling.
+ *
+ * rootResultRelInfo: the root table's ResultRelInfo (provides root
+ *		relation descriptor for attribute mapping)
+ * rootWCOList: the root table's WITH CHECK OPTION list to map
+ * rootVarno: the root table's RTE index (Var.varno to remap)
+ * leafPartRel: the leaf partition's Relation (open)
+ * ps: PlanState for ExecInitQual context
+ * qualShape: declares whether wco->qual is an implicit-AND List or
+ *		a single Expr node
+ */
+void
+ExecInitPartitionWithCheckOptions(ResultRelInfo *leafResultRelInfo,
+								  ResultRelInfo *rootResultRelInfo,
+								  List *rootWCOList,
+								  int rootVarno,
+								  Relation leafPartRel,
+								  PlanState *ps,
+								  PartitionWCOQualShape qualShape)
+{
+	List	   *mappedWCOList;
+	List	   *wcoExprs = NIL;
+	ListCell   *lc;
+	AttrMap    *attmap;
+	bool		found_whole_row;
+	Relation	rootRel = rootResultRelInfo->ri_RelationDesc;
+
+	attmap = build_attrmap_by_name(RelationGetDescr(leafPartRel),
+								   RelationGetDescr(rootRel),
+								   false);
+
+	mappedWCOList = (List *)
+		map_variable_attnos((Node *) rootWCOList,
+							rootVarno, 0,
+							attmap,
+							RelationGetForm(leafPartRel)->reltype,
+							&found_whole_row);
+	/* We ignore found_whole_row, matching ExecInitPartitionInfo() behavior. */
+
+	foreach(lc, mappedWCOList)
+	{
+		WithCheckOption *wco = lfirst_node(WithCheckOption, lc);
+		ExprState  *wcoExpr;
+
+		if (qualShape == PARTITION_WCO_QUAL_LIST)
+		{
+			Assert(IsA(wco->qual, List));
+			wcoExpr = ExecInitQual(castNode(List, wco->qual), ps);
+		}
+		else
+		{
+			Assert(!IsA(wco->qual, List));
+			wcoExpr = ExecInitQual(list_make1(wco->qual), ps);
+		}
+
+		wcoExprs = lappend(wcoExprs, wcoExpr);
+	}
+
+	leafResultRelInfo->ri_WithCheckOptions = mappedWCOList;
+	leafResultRelInfo->ri_WithCheckOptionExprs = wcoExprs;
+
+	Assert(list_length(leafResultRelInfo->ri_WithCheckOptions) ==
+		   list_length(leafResultRelInfo->ri_WithCheckOptionExprs));
+}
+
+/*
  * ExecInitPartitionInfo
  *		Lock the partition and initialize ResultRelInfo.  Also setup other
  *		information for the partition and store it in the next empty slot in
@@ -617,10 +689,6 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 */
 	if (node && node->withCheckOptionLists != NIL)
 	{
-		List	   *wcoList;
-		List	   *wcoExprs = NIL;
-		ListCell   *ll;
-
 		/*
 		 * In the case of INSERT on a partitioned table, there is only one
 		 * plan.  Likewise, there is only one WCO list, not one per partition.
@@ -636,43 +704,13 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				list_length(node->withCheckOptionLists) ==
 				list_length(node->resultRelations)));
 
-		/*
-		 * Use the WCO list of the first plan as a reference to calculate
-		 * attno's for the WCO list of this partition.  In the INSERT case,
-		 * that refers to the root partitioned table, whereas in the UPDATE
-		 * tuple routing case, that refers to the first partition in the
-		 * mtstate->resultRelInfo array.  In any case, both that relation and
-		 * this partition should have the same columns, so we should be able
-		 * to map attributes successfully.
-		 */
-		wcoList = linitial(node->withCheckOptionLists);
-
-		/*
-		 * Convert Vars in it to contain this partition's attribute numbers.
-		 */
-		part_attmap =
-			build_attrmap_by_name(RelationGetDescr(partrel),
-								  RelationGetDescr(firstResultRel),
-								  false);
-		wcoList = (List *)
-			map_variable_attnos((Node *) wcoList,
-								firstVarno, 0,
-								part_attmap,
-								RelationGetForm(partrel)->reltype,
-								&found_whole_row);
-		/* We ignore the value of found_whole_row. */
-
-		foreach(ll, wcoList)
-		{
-			WithCheckOption *wco = lfirst_node(WithCheckOption, ll);
-			ExprState  *wcoExpr = ExecInitQual(castNode(List, wco->qual),
-											   &mtstate->ps);
-
-			wcoExprs = lappend(wcoExprs, wcoExpr);
-		}
-
-		leaf_part_rri->ri_WithCheckOptions = wcoList;
-		leaf_part_rri->ri_WithCheckOptionExprs = wcoExprs;
+		ExecInitPartitionWithCheckOptions(leaf_part_rri,
+										  &mtstate->resultRelInfo[0],
+										  linitial(node->withCheckOptionLists),
+										  firstVarno,
+										  partrel,
+										  &mtstate->ps,
+										  PARTITION_WCO_QUAL_LIST);
 	}
 
 	/*

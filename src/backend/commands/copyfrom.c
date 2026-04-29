@@ -799,6 +799,34 @@ copy_from_wco_is_volatile(List *withCheckOptions)
 }
 
 /*
+ * copy_from_partition_wco_initialized
+ *
+ * Check whether per-leaf RLS WCO state has already been initialized for the
+ * given leaf partition ResultRelInfo during this COPY FROM operation.
+ */
+static bool
+copy_from_partition_wco_initialized(CopyFromState cstate,
+									ResultRelInfo *resultRelInfo)
+{
+	return list_member_ptr(cstate->rls_init_partitions, resultRelInfo);
+}
+
+/*
+ * copy_from_mark_partition_wco_initialized
+ *
+ * Record that per-leaf RLS WCO state has been initialized for the given leaf.
+ * Must be called in cstate->copycontext so the tracking list shares the
+ * lifetime of the COPY state and the mapped WCO trees.
+ */
+static void
+copy_from_mark_partition_wco_initialized(CopyFromState cstate,
+										 ResultRelInfo *resultRelInfo)
+{
+	cstate->rls_init_partitions =
+		lappend(cstate->rls_init_partitions, resultRelInfo);
+}
+
+/*
  * build_copy_from_wco_list
  *
  * Construct a minimal synthetic Query node just enough to call
@@ -1180,6 +1208,17 @@ CopyFrom(CopyFromState cstate)
 		 */
 		insertMethod = CIM_SINGLE;
 	}
+	else if (cstate->rls_wco_list != NIL &&
+			 copy_from_wco_is_volatile(cstate->rls_wco_list))
+	{
+		/*
+		 * For partitioned tables, root WCO expressions aren't yet mapped to
+		 * leaves at this point.  Check the root WCO list directly.
+		 * map_variable_attnos() doesn't change function/operator nodes, so
+		 * root volatility implies leaf volatility.
+		 */
+		insertMethod = CIM_SINGLE;
+	}
 	else
 	{
 		/*
@@ -1347,6 +1386,54 @@ CopyFrom(CopyFromState cstate)
 
 			if (prevResultRelInfo != resultRelInfo)
 			{
+				/*
+				 * If RLS enforcement is required but the routed leaf is a
+				 * foreign table, fail closed.  COPY FROM does not support
+				 * RLS enforcement through foreign table leaf partitions.
+				 */
+				if (cstate->rls_wco_list != NIL &&
+					resultRelInfo->ri_FdwRoutine != NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("COPY FROM with row-level security is not supported for foreign table leaf partitions")));
+
+				/*
+				 * Initialize mapped RLS WITH CHECK options for this leaf
+				 * partition on first visit.  The helper maps root WCO
+				 * expressions to the leaf tuple descriptor and compiles
+				 * ExprStates.  Initialization is tracked explicitly via
+				 * rls_init_partitions so A->B->A routing does not
+				 * reinitialize leaf A.
+				 */
+				if (cstate->rls_wco_list != NIL &&
+					!copy_from_partition_wco_initialized(cstate,
+														 resultRelInfo))
+				{
+					MemoryContext oldcxt;
+
+					/*
+					 * The root WCO expressions were collected from COPY
+					 * FROM's synthetic Query/RTE.  Use the root
+					 * ResultRelInfo's range table index so
+					 * map_variable_attnos() remaps the same Var.varno
+					 * used in those expressions.
+					 */
+					Assert(target_resultRelInfo->ri_RangeTableIndex > 0);
+
+					oldcxt = MemoryContextSwitchTo(cstate->copycontext);
+					ExecInitPartitionWithCheckOptions(
+						resultRelInfo,
+						target_resultRelInfo,
+						cstate->rls_wco_list,
+						target_resultRelInfo->ri_RangeTableIndex,
+						resultRelInfo->ri_RelationDesc,
+						&mtstate->ps,
+						PARTITION_WCO_QUAL_EXPR);
+					copy_from_mark_partition_wco_initialized(cstate,
+															 resultRelInfo);
+					MemoryContextSwitchTo(oldcxt);
+				}
+
 				/* Determine which triggers exist on this partition */
 				has_before_insert_row_trig = (resultRelInfo->ri_TrigDesc &&
 											  resultRelInfo->ri_TrigDesc->trig_insert_before_row);

@@ -119,6 +119,15 @@ typedef struct CopyFromStateData
 	bool		volatile_defexprs;	/* is any of defexprs volatile? */
 	bool		rls_enabled;		/* must enforce RLS for COPY FROM? */
 	List	   *rls_wco_list;		/* collected RLS WITH CHECK options */
+
+	/*
+	 * Leaf partitions whose WCO state has been initialized during this COPY.
+	 * Stores ResultRelInfo pointers; allocated in copycontext, released with
+	 * the COPY state.  Uses list_member_ptr() for O(n-leaves) lookup per
+	 * partition switch — a low-intrusion correctness-first choice; see
+	 * copy_from_partition_wco_initialized().
+	 */
+	List	   *rls_init_partitions;
 	List	   *range_table;	/* single element list of RangeTblEntry */
 	List	   *rteperminfos;	/* single element list of RTEPermissionInfo */
 	ExprState  *qualexpr;

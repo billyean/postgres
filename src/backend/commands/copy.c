@@ -250,20 +250,17 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 			if (is_from)
 			{
-				if (rel->rd_rel->relkind == RELKIND_RELATION)
+				if (rel->rd_rel->relkind == RELKIND_RELATION ||
+					rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 				{
 					/*
-					 * Plain heap table with RLS enabled: mark this COPY FROM
-					 * for RLS enforcement and fall through to the normal
-					 * execution path.  Policy setup happens in CopyFrom().
+					 * Plain heap table or partitioned table with RLS enabled:
+					 * mark this COPY FROM for RLS enforcement and fall through
+					 * to the normal execution path.  Policy setup happens in
+					 * CopyFrom() / BeginCopyFrom().
 					 */
 					rls_enabled = true;
 				}
-				else if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("COPY FROM with row-level security is not yet supported for partitioned tables"),
-							 errhint("Use INSERT statements instead.")));
 				else
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

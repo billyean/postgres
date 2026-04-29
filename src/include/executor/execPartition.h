@@ -32,6 +32,28 @@ extern ResultRelInfo *ExecFindPartition(ModifyTableState *mtstate,
 extern void ExecCleanupTupleRouting(ModifyTableState *mtstate,
 									PartitionTupleRouting *proute);
 
+/*
+ * PartitionWCOQualShape - Declares the shape of WithCheckOption.qual nodes
+ * so the partition WCO helper can compile ExprStates correctly without
+ * guessing.
+ *
+ * INSERT's rewriter produces WCO quals in implicit-AND List form, while
+ * COPY FROM's get_row_security_policies() produces single Expr nodes.
+ */
+typedef enum PartitionWCOQualShape
+{
+	PARTITION_WCO_QUAL_LIST,	/* wco->qual is an implicit-AND List */
+	PARTITION_WCO_QUAL_EXPR		/* wco->qual is a single Expr node */
+} PartitionWCOQualShape;
+
+extern void ExecInitPartitionWithCheckOptions(ResultRelInfo *leafResultRelInfo,
+											  ResultRelInfo *rootResultRelInfo,
+											  List *rootWCOList,
+											  int rootVarno,
+											  Relation leafPartRel,
+											  PlanState *ps,
+											  PartitionWCOQualShape qualShape);
+
 
 /*
  * PartitionedRelPruningData - Per-partitioned-table data for run-time pruning

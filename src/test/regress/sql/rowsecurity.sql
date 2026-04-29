@@ -2853,25 +2853,276 @@ RESET SESSION AUTHORIZATION;
 SELECT * FROM copy_rls_test;
 TRUNCATE copy_rls_test;
 
--- T18: Partitioned table with RLS enabled -> Patch 1 fail-closed error
+-- T18: Partitioned table with RLS enabled (Patch 2: now supported)
 CREATE TABLE copy_rls_part (id int, region text, data text)
   PARTITION BY LIST (region);
 CREATE TABLE copy_rls_part_us PARTITION OF copy_rls_part FOR VALUES IN ('us');
+CREATE TABLE copy_rls_part_eu PARTITION OF copy_rls_part FOR VALUES IN ('eu');
 ALTER TABLE copy_rls_part ENABLE ROW LEVEL SECURITY;
 CREATE POLICY p ON copy_rls_part FOR INSERT WITH CHECK (region = 'us');
-GRANT INSERT ON copy_rls_part TO regress_rls_bob;
+GRANT INSERT ON copy_rls_part, copy_rls_part_us, copy_rls_part_eu TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+
+-- T18a: Row satisfies root policy, routes to 'us' partition -> success
+COPY copy_rls_part FROM stdin;
+1	us	pass
+\.
+-- T18b: Row violates root policy (region='eu') -> RLS error
+COPY copy_rls_part FROM stdin;
+2	eu	fail
+\.
+-- T18c: Multiple rows, different leaves, root policy applied consistently
+COPY copy_rls_part FROM stdin;
+3	us	pass1
+4	us	pass2
+\.
+-- T18d: Row violating policy among passing rows -> error
+COPY copy_rls_part FROM stdin;
+5	us	pass
+6	eu	fail
+\.
+
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- T18e: Root policy references non-partition-key column
+DROP POLICY p ON copy_rls_part;
+CREATE POLICY p2 ON copy_rls_part FOR INSERT WITH CHECK (id > 10);
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_part FROM stdin;
+11	us	pass_id
+\.
+COPY copy_rls_part FROM stdin;
+5	us	fail_id
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- T18f: Route sequence A->B->A to prove no duplicate/corrupt WCO init
+DROP POLICY p2 ON copy_rls_part;
+CREATE POLICY p3 ON copy_rls_part FOR INSERT WITH CHECK (id > 0);
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_part FROM stdin;
+1	us	first_us
+2	eu	first_eu
+3	us	second_us
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- T18g: FORCE ROW LEVEL SECURITY on partitioned root
+-- Superusers always bypass RLS, so use a non-superuser owner to test FORCE.
+DROP POLICY p3 ON copy_rls_part;
+CREATE POLICY p_force ON copy_rls_part FOR INSERT WITH CHECK (id > 100);
+ALTER TABLE copy_rls_part FORCE ROW LEVEL SECURITY;
+ALTER TABLE copy_rls_part OWNER TO regress_rls_bob;
+ALTER TABLE copy_rls_part_us OWNER TO regress_rls_bob;
+ALTER TABLE copy_rls_part_eu OWNER TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Bob is owner with FORCE RLS: must go through RLS, id=1 fails
+COPY copy_rls_part FROM stdin;
+1	us	owner_fail
+\.
+-- id=101 passes the policy
+COPY copy_rls_part FROM stdin;
+101	us	owner_pass
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- T18h: Owner without FORCE RLS bypasses RLS through root
+ALTER TABLE copy_rls_part NO FORCE ROW LEVEL SECURITY;
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Bob is owner without FORCE: bypasses RLS
+COPY copy_rls_part FROM stdin;
+1	us	owner_bypass
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- Transfer ownership back to superuser for remaining tests
+ALTER TABLE copy_rls_part OWNER TO CURRENT_USER;
+ALTER TABLE copy_rls_part_us OWNER TO CURRENT_USER;
+ALTER TABLE copy_rls_part_eu OWNER TO CURRENT_USER;
+GRANT INSERT ON copy_rls_part, copy_rls_part_us, copy_rls_part_eu TO regress_rls_bob;
+
+-- T18i: SubLink policy on partitioned root -> setup-time 0A000 error
+DROP POLICY p_force ON copy_rls_part;
+CREATE TABLE copy_rls_ref (allowed_region text);
+INSERT INTO copy_rls_ref VALUES ('us');
+CREATE POLICY p_sub ON copy_rls_part FOR INSERT
+  WITH CHECK (region IN (SELECT allowed_region FROM copy_rls_ref));
+GRANT SELECT ON copy_rls_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_part FROM stdin;
+RESET SESSION AUTHORIZATION;
+DROP POLICY p_sub ON copy_rls_part;
+DROP TABLE copy_rls_ref;
+
+-- T18j: Leaf-specific policy conflict test.  Matches verified INSERT
+-- semantics: INSERT/COPY through root enforces only root policies mapped
+-- to the routed leaf.  Leaf-specific policies are not collected through
+-- root.  Direct INSERT/COPY into a leaf enforces the leaf's own policies.
+ALTER TABLE copy_rls_part_us ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_root_only ON copy_rls_part FOR INSERT WITH CHECK (region = 'us');
+CREATE POLICY p_leaf ON copy_rls_part_us FOR INSERT WITH CHECK (id > 100);
 GRANT INSERT ON copy_rls_part_us TO regress_rls_bob;
 
 SET SESSION AUTHORIZATION regress_rls_bob;
--- Should fail with feature-not-supported for partitioned tables
+-- Through root: only root policy applies, id=2 should pass
 COPY copy_rls_part FROM stdin;
+2	us	root_only
+\.
+-- Direct into leaf: leaf policy applies, id=2 should fail
+COPY copy_rls_part_us FROM stdin;
+3	us	leaf_fail
+\.
+-- Direct into leaf: leaf policy satisfied
+COPY copy_rls_part_us FROM stdin;
+101	us	leaf_pass
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+DROP POLICY p_root_only ON copy_rls_part;
+DROP POLICY p_leaf ON copy_rls_part_us;
+ALTER TABLE copy_rls_part_us DISABLE ROW LEVEL SECURITY;
+TRUNCATE copy_rls_part;
 
--- Non-RLS partitioned COPY FROM remains unchanged (owner bypasses RLS)
+-- T18j2: BEFORE ROW trigger on leaf changes failing row to passing
+CREATE POLICY p_trig ON copy_rls_part FOR INSERT WITH CHECK (id > 10);
+CREATE FUNCTION copy_rls_trig_fix() RETURNS trigger AS $$
+BEGIN
+  NEW.id := NEW.id + 100;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER copy_rls_fix_trig BEFORE INSERT ON copy_rls_part_us
+  FOR EACH ROW EXECUTE FUNCTION copy_rls_trig_fix();
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- id=5 would fail policy (id>10), but trigger changes id to 105 -> passes
+COPY copy_rls_part FROM stdin;
+5	us	trigger_fix
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- T18j3: BEFORE ROW trigger on leaf changes passing row to failing
+CREATE OR REPLACE FUNCTION copy_rls_trig_fix() RETURNS trigger AS $$
+BEGIN
+  NEW.id := 1;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- id=15 passes policy (id>10), but trigger changes id to 1 -> fails
+COPY copy_rls_part FROM stdin;
+15	us	trigger_break
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+DROP TRIGGER copy_rls_fix_trig ON copy_rls_part_us;
+DROP FUNCTION copy_rls_trig_fix();
+DROP POLICY p_trig ON copy_rls_part;
+
+-- T18j4: Stored generated column referenced by root policy
+CREATE TABLE copy_rls_gen (id int, data text, gen_col int GENERATED ALWAYS AS (id * 2) STORED)
+  PARTITION BY LIST (data);
+CREATE TABLE copy_rls_gen_a PARTITION OF copy_rls_gen FOR VALUES IN ('a');
+ALTER TABLE copy_rls_gen ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_gen ON copy_rls_gen FOR INSERT WITH CHECK (gen_col > 10);
+GRANT INSERT ON copy_rls_gen, copy_rls_gen_a TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- id=6 -> gen_col=12 -> passes (gen_col > 10)
+COPY copy_rls_gen (id, data) FROM stdin;
+6	a
+\.
+-- id=3 -> gen_col=6 -> fails (gen_col <= 10)
+COPY copy_rls_gen (id, data) FROM stdin;
+3	a
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_gen ORDER BY id;
+DROP TABLE copy_rls_gen;
+
+-- T18j5: CHECK constraint and RLS both fail -> RLS error (42501) wins
+CREATE POLICY p_check ON copy_rls_part FOR INSERT WITH CHECK (id > 100);
+ALTER TABLE copy_rls_part ADD CONSTRAINT chk_positive CHECK (id > 0);
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- id=-1: violates both RLS (id>100) and CHECK (id>0) -> RLS error wins
+COPY copy_rls_part FROM stdin;
+-1	us	both_fail
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+ALTER TABLE copy_rls_part DROP CONSTRAINT chk_positive;
+DROP POLICY p_check ON copy_rls_part;
+TRUNCATE copy_rls_part;
+
+-- T18j6: COPY FROM with explicit column list (data gets DEFAULT=NULL)
+CREATE POLICY p_collist ON copy_rls_part FOR INSERT WITH CHECK (region = 'us');
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_part (id, region) FROM stdin;
+1	us
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+DROP POLICY p_collist ON copy_rls_part;
+TRUNCATE copy_rls_part;
+
+-- T18j7: RLS policy references a column populated by DEFAULT through
+-- explicit column list.  Verifies RLS sees the defaulted value after
+-- default expression evaluation.
+ALTER TABLE copy_rls_part ALTER COLUMN data SET DEFAULT 'allowed';
+CREATE POLICY p_def ON copy_rls_part FOR INSERT
+  WITH CHECK (region = 'us' AND data = 'allowed');
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Omit data column; DEFAULT fills 'allowed' -> RLS passes
+COPY copy_rls_part (id, region) FROM stdin;
+1	us
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+ALTER TABLE copy_rls_part ALTER COLUMN data DROP DEFAULT;
+DROP POLICY p_def ON copy_rls_part;
+TRUNCATE copy_rls_part;
+
+-- T18k: ON_ERROR IGNORE does not skip partitioned-table RLS violation
+CREATE POLICY p_final ON copy_rls_part FOR INSERT WITH CHECK (region = 'us');
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_part FROM stdin WITH (ON_ERROR ignore);
+1	eu	should_fail_rls
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
+
+-- T18l: Partitioned COPY FROM with RLS bypass remains unchanged (owner/superuser bypass)
+DROP POLICY p_final ON copy_rls_part;
+CREATE POLICY p_nop ON copy_rls_part FOR INSERT WITH CHECK (region = 'us');
 RESET SESSION AUTHORIZATION;
 COPY copy_rls_part FROM stdin;
 1	us	owner_ok
+2	eu	owner_ok_eu
 \.
-SELECT * FROM copy_rls_part;
+SELECT * FROM copy_rls_part ORDER BY id;
+
 DROP TABLE copy_rls_part;
 
 -- Optional: BYPASSRLS role bypass
