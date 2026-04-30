@@ -2813,7 +2813,7 @@ COPY copy_rls_order_test FROM stdin;
 RESET SESSION AUTHORIZATION;
 DROP TABLE copy_rls_order_test;
 
--- T14: SubLink policy -> setup-time error
+-- T14: SubLink policy (IN subquery) -> COPY FROM enforces correctly
 CREATE TABLE copy_rls_sublink_test (id int, dept_id int);
 ALTER TABLE copy_rls_sublink_test ENABLE ROW LEVEL SECURITY;
 CREATE TABLE allowed_depts (dept_id int);
@@ -2824,12 +2824,19 @@ GRANT INSERT ON copy_rls_sublink_test TO regress_rls_bob;
 GRANT SELECT ON allowed_depts TO regress_rls_bob;
 
 SET SESSION AUTHORIZATION regress_rls_bob;
+-- dept_id=1 is in allowed_depts -> succeeds
 COPY copy_rls_sublink_test FROM stdin;
+1	1
+\.
+-- dept_id=99 is NOT in allowed_depts -> fails
+COPY copy_rls_sublink_test FROM stdin;
+2	99
+\.
 
 -- T15: INSERT with same SubLink policy succeeds
-INSERT INTO copy_rls_sublink_test VALUES (1, 1);
+INSERT INTO copy_rls_sublink_test VALUES (3, 2);
 RESET SESSION AUTHORIZATION;
-SELECT * FROM copy_rls_sublink_test;
+SELECT * FROM copy_rls_sublink_test ORDER BY id;
 DROP TABLE copy_rls_sublink_test;
 DROP TABLE allowed_depts;
 
@@ -2955,7 +2962,7 @@ ALTER TABLE copy_rls_part_us OWNER TO CURRENT_USER;
 ALTER TABLE copy_rls_part_eu OWNER TO CURRENT_USER;
 GRANT INSERT ON copy_rls_part, copy_rls_part_us, copy_rls_part_eu TO regress_rls_bob;
 
--- T18i: SubLink policy on partitioned root -> setup-time 0A000 error
+-- T18i: SubLink policy on partitioned root -> COPY FROM enforces correctly
 DROP POLICY p_force ON copy_rls_part;
 CREATE TABLE copy_rls_ref (allowed_region text);
 INSERT INTO copy_rls_ref VALUES ('us');
@@ -2964,8 +2971,17 @@ CREATE POLICY p_sub ON copy_rls_part FOR INSERT
 GRANT SELECT ON copy_rls_ref TO regress_rls_bob;
 
 SET SESSION AUTHORIZATION regress_rls_bob;
+-- region='us' is in copy_rls_ref -> succeeds
 COPY copy_rls_part FROM stdin;
+1	us	sub_ok
+\.
+-- region='eu' is NOT in copy_rls_ref -> fails
+COPY copy_rls_part FROM stdin;
+2	eu	sub_fail
+\.
 RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_part ORDER BY id;
+TRUNCATE copy_rls_part;
 DROP POLICY p_sub ON copy_rls_part;
 DROP TABLE copy_rls_ref;
 
@@ -3124,6 +3140,367 @@ COPY copy_rls_part FROM stdin;
 SELECT * FROM copy_rls_part ORDER BY id;
 
 DROP TABLE copy_rls_part;
+
+-- ================================================================
+-- SubLink (subquery) policy tests for COPY FROM (Patch 3)
+-- ================================================================
+
+-- T19: EXISTS SubLink policy
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_exists_test (id int, dept_id int);
+ALTER TABLE copy_rls_exists_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_exists_ref (dept_id int);
+INSERT INTO copy_rls_exists_ref VALUES (10), (20);
+CREATE POLICY p ON copy_rls_exists_test FOR INSERT
+  WITH CHECK (EXISTS (SELECT 1 FROM copy_rls_exists_ref r WHERE r.dept_id = copy_rls_exists_test.dept_id));
+GRANT INSERT ON copy_rls_exists_test TO regress_rls_bob;
+GRANT SELECT ON copy_rls_exists_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- dept_id=10 exists in ref -> passes
+COPY copy_rls_exists_test FROM stdin;
+1	10
+\.
+-- dept_id=99 does not exist in ref -> fails
+COPY copy_rls_exists_test FROM stdin;
+2	99
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_exists_test ORDER BY id;
+DROP TABLE copy_rls_exists_test;
+DROP TABLE copy_rls_exists_ref;
+
+-- T20: Scalar SubLink (= (SELECT ...)) policy
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_scalar_test (id int, max_id int);
+ALTER TABLE copy_rls_scalar_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_scalar_ref (limit_val int);
+INSERT INTO copy_rls_scalar_ref VALUES (100);
+CREATE POLICY p ON copy_rls_scalar_test FOR INSERT
+  WITH CHECK (max_id <= (SELECT max(limit_val) FROM copy_rls_scalar_ref));
+GRANT INSERT ON copy_rls_scalar_test TO regress_rls_bob;
+GRANT SELECT ON copy_rls_scalar_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- max_id=50 <= 100 -> passes
+COPY copy_rls_scalar_test FROM stdin;
+1	50
+\.
+-- max_id=200 > 100 -> fails
+COPY copy_rls_scalar_test FROM stdin;
+2	200
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_scalar_test ORDER BY id;
+DROP TABLE copy_rls_scalar_test;
+DROP TABLE copy_rls_scalar_ref;
+
+-- T21: SubLink policy with multiple rows via COPY FROM
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_multi_test (id int, code text);
+ALTER TABLE copy_rls_multi_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_multi_ref (code text);
+INSERT INTO copy_rls_multi_ref VALUES ('A'), ('B'), ('C');
+CREATE POLICY p ON copy_rls_multi_test FOR INSERT
+  WITH CHECK (code IN (SELECT code FROM copy_rls_multi_ref));
+GRANT INSERT ON copy_rls_multi_test TO regress_rls_bob;
+GRANT SELECT ON copy_rls_multi_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- All rows pass policy
+COPY copy_rls_multi_test FROM stdin;
+1	A
+2	B
+3	C
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_multi_test ORDER BY id;
+-- One bad row in the middle should fail the entire COPY
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_multi_test FROM stdin;
+4	A
+5	X
+6	B
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_multi_test ORDER BY id;
+DROP TABLE copy_rls_multi_test;
+DROP TABLE copy_rls_multi_ref;
+
+-- T22: NOT IN SubLink policy
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_notin_test (id int, status text);
+ALTER TABLE copy_rls_notin_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_notin_ref (blocked text);
+INSERT INTO copy_rls_notin_ref VALUES ('banned'), ('suspended');
+CREATE POLICY p ON copy_rls_notin_test FOR INSERT
+  WITH CHECK (status NOT IN (SELECT blocked FROM copy_rls_notin_ref));
+GRANT INSERT ON copy_rls_notin_test TO regress_rls_bob;
+GRANT SELECT ON copy_rls_notin_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- status='active' not in blocked -> passes
+COPY copy_rls_notin_test FROM stdin;
+1	active
+\.
+-- status='banned' is in blocked -> fails
+COPY copy_rls_notin_test FROM stdin;
+2	banned
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_notin_test ORDER BY id;
+DROP TABLE copy_rls_notin_test;
+DROP TABLE copy_rls_notin_ref;
+
+-- T23: SubLink policy combined with simple expression (AND)
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_combo_test (id int, dept_id int);
+ALTER TABLE copy_rls_combo_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_combo_ref (dept_id int);
+INSERT INTO copy_rls_combo_ref VALUES (1), (2);
+CREATE POLICY p ON copy_rls_combo_test FOR INSERT
+  WITH CHECK (id > 0 AND dept_id IN (SELECT dept_id FROM copy_rls_combo_ref));
+GRANT INSERT ON copy_rls_combo_test TO regress_rls_bob;
+GRANT SELECT ON copy_rls_combo_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- id=1 > 0 AND dept_id=1 in ref -> passes
+COPY copy_rls_combo_test FROM stdin;
+1	1
+\.
+-- id=-1 fails the simple expression part
+COPY copy_rls_combo_test FROM stdin;
+-1	1
+\.
+-- id=2 > 0 but dept_id=99 not in ref -> fails the SubLink part
+COPY copy_rls_combo_test FROM stdin;
+2	99
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_combo_test ORDER BY id;
+DROP TABLE copy_rls_combo_test;
+DROP TABLE copy_rls_combo_ref;
+
+-- T24: SubLink policy on partitioned table with multiple rows
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_partsub (id int, region text, data text)
+  PARTITION BY LIST (region);
+CREATE TABLE copy_rls_partsub_us PARTITION OF copy_rls_partsub FOR VALUES IN ('us');
+CREATE TABLE copy_rls_partsub_eu PARTITION OF copy_rls_partsub FOR VALUES IN ('eu');
+ALTER TABLE copy_rls_partsub ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_partsub_ref (allowed_region text);
+INSERT INTO copy_rls_partsub_ref VALUES ('us'), ('eu');
+CREATE POLICY p ON copy_rls_partsub FOR INSERT
+  WITH CHECK (region IN (SELECT allowed_region FROM copy_rls_partsub_ref));
+GRANT INSERT ON copy_rls_partsub, copy_rls_partsub_us, copy_rls_partsub_eu TO regress_rls_bob;
+GRANT SELECT ON copy_rls_partsub_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Both regions allowed -> all rows pass
+COPY copy_rls_partsub FROM stdin;
+1	us	us_data
+2	eu	eu_data
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_partsub ORDER BY id;
+
+-- Remove 'eu' from allowed regions
+DELETE FROM copy_rls_partsub_ref WHERE allowed_region = 'eu';
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- region='eu' no longer allowed -> fails
+COPY copy_rls_partsub FROM stdin;
+3	eu	should_fail
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_partsub ORDER BY id;
+DROP TABLE copy_rls_partsub;
+DROP TABLE copy_rls_partsub_ref;
+
+-- T25: Dynamic SubLink reference table update between COPY calls
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_dyn_test (id int, cat text);
+ALTER TABLE copy_rls_dyn_test ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_dyn_ref (cat text);
+INSERT INTO copy_rls_dyn_ref VALUES ('X');
+CREATE POLICY p ON copy_rls_dyn_test FOR INSERT
+  WITH CHECK (cat IN (SELECT cat FROM copy_rls_dyn_ref));
+GRANT INSERT ON copy_rls_dyn_test TO regress_rls_bob;
+GRANT SELECT ON copy_rls_dyn_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- cat='X' in ref -> passes
+COPY copy_rls_dyn_test FROM stdin;
+1	X
+\.
+-- cat='Y' not in ref -> fails
+COPY copy_rls_dyn_test FROM stdin;
+2	Y
+\.
+RESET SESSION AUTHORIZATION;
+-- Add 'Y' to ref
+INSERT INTO copy_rls_dyn_ref VALUES ('Y');
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Now cat='Y' in ref -> passes
+COPY copy_rls_dyn_test FROM stdin;
+3	Y
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_dyn_test ORDER BY id;
+DROP TABLE copy_rls_dyn_test;
+DROP TABLE copy_rls_dyn_ref;
+
+-- T26: BYPASSRLS role bypasses SubLink policy
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_bypass_sub (id int, val int);
+ALTER TABLE copy_rls_bypass_sub ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_bypass_ref (val int);
+INSERT INTO copy_rls_bypass_ref VALUES (1);
+CREATE POLICY p ON copy_rls_bypass_sub FOR INSERT
+  WITH CHECK (val IN (SELECT val FROM copy_rls_bypass_ref));
+GRANT INSERT ON copy_rls_bypass_sub TO regress_rls_exempt_user;
+GRANT SELECT ON copy_rls_bypass_ref TO regress_rls_exempt_user;
+
+SET SESSION AUTHORIZATION regress_rls_exempt_user;
+-- val=999 is not in ref, but BYPASSRLS user skips RLS -> passes
+COPY copy_rls_bypass_sub FROM stdin;
+1	999
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_bypass_sub ORDER BY id;
+DROP TABLE copy_rls_bypass_sub;
+DROP TABLE copy_rls_bypass_ref;
+
+-- T27: Owner bypasses SubLink policy (no FORCE RLS)
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_ownersub (id int, val int);
+ALTER TABLE copy_rls_ownersub ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_ownersub_ref (val int);
+INSERT INTO copy_rls_ownersub_ref VALUES (1);
+CREATE POLICY p ON copy_rls_ownersub FOR INSERT
+  WITH CHECK (val IN (SELECT val FROM copy_rls_ownersub_ref));
+
+-- Owner COPY (no FORCE RLS) -> bypasses policy
+COPY copy_rls_ownersub FROM stdin;
+1	999
+\.
+SELECT * FROM copy_rls_ownersub ORDER BY id;
+DROP TABLE copy_rls_ownersub;
+DROP TABLE copy_rls_ownersub_ref;
+
+-- T28: Partitioned root with correlated EXISTS SubLink referencing partition key
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_partsub (id int, region text, data text)
+  PARTITION BY LIST (region);
+CREATE TABLE copy_rls_partsub_us PARTITION OF copy_rls_partsub FOR VALUES IN ('us');
+CREATE TABLE copy_rls_partsub_eu PARTITION OF copy_rls_partsub FOR VALUES IN ('eu');
+ALTER TABLE copy_rls_partsub ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_partsub_ref (region text);
+INSERT INTO copy_rls_partsub_ref VALUES ('us');
+CREATE POLICY p_partcorr ON copy_rls_partsub FOR INSERT
+  WITH CHECK (EXISTS (SELECT 1 FROM copy_rls_partsub_ref r
+                      WHERE r.region = copy_rls_partsub.region));
+GRANT INSERT ON copy_rls_partsub, copy_rls_partsub_us, copy_rls_partsub_eu TO regress_rls_bob;
+GRANT SELECT ON copy_rls_partsub_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- T28a: region='us' exists in ref -> pass
+COPY copy_rls_partsub FROM stdin;
+1	us	corr_ok
+\.
+-- T28b: region='eu' not in ref -> fail
+COPY copy_rls_partsub FROM stdin;
+2	eu	corr_fail
+\.
+-- Now allow 'eu' so we can test A->B->A routing
+RESET SESSION AUTHORIZATION;
+INSERT INTO copy_rls_partsub_ref VALUES ('eu');
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- T28c: A->B->A routing with correlated SubLink
+COPY copy_rls_partsub FROM stdin;
+3	us	aba1
+4	eu	aba2
+5	us	aba3
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_partsub ORDER BY id;
+TRUNCATE copy_rls_partsub;
+
+-- T29: Partitioned root with correlated EXISTS SubLink referencing non-partition-key column
+DROP POLICY p_partcorr ON copy_rls_partsub;
+CREATE TABLE copy_rls_partsub_dataref (data text);
+INSERT INTO copy_rls_partsub_dataref VALUES ('allowed'), ('ok');
+GRANT SELECT ON copy_rls_partsub_dataref TO regress_rls_bob;
+CREATE POLICY p_partdata ON copy_rls_partsub FOR INSERT
+  WITH CHECK (EXISTS (SELECT 1 FROM copy_rls_partsub_dataref d
+                      WHERE d.data = copy_rls_partsub.data));
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- T29a: data='allowed' in ref -> pass (routes to us)
+COPY copy_rls_partsub FROM stdin;
+1	us	allowed
+\.
+-- T29b: data='forbidden' not in ref -> fail
+COPY copy_rls_partsub FROM stdin;
+2	us	forbidden
+\.
+-- T29c: rows to multiple leaves, correlated on non-partition-key
+COPY copy_rls_partsub FROM stdin;
+3	us	ok
+4	eu	allowed
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_partsub ORDER BY id;
+
+DROP TABLE copy_rls_partsub;
+DROP TABLE copy_rls_partsub_ref;
+DROP TABLE copy_rls_partsub_dataref;
+
+-- T30: ON_ERROR IGNORE does not skip SubLink RLS violation
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_onerr_sub (id int, code text);
+ALTER TABLE copy_rls_onerr_sub ENABLE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_onerr_ref (code text);
+INSERT INTO copy_rls_onerr_ref VALUES ('ok');
+CREATE POLICY p ON copy_rls_onerr_sub FOR INSERT
+  WITH CHECK (code IN (SELECT code FROM copy_rls_onerr_ref));
+GRANT INSERT ON copy_rls_onerr_sub TO regress_rls_bob;
+GRANT SELECT ON copy_rls_onerr_ref TO regress_rls_bob;
+
+SET SESSION AUTHORIZATION regress_rls_bob;
+COPY copy_rls_onerr_sub FROM stdin WITH (ON_ERROR ignore);
+1	bad
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_onerr_sub;
+DROP TABLE copy_rls_onerr_sub;
+DROP TABLE copy_rls_onerr_ref;
+
+-- T31: FORCE ROW LEVEL SECURITY applies to SubLink policy for table owner
+RESET SESSION AUTHORIZATION;
+CREATE TABLE copy_rls_force_sub (id int, val int);
+ALTER TABLE copy_rls_force_sub ENABLE ROW LEVEL SECURITY;
+ALTER TABLE copy_rls_force_sub FORCE ROW LEVEL SECURITY;
+CREATE TABLE copy_rls_force_sub_ref (val int);
+INSERT INTO copy_rls_force_sub_ref VALUES (1);
+CREATE POLICY p ON copy_rls_force_sub FOR INSERT
+  WITH CHECK (val IN (SELECT val FROM copy_rls_force_sub_ref));
+-- Transfer ownership to non-superuser so FORCE RLS takes effect
+ALTER TABLE copy_rls_force_sub OWNER TO regress_rls_bob;
+GRANT SELECT ON copy_rls_force_sub_ref TO regress_rls_bob;
+SET SESSION AUTHORIZATION regress_rls_bob;
+-- Owner with FORCE RLS: val=1 passes
+COPY copy_rls_force_sub FROM stdin;
+1	1
+\.
+-- Owner with FORCE RLS: val=999 fails
+COPY copy_rls_force_sub FROM stdin;
+2	999
+\.
+RESET SESSION AUTHORIZATION;
+SELECT * FROM copy_rls_force_sub ORDER BY id;
+DROP TABLE copy_rls_force_sub;
+DROP TABLE copy_rls_force_sub_ref;
 
 -- Optional: BYPASSRLS role bypass
 RESET SESSION AUTHORIZATION;

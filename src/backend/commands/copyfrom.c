@@ -36,14 +36,17 @@
 #include "executor/execPartition.h"
 #include "executor/executor.h"
 #include "executor/nodeModifyTable.h"
+#include "executor/nodeSubplan.h"
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
+#include "rewrite/rewriteManip.h"
 #include "rewrite/rowsecurity.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
@@ -872,6 +875,78 @@ build_copy_from_wco_list(Relation rel,
 }
 
 /*
+ * plan_copy_from_rls_wcos
+ *
+ * When RLS WITH CHECK policies contain SubLinks, we must run the planner
+ * to convert SubLink nodes into executable SubPlan nodes.  This function
+ * constructs a minimal synthetic Query, plans it, and extracts the
+ * resulting SubPlan state needed for executor initialization.
+ *
+ * The caller runs this helper under cstate->copycontext, so the PlannedStmt,
+ * expanded range table, planned WCOs, and SubPlan trees remain valid for
+ * the whole COPY operation.
+ *
+ * After planning:
+ *  - cstate->rls_wco_list is replaced with the planned ModifyTable WCO list.
+ *    These WCOs have been processed by set_plan_references, including
+ *    AlternativeSubPlan resolution, while retaining target-relation Vars in
+ *    the form expected by the partition WCO mapping helper.
+ *  - cstate->rls_planned_subplans holds the SubPlan Plan trees
+ *  - cstate->rls_num_params holds the nParamExec count
+ *  - cstate->rls_plannedstmt holds the PlannedStmt (needed for es_plannedstmt)
+ *  - cstate->range_table and rteperminfos are expanded by the planner
+ */
+static void
+plan_copy_from_rls_wcos(CopyFromState cstate)
+{
+	Query	   *query;
+	PlannedStmt *pstmt;
+	ModifyTable *mtplan;
+	ListCell   *lc;
+
+	query = makeNode(Query);
+	query->commandType = CMD_INSERT;
+	query->resultRelation = 1;
+	query->rtable = copyObject(cstate->range_table);
+	query->rteperminfos = copyObject(cstate->rteperminfos);
+	query->onConflict = NULL;
+	query->hasSubLinks = true;
+	query->withCheckOptions = copyObject(cstate->rls_wco_list);
+	query->canSetTag = true;
+	query->jointree = makeNode(FromExpr);
+	query->jointree->fromlist = NIL;
+	query->jointree->quals = NULL;
+	query->targetList = NIL;
+
+	AcquireRewriteLocks(query, true, false);
+	pstmt = pg_plan_query(query, NULL, 0, NULL, NULL);
+
+	/*
+	 * Extract the WCOs from the planned ModifyTable node rather than from
+	 * query->withCheckOptions.  The plan's withCheckOptionLists has been
+	 * processed by set_plan_references, which resolves AlternativeSubPlan
+	 * nodes to the best SubPlan alternative.  query->withCheckOptions
+	 * still contains unresolved AlternativeSubPlan nodes that the executor
+	 * cannot handle.
+	 */
+	mtplan = castNode(ModifyTable, pstmt->planTree);
+	Assert(list_length(mtplan->withCheckOptionLists) == 1);
+	cstate->rls_wco_list = linitial(mtplan->withCheckOptionLists);
+	cstate->rls_planned_subplans = pstmt->subplans;
+	cstate->rls_num_params = list_length(pstmt->paramExecTypes);
+	cstate->rls_plannedstmt = pstmt;
+	cstate->range_table = pstmt->rtable;
+	cstate->rteperminfos = pstmt->permInfos;
+
+	foreach(lc, cstate->rls_wco_list)
+	{
+		WithCheckOption *wco = lfirst_node(WithCheckOption, lc);
+		if (wco->qual != NULL && checkExprHasSubLink(wco->qual))
+			elog(ERROR, "COPY FROM RLS WCO planning failed to convert all SubLinks");
+	}
+}
+
+/*
  * init_copy_from_wco
  *
  * Compile WITH CHECK OPTION expressions and populate ResultRelInfo,
@@ -880,7 +955,8 @@ build_copy_from_wco_list(Relation rel,
 static void
 init_copy_from_wco(ResultRelInfo *resultRelInfo,
 				   List *withCheckOptions,
-				   PlanState *ps)
+				   PlanState *ps,
+				   PartitionWCOQualShape qualShape)
 {
 	List	   *wcoExprs = NIL;
 	ListCell   *lc;
@@ -890,13 +966,16 @@ init_copy_from_wco(ResultRelInfo *resultRelInfo,
 		WithCheckOption *wco = lfirst_node(WithCheckOption, lc);
 		ExprState  *wcoExpr;
 
-		/*
-		 * ExecInitQual() expects a List of implicit-AND qual clauses.  COPY
-		 * FROM receives a single WCO expression tree from RLS policy
-		 * collection, so wrap it in a one-element qual list, preserving the
-		 * ExprState list shape consumed by ExecWithCheckOptions().
-		 */
-		wcoExpr = ExecInitQual(list_make1(wco->qual), ps);
+		if (qualShape == PARTITION_WCO_QUAL_LIST)
+		{
+			Assert(IsA(wco->qual, List));
+			wcoExpr = ExecInitQual(castNode(List, wco->qual), ps);
+		}
+		else
+		{
+			Assert(!IsA(wco->qual, List));
+			wcoExpr = ExecInitQual(list_make1(wco->qual), ps);
+		}
 
 		wcoExprs = lappend(wcoExprs, wcoExpr);
 	}
@@ -934,7 +1013,7 @@ CopyFrom(CopyFromState cstate)
 	bool		leafpart_use_multi_insert = false;
 
 	Assert(cstate->rel);
-	Assert(list_length(cstate->range_table) == 1);
+	Assert(list_length(cstate->range_table) >= 1);
 
 	if (cstate->opts.on_error != COPY_ON_ERROR_STOP)
 		Assert(cstate->escontext);
@@ -1046,8 +1125,23 @@ CopyFrom(CopyFromState cstate)
 	 * index-entry-making machinery.  (There used to be a huge amount of code
 	 * here that basically duplicated execUtils.c ...)
 	 */
-	ExecInitRangeTable(estate, cstate->range_table, cstate->rteperminfos,
-					   bms_make_singleton(1));
+	{
+		Bitmapset  *unprunableRelids;
+
+		/*
+		 * The target relation (RTE 1) must always be kept open.  When RLS
+		 * SubPlans are present, the planner may require additional relations
+		 * for subquery scans; use the planned statement's unprunableRelids
+		 * rather than marking every RTE unprunable.
+		 */
+		if (cstate->rls_has_sublinks)
+			unprunableRelids = bms_union(bms_make_singleton(1),
+										 cstate->rls_plannedstmt->unprunableRelids);
+		else
+			unprunableRelids = bms_make_singleton(1);
+		ExecInitRangeTable(estate, cstate->range_table, cstate->rteperminfos,
+						   unprunableRelids);
+	}
 	resultRelInfo = target_resultRelInfo = makeNode(ResultRelInfo);
 	ExecInitResultRelation(estate, resultRelInfo, 1);
 
@@ -1121,13 +1215,71 @@ CopyFrom(CopyFromState cstate)
 	 * If RLS is enabled, initialize WCO ExprStates from the policy list
 	 * collected during BeginCopyFrom().  Allocate in copycontext so they
 	 * survive for the entire COPY operation.
+	 *
+	 * When SubLinks are present, we must first initialize the SubPlan
+	 * executor state so that ExecInitQual can find SubPlan nodes during
+	 * WCO expression compilation.
 	 */
+	if (cstate->rls_has_sublinks && cstate->rls_planned_subplans != NIL)
+	{
+		ListCell   *lc;
+
+		/*
+		 * COPY FROM owns this EState and, before RLS SubLink setup, has no
+		 * other executor subplans or PARAM_EXEC slots.
+		 */
+		Assert(estate->es_subplanstates == NIL);
+		Assert(estate->es_param_exec_vals == NULL);
+
+		/*
+		 * COPY FROM creates its EState via CreateExecutorState(), not
+		 * InitPlan(), so es_plannedstmt is NULL by default.  SubPlan
+		 * scan nodes call ScanRelIsReadOnly() which needs es_plannedstmt.
+		 * The PlannedStmt has COPY-lifetime ownership via cstate.
+		 */
+		estate->es_plannedstmt = cstate->rls_plannedstmt;
+		estate->es_snapshot = GetActiveSnapshot();
+		if (cstate->rls_num_params > 0)
+			estate->es_param_exec_vals = (ParamExecData *)
+				palloc0(cstate->rls_num_params * sizeof(ParamExecData));
+		foreach(lc, cstate->rls_planned_subplans)
+		{
+			Plan	   *subplan = (Plan *) lfirst(lc);
+			PlanState  *subplanstate = ExecInitNode(subplan, estate, 0);
+
+			estate->es_subplanstates = lappend(estate->es_subplanstates,
+											   subplanstate);
+			cstate->rls_subplanstates = lappend(cstate->rls_subplanstates,
+												subplanstate);
+		}
+
+		/*
+		 * Process initPlans from the planned ModifyTable node.  Scalar
+		 * SubLinks become initplans that set output parameters via lazy
+		 * evaluation.  ExecInitSubPlan links each initplan's SubPlanState
+		 * to es_param_exec_vals so that the Param nodes referencing
+		 * initplan results trigger execution on first access.  We use
+		 * mtstate->ps as the parent PlanState, matching init_copy_from_wco.
+		 */
+		foreach(lc, cstate->rls_plannedstmt->planTree->initPlan)
+		{
+			SubPlan    *subplan = (SubPlan *) lfirst(lc);
+			SubPlanState *sstate;
+
+			Assert(IsA(subplan, SubPlan));
+			Assert(subplan->args == NIL);
+			sstate = ExecInitSubPlan(subplan, &mtstate->ps);
+			mtstate->ps.initPlan = lappend(mtstate->ps.initPlan, sstate);
+		}
+	}
+
 	if (cstate->rls_enabled && cstate->rls_wco_list != NIL)
 	{
 		MemoryContext oldcxt;
 
 		oldcxt = MemoryContextSwitchTo(cstate->copycontext);
-		init_copy_from_wco(resultRelInfo, cstate->rls_wco_list, &mtstate->ps);
+		init_copy_from_wco(resultRelInfo, cstate->rls_wco_list, &mtstate->ps,
+						   cstate->rls_has_sublinks ? PARTITION_WCO_QUAL_LIST : PARTITION_WCO_QUAL_EXPR);
 		MemoryContextSwitchTo(oldcxt);
 	}
 
@@ -1216,6 +1368,16 @@ CopyFrom(CopyFromState cstate)
 		 * leaves at this point.  Check the root WCO list directly.
 		 * map_variable_attnos() doesn't change function/operator nodes, so
 		 * root volatility implies leaf volatility.
+		 */
+		insertMethod = CIM_SINGLE;
+	}
+	else if (cstate->rls_has_sublinks)
+	{
+		/*
+		 * Can't support multi-inserts when RLS policies contain SubLinks
+		 * (subqueries).  SubPlan execution requires per-tuple evaluation
+		 * with proper executor state, which is incompatible with batched
+		 * inserts.
 		 */
 		insertMethod = CIM_SINGLE;
 	}
@@ -1428,6 +1590,8 @@ CopyFrom(CopyFromState cstate)
 						target_resultRelInfo->ri_RangeTableIndex,
 						resultRelInfo->ri_RelationDesc,
 						&mtstate->ps,
+						cstate->rls_has_sublinks ?
+						PARTITION_WCO_QUAL_LIST :
 						PARTITION_WCO_QUAL_EXPR);
 					copy_from_mark_partition_wco_initialized(cstate,
 															 resultRelInfo);
@@ -1733,6 +1897,17 @@ CopyFrom(CopyFromState cstate)
 	/* Close all the partitioned tables, leaf partitions, and their indices */
 	if (proute)
 		ExecCleanupTupleRouting(mtstate, proute);
+
+	/* End COPY-owned SubPlan PlanStates before closing relations */
+	if (cstate->rls_subplanstates != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, cstate->rls_subplanstates)
+		{
+			ExecEndNode((PlanState *) lfirst(lc));
+		}
+	}
 
 	/* Close the result relations, including any trigger target relations */
 	ExecCloseResultRelations(estate);
@@ -2118,10 +2293,12 @@ BeginCopyFrom(ParseState *pstate,
 		MemoryContextSwitchTo(oldcontext);
 
 		if (hasSubLinks)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("COPY FROM cannot enforce row-level security policies containing subqueries"),
-					 errhint("Use INSERT statements instead, or rewrite the applicable row-level security policies to avoid subqueries.")));
+		{
+			oldcontext = MemoryContextSwitchTo(cstate->copycontext);
+			plan_copy_from_rls_wcos(cstate);
+			MemoryContextSwitchTo(oldcontext);
+			cstate->rls_has_sublinks = true;
+		}
 	}
 
 	if (data_source_cb)

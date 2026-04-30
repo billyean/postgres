@@ -119,6 +119,11 @@ typedef struct CopyFromStateData
 	bool		volatile_defexprs;	/* is any of defexprs volatile? */
 	bool		rls_enabled;		/* must enforce RLS for COPY FROM? */
 	List	   *rls_wco_list;		/* collected RLS WITH CHECK options */
+	bool		rls_has_sublinks;	/* do RLS WCO policies contain SubLinks? */
+	List	   *rls_planned_subplans;	/* SubPlan Plan trees from WCO planning */
+	int			rls_num_params;		/* nParamExec from WCO planning */
+	struct PlannedStmt *rls_plannedstmt;	/* PlannedStmt for SubPlan executor */
+	List	   *rls_subplanstates;	/* COPY-owned SubPlan PlanStates */
 
 	/*
 	 * Leaf partitions whose WCO state has been initialized during this COPY.
