@@ -264,6 +264,11 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 
 	pg_usage_scan_stats.segments_scanned++;
 	pg_usage_scan_stats.scan_calls++;
+	if (UsageScanSlots != NULL)
+	{
+		UsageScanSlots[MyProcNumber].segments_scanned++;
+		UsageScanSlots[MyProcNumber].scan_calls++;
+	}
 
 	/* Phase 1: scan segment for zero-usage candidates */
 	scan = pg_usage_scan(seg_map, seg_count);
@@ -281,6 +286,8 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 		cand_state = pg_atomic_read_u64(&cand->state);
 
 		pg_usage_scan_stats.candidates_examined++;
+		if (UsageScanSlots != NULL)
+			UsageScanSlots[MyProcNumber].candidates_examined++;
 
 		/*
 		 * Hot-state checks — must match the existing StrategyGetBuffer()
@@ -311,21 +318,29 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 				TrackNewBufferPin(BufferDescriptorGetBuffer(cand));
 
 				pg_usage_scan_stats.victims_found++;
+				if (UsageScanSlots != NULL)
+					UsageScanSlots[MyProcNumber].victims_found++;
 
 				return cand;
 			}
 			else
 			{
 				pg_usage_scan_stats.cas_failures++;
+				if (UsageScanSlots != NULL)
+					UsageScanSlots[MyProcNumber].cas_failures++;
 			}
 		}
 		else if (BUF_STATE_GET_REFCOUNT(cand_state) != 0)
 		{
 			pg_usage_scan_stats.rejected_refcount++;
+			if (UsageScanSlots != NULL)
+				UsageScanSlots[MyProcNumber].rejected_refcount++;
 		}
 		else
 		{
 			pg_usage_scan_stats.rejected_locked++;
+			if (UsageScanSlots != NULL)
+				UsageScanSlots[MyProcNumber].rejected_locked++;
 		}
 
 		mask &= (mask - 1);		/* clear lowest set bit */
@@ -339,11 +354,21 @@ process_chunk_segment(uint8_t *seg_map, int seg_base, int seg_count,
 	 * same heuristic-level race as Patch 1 (see design doc Section 7.4).
 	 */
 	pg_usage_scan_stats.decrement_calls++;
+	if (UsageScanSlots != NULL)
+		UsageScanSlots[MyProcNumber].decrement_calls++;
 	*made_progress = pg_usage_decrement(seg_map, seg_count);
 	if (*made_progress)
+	{
 		pg_usage_scan_stats.decrement_progress++;
+		if (UsageScanSlots != NULL)
+			UsageScanSlots[MyProcNumber].decrement_progress++;
+	}
 	else
+	{
 		pg_usage_scan_stats.decrement_noprogress++;
+		if (UsageScanSlots != NULL)
+			UsageScanSlots[MyProcNumber].decrement_noprogress++;
+	}
 
 	return NULL;
 }
@@ -449,6 +474,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			bool		progress_head = false;
 
 			pg_usage_scan_stats.chunks_scanned++;
+			if (UsageScanSlots != NULL)
+				UsageScanSlots[MyProcNumber].chunks_scanned++;
 
 			start = ClockSweepTickChunk(effective_chunk);
 			tail_count = Min(effective_chunk, NBuffers - (int) start);
@@ -478,6 +505,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint64 *buf_state, bool *from_r
 			{
 				trycounter = NBuffers;
 				pg_usage_scan_stats.trycounter_resets++;
+				if (UsageScanSlots != NULL)
+					UsageScanSlots[MyProcNumber].trycounter_resets++;
 			}
 			else
 				trycounter -= effective_chunk;

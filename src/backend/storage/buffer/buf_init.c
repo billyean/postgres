@@ -16,6 +16,7 @@
 
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
+#include "storage/buf_usage_scan.h"
 #include "storage/bufmgr.h"
 #include "storage/proclist.h"
 #include "storage/shmem.h"
@@ -30,6 +31,8 @@ CkptSortItem *CkptBufferIds;
 #ifdef USE_DECOUPLED_USAGE_COUNT
 PGDLLIMPORT uint8_t *BufferUsageMap;
 PGDLLIMPORT bool enable_decoupled_usage_count = false;
+PGDLLIMPORT UsageScanSlot *UsageScanSlots;
+PGDLLIMPORT UsageScanDispatchIdentity *UsageScanDispatchId;
 #endif
 
 static void BufferManagerShmemRequest(void *arg);
@@ -126,6 +129,20 @@ BufferManagerShmemRequest(void *arg)
 					   .alignment = PG_CACHE_LINE_SIZE,
 					   .ptr = (void **) &BufferUsageMap,
 		);
+
+	/* Per-backend counter slots for cluster-wide aggregation (Patch 7). */
+	ShmemRequestStruct(.name = "Usage Scan Per-Backend Slots",
+					   .size = (MaxBackends + NUM_AUXILIARY_PROCS)
+								* sizeof(UsageScanSlot),
+					   .alignment = PG_CACHE_LINE_SIZE,
+					   .ptr = (void **) &UsageScanSlots,
+		);
+
+	ShmemRequestStruct(.name = "Usage Scan Dispatch Identity",
+					   .size = sizeof(UsageScanDispatchIdentity),
+					   .alignment = PG_CACHE_LINE_SIZE,
+					   .ptr = (void **) &UsageScanDispatchId,
+		);
 #endif
 }
 
@@ -161,6 +178,17 @@ BufferManagerShmemInit(void *arg)
 #ifdef USE_DECOUPLED_USAGE_COUNT
 	/* Zero-init the usage map; all buffers start at usage_count=0 */
 	memset(BufferUsageMap, 0, NBuffers * sizeof(uint8_t));
+
+	/* Zero-init per-backend aggregation slots (Patch 7). */
+	memset(UsageScanSlots, 0,
+		   (MaxBackends + NUM_AUXILIARY_PROCS) * sizeof(UsageScanSlot));
+
+	/* Init shared dispatch identity to sentinel state (Patch 7). */
+	strlcpy(UsageScanDispatchId->dispatch_path, "not_initialized",
+			sizeof(UsageScanDispatchId->dispatch_path));
+	UsageScanDispatchId->dispatch_chunk_size = 0;
+	pg_atomic_init_u32(&UsageScanDispatchId->state,
+					   USAGE_SCAN_DISPATCH_ID_UNINITIALIZED);
 #endif
 
 	/* Initialize per-backend file flush context */

@@ -150,3 +150,29 @@ CREATE FUNCTION pg_buffercache_eviction_stats_reset()
 RETURNS void
 AS 'MODULE_PATHNAME', 'pg_buffercache_eviction_stats_reset'
 LANGUAGE C PARALLEL SAFE VOLATILE;
+
+-- Cluster-wide aggregated eviction instrumentation (Patch 7).
+CREATE FUNCTION pg_buffercache_eviction_stats_aggregated(
+    OUT requested_mode text,
+    OUT dispatch_path text,
+    OUT dispatch_chunk_size int4,
+    OUT active_slots int4,
+    OUT chunks_scanned int8,
+    OUT segments_scanned int8,
+    OUT scan_calls int8,
+    OUT decrement_calls int8,
+    OUT candidates_examined int8,
+    OUT rejected_refcount int8,
+    OUT rejected_locked int8,
+    OUT cas_failures int8,
+    OUT victims_found int8,
+    OUT decrement_progress int8,
+    OUT decrement_noprogress int8,
+    OUT trycounter_resets int8)
+AS 'MODULE_PATHNAME', 'pg_buffercache_eviction_stats_aggregated'
+LANGUAGE C PARALLEL SAFE VOLATILE;
+
+CREATE FUNCTION pg_buffercache_eviction_stats_aggregated_reset()
+RETURNS void
+AS 'MODULE_PATHNAME', 'pg_buffercache_eviction_stats_aggregated_reset'
+LANGUAGE C PARALLEL SAFE VOLATILE;

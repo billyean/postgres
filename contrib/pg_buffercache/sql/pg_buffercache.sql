@@ -330,3 +330,116 @@ SELECT (SELECT rm_before FROM pre_reset) =
 AS dispatch_fields_preserved_across_reset;
 
 DROP TABLE pre_reset;
+
+------
+---- Test pg_buffercache_eviction_stats_aggregated (Patch 7)
+------
+
+-- A. Shape / existence
+
+-- Aggregate SRF returns exactly one row
+SELECT count(*) = 1 FROM pg_buffercache_eviction_stats_aggregated();
+
+-- Output has 16 columns
+SELECT count(*) = 16
+FROM pg_catalog.pg_proc p, unnest(p.proargnames) AS col
+WHERE p.proname = 'pg_buffercache_eviction_stats_aggregated';
+
+-- active_slots column exists (naming contract)
+SELECT active_slots IS NOT NULL
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- B. Sentinel / dispatch identity behavior
+
+-- dispatch_path is a valid sentinel or ISA value
+SELECT dispatch_path IN ('not_enabled', 'not_initialized',
+                         'scalar', 'sse2', 'avx2', 'neon')
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- dispatch_chunk_size is 0 (sentinel) or 16 or 32 (active)
+SELECT dispatch_chunk_size IN (0, 16, 32)
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- requested_mode matches local SRF
+SELECT (SELECT requested_mode FROM pg_buffercache_eviction_stats()) =
+       (SELECT requested_mode FROM pg_buffercache_eviction_stats_aggregated())
+AS requested_mode_matches;
+
+-- C. Reset behavior
+
+-- Aggregate reset succeeds
+SELECT pg_buffercache_eviction_stats_aggregated_reset();
+
+-- After reset with no concurrent workload: all counters 0, active_slots 0
+SELECT active_slots = 0
+       AND chunks_scanned = 0 AND segments_scanned = 0
+       AND scan_calls = 0 AND decrement_calls = 0
+       AND candidates_examined = 0 AND rejected_refcount = 0
+       AND rejected_locked = 0 AND cas_failures = 0
+       AND victims_found = 0
+       AND decrement_progress = 0 AND decrement_noprogress = 0
+       AND trycounter_resets = 0
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- Dispatch identity preserved across aggregate reset
+SELECT dispatch_path IN ('not_enabled', 'not_initialized',
+                         'scalar', 'sse2', 'avx2', 'neon')
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- Local and aggregate resets are independent:
+-- reset aggregate only, local counters should be unchanged by it
+SELECT pg_buffercache_eviction_stats_reset();
+SELECT pg_buffercache_eviction_stats_aggregated_reset();
+
+-- D. Counter sanity after workload
+
+-- Smoke workload
+CREATE TABLE agg_stats_test (id int, payload text);
+INSERT INTO agg_stats_test
+    SELECT g, repeat('x', 500) FROM generate_series(1, 10000) g;
+SELECT count(*) FROM agg_stats_test;
+SELECT count(*) FROM agg_stats_test WHERE id % 2 = 0;
+DROP TABLE agg_stats_test;
+
+-- All counters non-negative
+SELECT chunks_scanned >= 0 AND segments_scanned >= 0
+       AND scan_calls >= 0 AND decrement_calls >= 0
+       AND candidates_examined >= 0 AND rejected_refcount >= 0
+       AND rejected_locked >= 0 AND cas_failures >= 0
+       AND victims_found >= 0
+       AND decrement_progress >= 0 AND decrement_noprogress >= 0
+       AND trycounter_resets >= 0
+       AND active_slots >= 0
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- Aggregate invariants (conditional on activity)
+SELECT
+    CASE WHEN scan_calls > 0 THEN
+        segments_scanned >= chunks_scanned
+        AND scan_calls = segments_scanned
+        AND rejected_refcount + rejected_locked + cas_failures + victims_found
+            <= candidates_examined
+    ELSE true END
+    AND
+    CASE WHEN decrement_calls > 0 THEN
+        decrement_progress + decrement_noprogress = decrement_calls
+    ELSE true END
+AS agg_invariants_hold
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- E. active_slots contract
+
+-- After activity: active_slots >= 1 when dispatch is active
+SELECT CASE
+    WHEN dispatch_path IN ('scalar', 'sse2', 'avx2', 'neon')
+        THEN active_slots >= 1
+    ELSE active_slots = 0
+END AS active_slots_contract
+FROM pg_buffercache_eviction_stats_aggregated();
+
+-- F. Permission checks
+
+SET ROLE pg_database_owner;
+SELECT * FROM pg_buffercache_eviction_stats_aggregated();
+SELECT pg_buffercache_eviction_stats_aggregated_reset();
+RESET ROLE;

@@ -12,10 +12,12 @@
 #include "access/relation.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "port/pg_numa.h"
 #include "storage/buf_internals.h"
 #include "storage/buf_usage_scan.h"
 #include "storage/bufmgr.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
@@ -31,6 +33,7 @@
 #define NUM_BUFFERCACHE_MARK_DIRTY_ELEM 2
 #define NUM_BUFFERCACHE_MARK_DIRTY_RELATION_ELEM 3
 #define NUM_BUFFERCACHE_EVICTION_STATS_ELEM 15
+#define NUM_BUFFERCACHE_EVICTION_STATS_AGG_ELEM 16
 #define NUM_BUFFERCACHE_MARK_DIRTY_ALL_ELEM 3
 
 #define NUM_BUFFERCACHE_OS_PAGES_ELEM	3
@@ -80,6 +83,8 @@ PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty_relation);
 PG_FUNCTION_INFO_V1(pg_buffercache_mark_dirty_all);
 PG_FUNCTION_INFO_V1(pg_buffercache_eviction_stats);
 PG_FUNCTION_INFO_V1(pg_buffercache_eviction_stats_reset);
+PG_FUNCTION_INFO_V1(pg_buffercache_eviction_stats_aggregated);
+PG_FUNCTION_INFO_V1(pg_buffercache_eviction_stats_aggregated_reset);
 
 
 /* Only need to touch memory once per backend process lifetime */
@@ -995,6 +1000,140 @@ pg_buffercache_eviction_stats_reset(PG_FUNCTION_ARGS)
 	pg_usage_scan_stats.decrement_progress = 0;
 	pg_usage_scan_stats.decrement_noprogress = 0;
 	pg_usage_scan_stats.trycounter_resets = 0;
+#endif
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * pg_buffercache_eviction_stats_aggregated
+ *
+ * Returns one row of cluster-wide eviction statistics by summing
+ * per-backend shared slots (Patch 7).  Dispatch identity is read
+ * from the shared UsageScanDispatchIdentity using the three-state
+ * publication protocol.
+ */
+Datum
+pg_buffercache_eviction_stats_aggregated(PG_FUNCTION_ARGS)
+{
+	Datum		result;
+	TupleDesc	tupledesc;
+	HeapTuple	tuple;
+	Datum		values[NUM_BUFFERCACHE_EVICTION_STATS_AGG_ELEM];
+	bool		nulls[NUM_BUFFERCACHE_EVICTION_STATS_AGG_ELEM];
+
+	if (get_call_result_type(fcinfo, NULL, &tupledesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	pg_buffercache_superuser_check("pg_buffercache_eviction_stats_aggregated");
+
+	memset(nulls, 0, sizeof(nulls));
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	{
+		int		nprocs = MaxBackends + NUM_AUXILIARY_PROCS;
+		int		active_slots = 0;
+		int64	sum_chunks_scanned = 0;
+		int64	sum_segments_scanned = 0;
+		int64	sum_scan_calls = 0;
+		int64	sum_decrement_calls = 0;
+		int64	sum_candidates_examined = 0;
+		int64	sum_rejected_refcount = 0;
+		int64	sum_rejected_locked = 0;
+		int64	sum_cas_failures = 0;
+		int64	sum_victims_found = 0;
+		int64	sum_decrement_progress = 0;
+		int64	sum_decrement_noprogress = 0;
+		int64	sum_trycounter_resets = 0;
+
+		/*
+		 * active_slots: count of slots with scan_calls > 0.  This reflects
+		 * slots with eviction activity since last reset, not a live count
+		 * of currently connected backends.
+		 */
+		for (int i = 0; i < nprocs; i++)
+		{
+			UsageScanSlot *slot = &UsageScanSlots[i];
+
+			sum_chunks_scanned += slot->chunks_scanned;
+			sum_segments_scanned += slot->segments_scanned;
+			sum_scan_calls += slot->scan_calls;
+			sum_decrement_calls += slot->decrement_calls;
+			sum_candidates_examined += slot->candidates_examined;
+			sum_rejected_refcount += slot->rejected_refcount;
+			sum_rejected_locked += slot->rejected_locked;
+			sum_cas_failures += slot->cas_failures;
+			sum_victims_found += slot->victims_found;
+			sum_decrement_progress += slot->decrement_progress;
+			sum_decrement_noprogress += slot->decrement_noprogress;
+			sum_trycounter_resets += slot->trycounter_resets;
+
+			if (slot->scan_calls > 0)
+				active_slots++;
+		}
+
+		values[0] = CStringGetTextDatum(
+						buffercache_dispatch_mode_name(
+							pg_usage_scan_dispatch_mode));
+
+		if (pg_atomic_read_u32(&UsageScanDispatchId->state) ==
+			USAGE_SCAN_DISPATCH_ID_READY)
+		{
+			pg_read_barrier();
+			values[1] = CStringGetTextDatum(UsageScanDispatchId->dispatch_path);
+			values[2] = Int32GetDatum(UsageScanDispatchId->dispatch_chunk_size);
+		}
+		else
+		{
+			values[1] = CStringGetTextDatum("not_initialized");
+			values[2] = Int32GetDatum(0);
+		}
+
+		values[3]  = Int32GetDatum(active_slots);
+		values[4]  = Int64GetDatum(sum_chunks_scanned);
+		values[5]  = Int64GetDatum(sum_segments_scanned);
+		values[6]  = Int64GetDatum(sum_scan_calls);
+		values[7]  = Int64GetDatum(sum_decrement_calls);
+		values[8]  = Int64GetDatum(sum_candidates_examined);
+		values[9]  = Int64GetDatum(sum_rejected_refcount);
+		values[10] = Int64GetDatum(sum_rejected_locked);
+		values[11] = Int64GetDatum(sum_cas_failures);
+		values[12] = Int64GetDatum(sum_victims_found);
+		values[13] = Int64GetDatum(sum_decrement_progress);
+		values[14] = Int64GetDatum(sum_decrement_noprogress);
+		values[15] = Int64GetDatum(sum_trycounter_resets);
+	}
+#else
+	values[0]  = CStringGetTextDatum("not_enabled");
+	values[1]  = CStringGetTextDatum("not_enabled");
+	values[2]  = Int32GetDatum(0);
+	values[3]  = Int32GetDatum(0);
+	for (int i = 4; i < NUM_BUFFERCACHE_EVICTION_STATS_AGG_ELEM; i++)
+		values[i] = Int64GetDatum((int64) 0);
+#endif
+
+	tuple = heap_form_tuple(tupledesc, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+/*
+ * pg_buffercache_eviction_stats_aggregated_reset
+ *
+ * Zeros all per-backend shared slots.  Dispatch identity is preserved.
+ * Reset is approximate: concurrent backends may repopulate their slots
+ * immediately.  Quiescence before reset is recommended for evaluation.
+ */
+Datum
+pg_buffercache_eviction_stats_aggregated_reset(PG_FUNCTION_ARGS)
+{
+	pg_buffercache_superuser_check(
+		"pg_buffercache_eviction_stats_aggregated_reset");
+
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	memset(UsageScanSlots, 0,
+		   (MaxBackends + NUM_AUXILIARY_PROCS) * sizeof(UsageScanSlot));
 #endif
 
 	PG_RETURN_VOID();

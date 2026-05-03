@@ -18,6 +18,7 @@
 #define BUF_USAGE_SCAN_H
 
 #include "c.h"
+#include "port/atomics.h"
 
 /*
  * Default chunk size for usage-map scanning.  Matches SSE2/NEON width (16
@@ -114,6 +115,53 @@ typedef struct UsageScanStats
 } UsageScanStats;
 
 extern PGDLLIMPORT UsageScanStats pg_usage_scan_stats;
+
+/*
+ * Shared-memory per-backend counter slot for cluster-wide aggregation (Patch 7).
+ *
+ * One slot per possible backend.  Each backend writes only its own slot
+ * using plain stores; the aggregate SRF sums all slots on read.
+ * Counter fields mirror the activity counters in UsageScanStats.
+ */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+
+typedef struct UsageScanSlot
+{
+	int64		chunks_scanned;
+	int64		segments_scanned;
+	int64		scan_calls;
+	int64		decrement_calls;
+	int64		candidates_examined;
+	int64		rejected_refcount;
+	int64		rejected_locked;
+	int64		cas_failures;
+	int64		victims_found;
+	int64		decrement_progress;
+	int64		decrement_noprogress;
+	int64		trycounter_resets;
+} UsageScanSlot;
+
+/*
+ * Shared dispatch identity — written once by the first backend to complete
+ * InitUsageScanDispatch(), read by the aggregate SRF.
+ *
+ * Publication uses a three-state protocol via the state field:
+ */
+#define USAGE_SCAN_DISPATCH_ID_UNINITIALIZED	0	/* no backend has published */
+#define USAGE_SCAN_DISPATCH_ID_PUBLISHING		1	/* writer won CAS, payload in flight */
+#define USAGE_SCAN_DISPATCH_ID_READY			2	/* payload committed, safe to read */
+
+typedef struct UsageScanDispatchIdentity
+{
+	char				dispatch_path[16];
+	int					dispatch_chunk_size;
+	pg_atomic_uint32	state;
+} UsageScanDispatchIdentity;
+
+extern PGDLLIMPORT UsageScanSlot *UsageScanSlots;
+extern PGDLLIMPORT UsageScanDispatchIdentity *UsageScanDispatchId;
+
+#endif							/* USE_DECOUPLED_USAGE_COUNT */
 
 /*
  * usage_scan_valid_mask - Return a uint32 bitmask with the lowest 'n' bits

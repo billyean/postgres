@@ -25,6 +25,7 @@
 
 #include <string.h>
 
+#include "port/atomics.h"
 #include "storage/buf_usage_scan.h"
 
 #ifdef USE_DECOUPLED_USAGE_COUNT
@@ -377,6 +378,34 @@ dispatch_done:
 		pg_usage_scan_stats.dispatch_path = "scalar";
 #else
 	pg_usage_scan_stats.dispatch_path = "scalar";
+#endif
+
+	/*
+	 * Publish dispatch identity to shared memory (Patch 7).
+	 *
+	 * Three-state protocol: CAS UNINITIALIZED→PUBLISHING (claim),
+	 * write payload, barrier, then store READY.  Readers only trust
+	 * payload when state == READY.
+	 */
+#ifdef USE_DECOUPLED_USAGE_COUNT
+	if (UsageScanDispatchId != NULL)
+	{
+		uint32 expected = USAGE_SCAN_DISPATCH_ID_UNINITIALIZED;
+
+		if (pg_atomic_compare_exchange_u32(&UsageScanDispatchId->state,
+										   &expected,
+										   USAGE_SCAN_DISPATCH_ID_PUBLISHING))
+		{
+			strlcpy(UsageScanDispatchId->dispatch_path,
+					pg_usage_scan_stats.dispatch_path,
+					sizeof(UsageScanDispatchId->dispatch_path));
+			UsageScanDispatchId->dispatch_chunk_size =
+					pg_usage_scan_stats.dispatch_chunk_size;
+			pg_write_barrier();
+			pg_atomic_write_u32(&UsageScanDispatchId->state,
+								USAGE_SCAN_DISPATCH_ID_READY);
+		}
+	}
 #endif
 }
 
