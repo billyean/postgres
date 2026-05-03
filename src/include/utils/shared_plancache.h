@@ -109,6 +109,7 @@ typedef struct SharedPlanCacheControl
 	int			max_entry_size_kb;
 
 	pg_atomic_uint64 generation;
+	pg_atomic_uint64 relcache_store_epoch;
 	pg_atomic_uint32 current_entries;
 
 	char		raw_dsa_area[FLEXIBLE_ARRAY_MEMBER];
@@ -201,6 +202,8 @@ typedef enum SharedPlanStoreStatus
 	SHARED_PLAN_STORE_OOM,
 	SHARED_PLAN_STORE_DUPLICATE,
 	SHARED_PLAN_STORE_FULL,
+	SHARED_PLAN_STORE_REJECTED,		/* runtime partition pruning, etc. */
+	SHARED_PLAN_STORE_INVALID,		/* concurrent relcache invalidation */
 } SharedPlanStoreStatus;
 
 extern bool ComputeSharedPlanKey(CachedPlanSource *plansource,
@@ -257,5 +260,11 @@ extern const char *SharedPlanCacheLastL2StatusName(void);
 extern dsa_area *SharedPlanCacheGetDSA(void);
 extern dshash_table *SharedPlanCacheGetHash(void);
 extern SharedPlanCacheControl *SharedPlanCacheGetControl(void);
+
+/* ---- Dependency Index Accessors (Patch 0008, test-only) ---- */
+
+extern dshash_table *SharedPlanCacheGetDepHash(void);
+extern uint64 SharedPlanCacheGeneration(void);
+extern uint64 SharedPlanCacheRelcacheStoreEpoch(void);
 
 #endif							/* SHARED_PLANCACHE_H */

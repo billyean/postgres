@@ -1,0 +1,4 @@
+comment = 'Test code for shared plan cache relation invalidation'
+default_version = '1.0'
+module_pathname = '$libdir/test_shared_plan_cache_invalidation'
+relocatable = true
