@@ -216,7 +216,9 @@ test_shared_plan_store(PG_FUNCTION_ARGS)
 
 	PG_TRY();
 	{
-		status = SharedPlanCacheStore(plansource, plan, true, NULL, &reason);
+		status = SharedPlanCacheStore(plansource, plan, true,
+								 SharedPlanCacheGeneration(),
+								 NULL, &reason);
 	}
 	PG_FINALLY();
 	{

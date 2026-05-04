@@ -122,7 +122,8 @@ static CachedPlan *ReconstructCachedPlanFromShared(List *stmt_list,
 												   CachedPlanSource *plansource,
 												   MemoryContext plan_context);
 static SharedPlanCacheTryLookupResult SharedPlanCacheTryLookup(CachedPlanSource *plansource);
-static void SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan);
+static void SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan,
+									uint64 planning_start_generation);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheObjectCallback(Datum arg, SysCacheIdentifier cacheid,
@@ -1385,6 +1386,13 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 
 			if (l2_plan == NULL)
 			{
+				uint64 planning_start_gen = 0;
+
+				/* Capture generation before planning to close the
+				 * BuildCachedPlan → Store race window (Patch 0009). */
+				if (shared_plan_cache_enabled && SharedPlanCacheIsActive())
+					planning_start_gen = SharedPlanCacheGeneration();
+
 				/* L2 miss or disabled: build locally */
 				plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv);
 				ReleaseGenericPlan(plansource);
@@ -1408,7 +1416,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 
 				/* Store in L2 only if we kept the generic plan */
 				if (!customplan)
-					SharedPlanCacheTryStore(plansource, plan);
+					SharedPlanCacheTryStore(plansource, plan, planning_start_gen);
 			}
 		}
 	}
@@ -2804,7 +2812,8 @@ SharedPlanCacheTryLookup(CachedPlanSource *plansource)
  * never affect the caller.  The local plan is already valid regardless.
  */
 static void
-SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan)
+SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan,
+						uint64 planning_start_generation)
 {
 	MemoryContext oldcontext;
 
@@ -2820,7 +2829,8 @@ SharedPlanCacheTryStore(CachedPlanSource *plansource, CachedPlan *plan)
 		SharedPlanKey key;
 		SharedPlanRejectReason reject;
 
-		SharedPlanCacheStore(plansource, plan, true, &key, &reject);
+		SharedPlanCacheStore(plansource, plan, true,
+							planning_start_generation, &key, &reject);
 	}
 	PG_CATCH();
 	{

@@ -57,6 +57,10 @@ static dsa_area *shared_plan_dsa = NULL;
 static dshash_table *shared_plan_hash = NULL;
 static dshash_table *shared_plan_dep_hash = NULL;
 static bool relcache_callback_registered = false;
+static bool syscache_callbacks_registered = false;
+
+/* Test-only hook for T7 store-during-generation-change test */
+static bool shared_plan_test_force_generation_bump_before_publish = false;
 
 /* Backend-local test counters (Patch 0007) */
 static uint64 l2_hit_count = 0;
@@ -97,6 +101,11 @@ static void SharedPlanCacheShutdown(int code, Datum arg);
 static void SharedPlanCacheDetachLocal(void);
 static Size shared_plan_cache_dsa_init_size(void);
 static void SharedPlanCacheRelCallback(Datum arg, Oid relid);
+static void SharedPlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid,
+									   uint32 hashvalue);
+static bool SharedPlanExtractRelationDeps(List *stmt_list, Oid **rel_oids_out,
+										  int *num_rels_out,
+										  SharedPlanStoreStatus *reject_out);
 
 /* Shmem callbacks for subsystemlist.h */
 const ShmemCallbacks SharedPlanCacheShmemCallbacks = {
@@ -326,6 +335,26 @@ SharedPlanCacheAttach(void)
 	{
 		CacheRegisterRelcacheCallback(SharedPlanCacheRelCallback, (Datum) 0);
 		relcache_callback_registered = true;
+	}
+
+	/* Register syscache invalidation callbacks exactly once (Patch 0009) */
+	if (!syscache_callbacks_registered)
+	{
+		CacheRegisterSyscacheCallback(PROCOID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(TYPEOID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(NAMESPACEOID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(OPEROID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(AMOPOPID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(FOREIGNSERVEROID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		CacheRegisterSyscacheCallback(FOREIGNDATAWRAPPEROID,
+									  SharedPlanCacheSysCallback, (Datum) 0);
+		syscache_callbacks_registered = true;
 	}
 
 	/* Register cleanup callback exactly once */
@@ -924,7 +953,431 @@ ComputeSharedPlanKey(CachedPlanSource *plansource,
 }
 
 /*
+ * SharedPlanExtractRelationDeps - extract deduplicated relation OIDs from plan.
+ *
+ * Iterates PlannedStmt.relationOids, deduplicates, and returns a palloc'd
+ * Oid array.  Rejects plans with runtime partition pruning (partPruneInfos)
+ * or temp relations.
+ *
+ * Returns true if extraction succeeded.  On rejection, sets *reject_out
+ * to the appropriate status and returns false.  Caller must pfree rel_oids
+ * when done.
+ */
+static bool
+SharedPlanExtractRelationDeps(List *stmt_list, Oid **rel_oids_out,
+							  int *num_rels_out,
+							  SharedPlanStoreStatus *reject_out)
+{
+	List	   *relid_list = NIL;
+	ListCell   *lc;
+	int			idx;
+
+	*rel_oids_out = NULL;
+	*num_rels_out = 0;
+
+	foreach(lc, stmt_list)
+	{
+		PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
+		ListCell   *rlc;
+
+		if (pstmt->commandType == CMD_UTILITY)
+			continue;
+
+		if (pstmt->partPruneInfos != NIL)
+		{
+			list_free(relid_list);
+			*reject_out = SHARED_PLAN_STORE_REJECTED;
+			return false;
+		}
+
+		foreach(rlc, pstmt->relationOids)
+		{
+			Oid			reloid = lfirst_oid(rlc);
+
+			if (!OidIsValid(reloid))
+				continue;
+
+			if (isAnyTempNamespace(get_rel_namespace(reloid)))
+			{
+				list_free(relid_list);
+				*reject_out = SHARED_PLAN_STORE_REJECTED;
+				return false;
+			}
+
+			if (!list_member_oid(relid_list, reloid))
+				relid_list = lappend_oid(relid_list, reloid);
+		}
+	}
+
+	*num_rels_out = list_length(relid_list);
+	if (*num_rels_out > 0)
+	{
+		*rel_oids_out = (Oid *) palloc(sizeof(Oid) * (*num_rels_out));
+		idx = 0;
+		foreach(lc, relid_list)
+			(*rel_oids_out)[idx++] = lfirst_oid(lc);
+	}
+	list_free(relid_list);
+	return true;
+}
+
+/*
+ * SharedPlanPrepareStorePayloads - serialize plan and allocate DSA payloads.
+ *
+ * Serializes plan to local buffer, allocates DSA for serialized_plan and
+ * relation_oids array, copies data.  Frees local buffer on completion.
+ * No current_entries reservation.
+ *
+ * On success: *dp_out and *rel_oids_dp_out are valid DSA pointers (or
+ * InvalidDsaPointer if no relation oids).  *local_len_out is the plan size.
+ * Returns SHARED_PLAN_STORE_OK.
+ *
+ * On failure: returns appropriate status.  Caller owns no DSA payloads.
+ */
+static SharedPlanStoreStatus
+SharedPlanPrepareStorePayloads(List *stmt_list, int max_entry_size_kb,
+							   Oid *rel_oids, int num_rel_oids,
+							   dsa_pointer *dp_out, Size *local_len_out,
+							   dsa_pointer *rel_oids_dp_out)
+{
+	SharedPlanSerializeStatus ser_status;
+	char	   *local_buf = NULL;
+	Size		local_len = 0;
+	dsa_pointer dp = InvalidDsaPointer;
+	dsa_pointer rel_oids_dp = InvalidDsaPointer;
+
+	*dp_out = InvalidDsaPointer;
+	*local_len_out = 0;
+	*rel_oids_dp_out = InvalidDsaPointer;
+
+	/* Serialize to local buffer */
+	ser_status = SharedPlanSerializeStmtList(stmt_list,
+											 mul_size((Size) max_entry_size_kb, 1024),
+											 &local_buf, &local_len);
+	switch (ser_status)
+	{
+		case SHARED_PLAN_SERIALIZE_OK:
+			break;
+		case SHARED_PLAN_SERIALIZE_OVERSIZE:
+			return SHARED_PLAN_STORE_OVERSIZE;
+		case SHARED_PLAN_SERIALIZE_OOM:
+			return SHARED_PLAN_STORE_OOM;
+		case SHARED_PLAN_SERIALIZE_NOT_SHAREABLE:
+		case SHARED_PLAN_SERIALIZE_INVALID_INPUT:
+			elog(ERROR, "unexpected serialization status %d", ser_status);
+			return SHARED_PLAN_STORE_OOM;
+	}
+
+	/* Allocate DSA for relation_oids array */
+	if (num_rel_oids > 0)
+	{
+		Size		rel_oids_size = sizeof(Oid) * num_rel_oids;
+
+		rel_oids_dp = dsa_allocate_extended(shared_plan_dsa, rel_oids_size,
+											DSA_ALLOC_NO_OOM);
+		if (!DsaPointerIsValid(rel_oids_dp))
+		{
+			pfree(local_buf);
+			return SHARED_PLAN_STORE_OOM;
+		}
+		memcpy(dsa_get_address(shared_plan_dsa, rel_oids_dp),
+			   rel_oids, rel_oids_size);
+	}
+
+	/* Allocate DSA for serialized plan */
+	dp = dsa_allocate_extended(shared_plan_dsa, local_len, DSA_ALLOC_NO_OOM);
+	if (!DsaPointerIsValid(dp))
+	{
+		if (DsaPointerIsValid(rel_oids_dp))
+			dsa_free(shared_plan_dsa, rel_oids_dp);
+		pfree(local_buf);
+		return SHARED_PLAN_STORE_OOM;
+	}
+	memcpy(dsa_get_address(shared_plan_dsa, dp), local_buf, local_len);
+	pfree(local_buf);
+
+	*dp_out = dp;
+	*local_len_out = local_len;
+	*rel_oids_dp_out = rel_oids_dp;
+	return SHARED_PLAN_STORE_OK;
+}
+
+/*
+ * SharedPlanPopulateRelationDepIndex - populate relid -> SharedPlanKey[] index.
+ *
+ * For each relation OID, appends the SharedPlanKey to the dep-index array.
+ * Suppresses duplicate SharedPlanKey entries.  Grows arrays without freeing
+ * old arrays (conservative no-free policy).  Obeys dep_hash -> plan_hash
+ * lock order: all dep_hash locks are released before return.
+ *
+ * Returns true on success, false on OOM.
+ */
+static bool
+SharedPlanPopulateRelationDepIndex(SharedPlanKey *key, Oid *rel_oids,
+								   int num_rel_oids)
+{
+	int			i;
+
+	for (i = 0; i < num_rel_oids; i++)
+	{
+		SharedPlanDepEntry *dep_entry;
+		bool		dep_found;
+		SharedPlanKey *dep_keys;
+		bool		already_tracked = false;
+		int			j;
+
+		dep_entry = dshash_find_or_insert_extended(shared_plan_dep_hash,
+												   &rel_oids[i],
+												   &dep_found,
+												   DSHASH_INSERT_NO_OOM);
+		if (dep_entry == NULL)
+			return false;
+
+		if (!dep_found)
+		{
+			dsa_pointer new_arr;
+			Size		arr_size = sizeof(SharedPlanKey) * 16;
+
+			new_arr = dsa_allocate_extended(shared_plan_dsa, arr_size,
+										   DSA_ALLOC_NO_OOM);
+			if (!DsaPointerIsValid(new_arr))
+			{
+				dshash_delete_entry(shared_plan_dep_hash, dep_entry);
+				return false;
+			}
+			dep_entry->array_ptr = new_arr;
+			dep_entry->num_entries = 0;
+			dep_entry->capacity = 16;
+		}
+
+		dep_keys = (SharedPlanKey *) dsa_get_address(shared_plan_dsa,
+													 dep_entry->array_ptr);
+		for (j = 0; j < dep_entry->num_entries; j++)
+		{
+			if (memcmp(&dep_keys[j], key, sizeof(SharedPlanKey)) == 0)
+			{
+				already_tracked = true;
+				break;
+			}
+		}
+
+		if (already_tracked)
+		{
+			dshash_release_lock(shared_plan_dep_hash, dep_entry);
+			continue;
+		}
+
+		/* Grow array if full (old array NOT freed) */
+		if (dep_entry->num_entries >= dep_entry->capacity)
+		{
+			dsa_pointer new_arr;
+			int32		new_cap = dep_entry->capacity * 2;
+			Size		new_size = sizeof(SharedPlanKey) * new_cap;
+
+			new_arr = dsa_allocate_extended(shared_plan_dsa, new_size,
+										   DSA_ALLOC_NO_OOM);
+			if (!DsaPointerIsValid(new_arr))
+			{
+				dshash_release_lock(shared_plan_dep_hash, dep_entry);
+				return false;
+			}
+
+			memcpy(dsa_get_address(shared_plan_dsa, new_arr),
+				   dsa_get_address(shared_plan_dsa, dep_entry->array_ptr),
+				   sizeof(SharedPlanKey) * dep_entry->num_entries);
+
+			dep_entry->array_ptr = new_arr;
+			dep_entry->capacity = new_cap;
+
+			dep_keys = (SharedPlanKey *) dsa_get_address(shared_plan_dsa,
+														 dep_entry->array_ptr);
+		}
+
+		memcpy(&dep_keys[dep_entry->num_entries], key, sizeof(SharedPlanKey));
+		dep_entry->num_entries++;
+
+		dshash_release_lock(shared_plan_dep_hash, dep_entry);
+	}
+
+	return true;
+}
+
+/*
+ * SharedPlanPublishEntry - insert/overwrite primary entry and publish.
+ *
+ * Reserves current_entries, performs dshash find/insert, handles valid
+ * duplicate and stale overwrite, rechecks relcache_store_epoch and
+ * global_generation, and publishes is_valid=1.
+ *
+ * On success: returns SHARED_PLAN_STORE_OK.  DSA payloads are owned by
+ * the published entry.  Caller must not free them.
+ *
+ * On failure: returns appropriate status.  DSA payloads may or may not
+ * be owned by the caller depending on the failure path.
+ * *payloads_installed_out indicates whether payloads were installed into
+ * a shared entry (true = caller must NOT free them).
+ */
+static SharedPlanStoreStatus
+SharedPlanPublishEntry(SharedPlanKey *key, dsa_pointer dp, Size local_len,
+					   dsa_pointer rel_oids_dp, int num_rel_oids,
+					   double generic_cost,
+					   uint64 saved_store_epoch, uint64 saved_global_generation,
+					   bool *payloads_installed_out)
+{
+	SharedPlanEntry *entry;
+	bool		found;
+	bool		new_slot_reserved = false;
+
+	*payloads_installed_out = false;
+
+	/* Insert into dshash (acquires exclusive partition lock) */
+	entry = dshash_find_or_insert_extended(shared_plan_hash, key, &found,
+										   DSHASH_INSERT_NO_OOM);
+	if (entry == NULL)
+		return SHARED_PLAN_STORE_OOM;
+
+	if (found)
+	{
+		uint64		cur_gen = pg_atomic_read_u64(&shared_plan_ctl->generation);
+		bool		entry_is_stale = (pg_atomic_read_u32(&entry->is_valid) == 0 ||
+									  entry->generation != cur_gen);
+
+		if (!entry_is_stale)
+		{
+			/* Entry is valid and current — true duplicate */
+			dshash_release_lock(shared_plan_hash, entry);
+			return SHARED_PLAN_STORE_DUPLICATE;
+		}
+
+		/*
+		 * Stale or invalidated entry — overwrite it.  Do NOT free old DSA
+		 * payloads (conservative no-free-until-reset policy).
+		 * No current_entries change: reusing the existing slot.
+		 */
+	}
+	else
+	{
+		/*
+		 * New entry — reserve a current_entries slot.  If the cache is full,
+		 * delete the newly inserted (empty) dshash entry and return FULL.
+		 */
+		uint32		cur;
+
+		for (;;)
+		{
+			cur = pg_atomic_read_u32(&shared_plan_ctl->current_entries);
+			if (cur >= (uint32) shared_plan_ctl->max_entries)
+			{
+				dshash_delete_entry(shared_plan_hash, entry);
+				return SHARED_PLAN_STORE_FULL;
+			}
+			if (pg_atomic_compare_exchange_u32(&shared_plan_ctl->current_entries,
+											   &cur, cur + 1))
+				break;
+		}
+		new_slot_reserved = true;
+	}
+
+	/*
+	 * Initialize/overwrite entry with is_valid=0 (not yet published).
+	 * For stale overwrites: must set is_valid=0 under exclusive lock because
+	 * generation-stale entries may still have is_valid=1.
+	 */
+	if (!found)
+	{
+		pg_atomic_init_u32(&entry->refcount, 0);
+		pg_atomic_init_u32(&entry->is_valid, 0);
+	}
+	else
+	{
+		pg_atomic_write_u32(&entry->is_valid, 0);
+	}
+
+	entry->serialized_plan = dp;
+	entry->serialized_plan_len = local_len;
+	entry->generic_cost = generic_cost;
+	entry->relation_oids = rel_oids_dp;
+	entry->num_relation_oids = num_rel_oids;
+	entry->inval_items = InvalidDsaPointer;
+	entry->num_inval_items = 0;
+
+	*payloads_installed_out = true;
+
+	/*
+	 * Test-only hook: bump generation before the recheck to simulate
+	 * a concurrent syscache invalidation during the store window.
+	 */
+	if (shared_plan_test_force_generation_bump_before_publish)
+	{
+		pg_atomic_fetch_add_u64(&shared_plan_ctl->generation, 1);
+		shared_plan_test_force_generation_bump_before_publish = false;
+	}
+
+	/*
+	 * Recheck relcache_store_epoch and global_generation before publishing.
+	 *
+	 * Case A (new insert): delete entry, undo reservation.
+	 * Case B (stale overwrite): leave is_valid=0, do not delete/decrement.
+	 */
+	{
+		uint64		current_epoch;
+		uint64		current_gen;
+
+		current_epoch = pg_atomic_read_u64(&shared_plan_ctl->relcache_store_epoch);
+		current_gen = pg_atomic_read_u64(&shared_plan_ctl->generation);
+
+		if (current_epoch != saved_store_epoch ||
+			current_gen != saved_global_generation)
+		{
+			if (!found)
+			{
+				/* Case A: newly inserted — delete and free */
+				dshash_delete_entry(shared_plan_hash, entry);
+				if (new_slot_reserved)
+					pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
+				*payloads_installed_out = false;
+			}
+			else
+			{
+				/* Case B: stale overwrite — leave invalid, release lock */
+				dshash_release_lock(shared_plan_hash, entry);
+				/* payloads remain installed in invalid entry */
+			}
+			return SHARED_PLAN_STORE_INVALID;
+		}
+	}
+
+	/* Publish — set generation and is_valid */
+	entry->generation = saved_global_generation;
+	pg_atomic_write_u32(&entry->is_valid, 1);
+	dshash_release_lock(shared_plan_hash, entry);
+
+	if (shared_plan_cache_enabled)
+		l2_store_count++;
+
+	return SHARED_PLAN_STORE_OK;
+}
+
+/*
+ * SharedPlanFreeStorePayloads - free DSA payloads from a failed store.
+ *
+ * Frees only NEW payloads allocated by the current store attempt.
+ * Must NOT free old stale-entry payloads (Patch 0010 safety).
+ */
+static void
+SharedPlanFreeStorePayloads(dsa_pointer dp, dsa_pointer rel_oids_dp)
+{
+	if (DsaPointerIsValid(dp))
+		dsa_free(shared_plan_dsa, dp);
+	if (DsaPointerIsValid(rel_oids_dp))
+		dsa_free(shared_plan_dsa, rel_oids_dp);
+}
+
+/*
  * SharedPlanCacheStore - store a serialized plan in the shared plan cache.
+ *
+ * Orchestrates: precondition checks, key computation, dependency extraction,
+ * payload preparation, dep-index population, and entry publication.
  *
  * DUPLICATE takes precedence over FULL.  The dshash partition lock is never
  * held during serialization, DSA allocation, or memcpy.
@@ -935,21 +1388,19 @@ SharedPlanStoreStatus
 SharedPlanCacheStore(CachedPlanSource *plansource,
 					 CachedPlan *plan,
 					 bool is_generic_plan,
+					 uint64 planning_start_generation,
 					 SharedPlanKey *out_key,
 					 SharedPlanRejectReason *reject_reason)
 {
 	SharedPlanKey key;
-	SharedPlanEntry *entry;
 	SharedPlanEntry *existing;
-	SharedPlanSerializeStatus ser_status;
-	char	   *local_buf = NULL;
-	Size		local_len = 0;
+	SharedPlanStoreStatus status;
 	dsa_pointer dp = InvalidDsaPointer;
 	dsa_pointer rel_oids_dp = InvalidDsaPointer;
+	Size		local_len = 0;
 	double		generic_cost;
-	uint32		cur;
-	bool		found;
 	uint64		saved_store_epoch;
+	bool		payloads_installed;
 
 	/* Dependency extraction locals */
 	Oid		   *rel_oids = NULL;
@@ -979,7 +1430,7 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 	if (out_key)
 		memcpy(out_key, &key, sizeof(SharedPlanKey));
 
-	/* Step 3: Compute generic_cost before any shared resource commit */
+	/* Step 3: Compute generic_cost */
 	generic_cost = shared_plan_compute_generic_cost(plan->stmt_list);
 	if (generic_cost < 0)
 		return SHARED_PLAN_STORE_NOT_SHAREABLE;
@@ -995,377 +1446,81 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 		dshash_release_lock(shared_plan_hash, existing);
 		if (!is_stale)
 			return SHARED_PLAN_STORE_DUPLICATE;
-		/* Stale entry: proceed with store to overwrite it */
+		/* Stale entry found: proceed — stale overwrite does not need a new slot */
 	}
 
-	/* Step 5: Racy FULL pre-check */
-	if (pg_atomic_read_u32(&shared_plan_ctl->current_entries) >=
+	/*
+	 * Step 5: Racy FULL pre-check.  Skip if Step 4 found a stale entry for
+	 * the same key — stale overwrite reuses the existing slot without
+	 * consuming a new current_entries slot.
+	 */
+	if (existing == NULL &&
+		pg_atomic_read_u32(&shared_plan_ctl->current_entries) >=
 		(uint32) shared_plan_ctl->max_entries)
 		return SHARED_PLAN_STORE_FULL;
 
-	/* Step 6: Serialize to local buffer */
-	ser_status = SharedPlanSerializeStmtList(plan->stmt_list,
-											 mul_size((Size) shared_plan_ctl->max_entry_size_kb, 1024),
-											 &local_buf, &local_len);
-	switch (ser_status)
-	{
-		case SHARED_PLAN_SERIALIZE_OK:
-			break;
-		case SHARED_PLAN_SERIALIZE_OVERSIZE:
-			return SHARED_PLAN_STORE_OVERSIZE;
-		case SHARED_PLAN_SERIALIZE_OOM:
-			return SHARED_PLAN_STORE_OOM;
-		case SHARED_PLAN_SERIALIZE_NOT_SHAREABLE:
-		case SHARED_PLAN_SERIALIZE_INVALID_INPUT:
-			elog(ERROR, "unexpected serialization status %d from SharedPlanSerializeStmtList", ser_status);
-			return SHARED_PLAN_STORE_OOM;
-	}
-
 	/*
-	 * Step 6.5: Extract relation dependencies and check partPruneInfos.
+	 * Step 6: Capture saved_store_epoch BEFORE dep-index work.
 	 *
-	 * Collect deduplicated relation OIDs from PlannedStmt.relationOids.
-	 * Reject plans with runtime partition pruning (partPruneInfos != NIL).
+	 * planning_start_generation was captured by the caller before
+	 * BuildCachedPlan() and passed in.  This closes the race where a
+	 * concurrent syscache DDL bumps global_generation after planning but
+	 * before this function starts.  The publish recheck (Step 10) compares
+	 * current global_generation against planning_start_generation.
 	 */
-	{
-		List	   *relid_list = NIL;
-		ListCell   *lc;
-		int			idx;
-
-		foreach(lc, plan->stmt_list)
-		{
-			PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
-			ListCell   *rlc;
-
-			if (pstmt->commandType == CMD_UTILITY)
-				continue;
-
-			/* Reject runtime partition pruning */
-			if (pstmt->partPruneInfos != NIL)
-			{
-				pfree(local_buf);
-				list_free(relid_list);
-				return SHARED_PLAN_STORE_REJECTED;
-			}
-
-			foreach(rlc, pstmt->relationOids)
-			{
-				Oid			reloid = lfirst_oid(rlc);
-
-				if (!OidIsValid(reloid))
-					continue;
-
-				/*
-				 * Reject if temp relation found.  PlanIsShareable()
-				 * should have already rejected, but this is a second
-				 * safety barrier — do not publish incomplete dep coverage.
-				 */
-				if (isAnyTempNamespace(get_rel_namespace(reloid)))
-				{
-					pfree(local_buf);
-					list_free(relid_list);
-					return SHARED_PLAN_STORE_REJECTED;
-				}
-
-				/* O(n^2) dedup is fine for small relation lists */
-				if (!list_member_oid(relid_list, reloid))
-					relid_list = lappend_oid(relid_list, reloid);
-			}
-		}
-
-		/* Convert List to Oid array */
-		num_rel_oids = list_length(relid_list);
-		if (num_rel_oids > 0)
-		{
-			rel_oids = (Oid *) palloc(sizeof(Oid) * num_rel_oids);
-			idx = 0;
-			foreach(lc, relid_list)
-				rel_oids[idx++] = lfirst_oid(lc);
-		}
-		list_free(relid_list);
-	}
-
-	/*
-	 * Allocate DSA for relation_oids array (stored in SharedPlanEntry).
-	 */
-	if (num_rel_oids > 0)
-	{
-		Size		rel_oids_size = sizeof(Oid) * num_rel_oids;
-
-		rel_oids_dp = dsa_allocate_extended(shared_plan_dsa, rel_oids_size,
-											DSA_ALLOC_NO_OOM);
-		if (!DsaPointerIsValid(rel_oids_dp))
-		{
-			pfree(local_buf);
-			if (rel_oids)
-				pfree(rel_oids);
-			return SHARED_PLAN_STORE_OOM;
-		}
-		memcpy(dsa_get_address(shared_plan_dsa, rel_oids_dp),
-			   rel_oids, rel_oids_size);
-	}
-
-	/* Step 6.6: Capture relcache_store_epoch before dep-index work */
 	saved_store_epoch = pg_atomic_read_u64(&shared_plan_ctl->relcache_store_epoch);
 
-	/*
-	 * Step 6.7: Populate dep-index (dep_hash locks only, NO plan_hash lock).
-	 *
-	 * For each unique relation OID, append our SharedPlanKey to the dep array.
-	 * Duplicate SharedPlanKey values within the same dep_entry are suppressed.
-	 */
+	/* Step 7: Extract relation dependencies and reject unsafe plans */
 	{
-		int			i;
+		SharedPlanStoreStatus dep_reject;
 
-		for (i = 0; i < num_rel_oids; i++)
-		{
-			SharedPlanDepEntry *dep_entry;
-			bool		dep_found;
-			SharedPlanKey *dep_keys;
-			bool		already_tracked = false;
-			int			j;
-
-			dep_entry = dshash_find_or_insert_extended(shared_plan_dep_hash,
-													   &rel_oids[i],
-													   &dep_found,
-													   DSHASH_INSERT_NO_OOM);
-			if (dep_entry == NULL)
-			{
-				/* OOM on dep-index insert */
-				pfree(local_buf);
-				if (rel_oids)
-					pfree(rel_oids);
-				if (DsaPointerIsValid(rel_oids_dp))
-					dsa_free(shared_plan_dsa, rel_oids_dp);
-				return SHARED_PLAN_STORE_OOM;
-			}
-
-			if (!dep_found)
-			{
-				/* New dep entry: allocate initial array */
-				dsa_pointer new_arr;
-				Size		arr_size = sizeof(SharedPlanKey) * 16;
-
-				new_arr = dsa_allocate_extended(shared_plan_dsa, arr_size,
-											   DSA_ALLOC_NO_OOM);
-				if (!DsaPointerIsValid(new_arr))
-				{
-					/*
-					 * OOM: delete the newly created empty dep_entry to avoid
-					 * leaving an entry with uninitialized array_ptr.
-					 */
-					dshash_delete_entry(shared_plan_dep_hash, dep_entry);
-					if (local_buf)
-						pfree(local_buf);
-					if (rel_oids)
-						pfree(rel_oids);
-					if (DsaPointerIsValid(rel_oids_dp))
-						dsa_free(shared_plan_dsa, rel_oids_dp);
-					return SHARED_PLAN_STORE_OOM;
-				}
-				dep_entry->array_ptr = new_arr;
-				dep_entry->num_entries = 0;
-				dep_entry->capacity = 16;
-			}
-
-			/* Check for duplicate SharedPlanKey */
-			dep_keys = (SharedPlanKey *) dsa_get_address(shared_plan_dsa,
-														 dep_entry->array_ptr);
-			for (j = 0; j < dep_entry->num_entries; j++)
-			{
-				if (memcmp(&dep_keys[j], &key, sizeof(SharedPlanKey)) == 0)
-				{
-					already_tracked = true;
-					break;
-				}
-			}
-
-			if (already_tracked)
-			{
-				dshash_release_lock(shared_plan_dep_hash, dep_entry);
-				continue;
-			}
-
-			/* Grow array if full (old array NOT freed) */
-			if (dep_entry->num_entries >= dep_entry->capacity)
-			{
-				dsa_pointer new_arr;
-				int32		new_cap = dep_entry->capacity * 2;
-				Size		new_size = sizeof(SharedPlanKey) * new_cap;
-
-				new_arr = dsa_allocate_extended(shared_plan_dsa, new_size,
-											   DSA_ALLOC_NO_OOM);
-				if (!DsaPointerIsValid(new_arr))
-				{
-					dshash_release_lock(shared_plan_dep_hash, dep_entry);
-					pfree(local_buf);
-					if (rel_oids)
-						pfree(rel_oids);
-					if (DsaPointerIsValid(rel_oids_dp))
-						dsa_free(shared_plan_dsa, rel_oids_dp);
-					return SHARED_PLAN_STORE_OOM;
-				}
-
-				memcpy(dsa_get_address(shared_plan_dsa, new_arr),
-					   dsa_get_address(shared_plan_dsa, dep_entry->array_ptr),
-					   sizeof(SharedPlanKey) * dep_entry->num_entries);
-
-				/* Old array NOT freed (conservative no-free policy) */
-				dep_entry->array_ptr = new_arr;
-				dep_entry->capacity = new_cap;
-
-				/* Re-resolve pointer after array_ptr change */
-				dep_keys = (SharedPlanKey *) dsa_get_address(shared_plan_dsa,
-															 dep_entry->array_ptr);
-			}
-
-			/* Append key */
-			memcpy(&dep_keys[dep_entry->num_entries], &key, sizeof(SharedPlanKey));
-			dep_entry->num_entries++;
-
-			dshash_release_lock(shared_plan_dep_hash, dep_entry);
-		}
+		if (!SharedPlanExtractRelationDeps(plan->stmt_list, &rel_oids,
+										   &num_rel_oids, &dep_reject))
+			return dep_reject;
 	}
 
-	/* Step 7: Allocate DSA payload and copy (no dshash lock held) */
-	dp = dsa_allocate_extended(shared_plan_dsa, local_len, DSA_ALLOC_NO_OOM);
-	if (!DsaPointerIsValid(dp))
+	/* Step 8: Serialize plan and prepare DSA payloads */
+	status = SharedPlanPrepareStorePayloads(plan->stmt_list,
+											shared_plan_ctl->max_entry_size_kb,
+											rel_oids, num_rel_oids,
+											&dp, &local_len, &rel_oids_dp);
+	if (status != SHARED_PLAN_STORE_OK)
 	{
-		pfree(local_buf);
 		if (rel_oids)
 			pfree(rel_oids);
-		if (DsaPointerIsValid(rel_oids_dp))
-			dsa_free(shared_plan_dsa, rel_oids_dp);
-		return SHARED_PLAN_STORE_OOM;
+		return status;
 	}
-	memcpy(dsa_get_address(shared_plan_dsa, dp), local_buf, local_len);
-	pfree(local_buf);
-	local_buf = NULL;
 
-	/* Step 8: Reserve entry slot (atomic CAS loop) */
-	for (;;)
+	/* Step 9: Populate relation dep-index */
+	if (num_rel_oids > 0)
 	{
-		cur = pg_atomic_read_u32(&shared_plan_ctl->current_entries);
-		if (cur >= (uint32) shared_plan_ctl->max_entries)
+		if (!SharedPlanPopulateRelationDepIndex(&key, rel_oids, num_rel_oids))
 		{
-			dsa_free(shared_plan_dsa, dp);
-			if (DsaPointerIsValid(rel_oids_dp))
-				dsa_free(shared_plan_dsa, rel_oids_dp);
+			SharedPlanFreeStorePayloads(dp, rel_oids_dp);
 			if (rel_oids)
 				pfree(rel_oids);
-			return SHARED_PLAN_STORE_FULL;
+			return SHARED_PLAN_STORE_OOM;
 		}
-		if (pg_atomic_compare_exchange_u32(&shared_plan_ctl->current_entries,
-										   &cur, cur + 1))
-			break;
 	}
 
-	/* Step 9: Insert into dshash (acquires exclusive partition lock) */
-	entry = dshash_find_or_insert_extended(shared_plan_hash, &key, &found,
-										   DSHASH_INSERT_NO_OOM);
-	if (entry == NULL)
+	/* Step 10: Publish entry (reserve, insert, recheck, publish) */
+	status = SharedPlanPublishEntry(&key, dp, local_len, rel_oids_dp,
+									num_rel_oids, generic_cost,
+									saved_store_epoch, planning_start_generation,
+									&payloads_installed);
+
+	if (status != SHARED_PLAN_STORE_OK)
 	{
-		dsa_free(shared_plan_dsa, dp);
-		if (DsaPointerIsValid(rel_oids_dp))
-			dsa_free(shared_plan_dsa, rel_oids_dp);
-		pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
+		/* Free payloads only if not installed into a shared entry */
+		if (!payloads_installed)
+			SharedPlanFreeStorePayloads(dp, rel_oids_dp);
 		if (rel_oids)
 			pfree(rel_oids);
-		return SHARED_PLAN_STORE_OOM;
+		return status;
 	}
-
-	if (found)
-	{
-		uint64		cur_gen = pg_atomic_read_u64(&shared_plan_ctl->generation);
-		bool		entry_is_stale = (pg_atomic_read_u32(&entry->is_valid) == 0 ||
-									  entry->generation != cur_gen);
-
-		if (!entry_is_stale)
-		{
-			/* Entry is valid and current — true duplicate */
-			dshash_release_lock(shared_plan_hash, entry);
-			dsa_free(shared_plan_dsa, dp);
-			if (DsaPointerIsValid(rel_oids_dp))
-				dsa_free(shared_plan_dsa, rel_oids_dp);
-			pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
-			if (rel_oids)
-				pfree(rel_oids);
-			return SHARED_PLAN_STORE_DUPLICATE;
-		}
-
-		/*
-		 * Stale or invalidated entry — overwrite it.  Do NOT free old DSA
-		 * payloads: a concurrent lookup (pre-Patch 0010) may still be reading
-		 * them.  The old payloads leak until cache reset, which is acceptable
-		 * under the conservative no-free-until-reset policy.
-		 *
-		 * current_entries accounting: the stale entry already occupies a slot.
-		 * We reserved a new slot in Step 8.  Undo that new reservation now
-		 * because we are reusing the existing slot, not adding a new one.
-		 */
-		pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
-		/* Fall through to initialize/overwrite below */
-	}
-
-	/* Initialize entry with is_valid=0 (not yet published) */
-	pg_atomic_init_u32(&entry->refcount, 0);
-	pg_atomic_init_u32(&entry->is_valid, 0);
-	entry->serialized_plan = dp;
-	entry->serialized_plan_len = local_len;
-	entry->generic_cost = generic_cost;
-	entry->relation_oids = rel_oids_dp;
-	entry->num_relation_oids = num_rel_oids;
-	entry->inval_items = InvalidDsaPointer;
-	entry->num_inval_items = 0;
-
-	/*
-	 * Step 9.5: Recheck relcache_store_epoch before publishing.
-	 *
-	 * If any relcache DDL occurred during the store window (between
-	 * Step 6.6 and now), do not publish.  Delete the unpublished entry.
-	 */
-	{
-		uint64		current_epoch;
-
-		current_epoch = pg_atomic_read_u64(&shared_plan_ctl->relcache_store_epoch);
-		if (current_epoch != saved_store_epoch)
-		{
-			/*
-			 * Concurrent relcache invalidation during store window.
-			 *
-			 * current_entries accounting for epoch mismatch:
-			 * - New insert: delete entry and undo the one remaining
-			 *   reservation (Step 8 reservation is still in effect).
-			 * - Stale overwrite: we already undid the Step 8 reservation.
-			 *   The stale slot's original count must also be removed
-			 *   because we are deleting the entry entirely.
-			 *
-			 * In both cases: one decrement after delete.
-			 */
-			dsa_pointer saved_dp = entry->serialized_plan;
-			dsa_pointer saved_rel_dp = entry->relation_oids;
-
-			dshash_delete_entry(shared_plan_hash, entry);
-			dsa_free(shared_plan_dsa, saved_dp);
-			if (DsaPointerIsValid(saved_rel_dp))
-				dsa_free(shared_plan_dsa, saved_rel_dp);
-			pg_atomic_fetch_sub_u32(&shared_plan_ctl->current_entries, 1);
-			if (rel_oids)
-				pfree(rel_oids);
-			return SHARED_PLAN_STORE_INVALID;
-		}
-	}
-
-	/* Step 10: Publish — set generation and is_valid atomically */
-	entry->generation = pg_atomic_read_u64(&shared_plan_ctl->generation);
-	pg_atomic_write_u32(&entry->is_valid, 1);
-	dshash_release_lock(shared_plan_hash, entry);
 
 	if (rel_oids)
 		pfree(rel_oids);
-
-	if (shared_plan_cache_enabled)
-		l2_store_count++;
 
 	return SHARED_PLAN_STORE_OK;
 }
@@ -1435,6 +1590,26 @@ SharedPlanCacheRelCallback(Datum arg, Oid relid)
 	}
 
 	dshash_release_lock(shared_plan_dep_hash, dep_entry);
+}
+
+/*
+ * SharedPlanCacheSysCallback - syscache invalidation callback (Patch 0009).
+ *
+ * Registered for PROCOID, TYPEOID, NAMESPACEOID, OPEROID, AMOPOPID,
+ * FOREIGNSERVEROID, and FOREIGNDATAWRAPPEROID.  All classes receive identical
+ * coarse treatment: bump global_generation so entries with older generation
+ * become lookup-stale.  No per-object precision — future improvement.
+ *
+ * Must not ERROR, allocate memory, scan hash tables, or deserialize plans.
+ */
+static void
+SharedPlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid,
+						   uint32 hashvalue)
+{
+	if (shared_plan_ctl == NULL || shared_plan_ctl->max_entries == 0)
+		return;
+
+	pg_atomic_fetch_add_u64(&shared_plan_ctl->generation, 1);
 }
 
 /* ---- L2 Lookup (Patch 0007) ---- */
@@ -1706,4 +1881,10 @@ SharedPlanCacheRelcacheStoreEpoch(void)
 	if (shared_plan_ctl == NULL)
 		return 0;
 	return pg_atomic_read_u64(&shared_plan_ctl->relcache_store_epoch);
+}
+
+void
+SharedPlanCacheTestArmGenerationBump(void)
+{
+	shared_plan_test_force_generation_bump_before_publish = true;
 }

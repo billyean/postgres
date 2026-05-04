@@ -215,6 +215,7 @@ extern bool ComputeSharedPlanKey(CachedPlanSource *plansource,
 extern SharedPlanStoreStatus SharedPlanCacheStore(CachedPlanSource *plansource,
 												   CachedPlan *plan,
 												   bool is_generic_plan,
+												   uint64 planning_start_generation,
 												   SharedPlanKey *out_key,
 												   SharedPlanRejectReason *reject_reason);
 
@@ -266,5 +267,8 @@ extern SharedPlanCacheControl *SharedPlanCacheGetControl(void);
 extern dshash_table *SharedPlanCacheGetDepHash(void);
 extern uint64 SharedPlanCacheGeneration(void);
 extern uint64 SharedPlanCacheRelcacheStoreEpoch(void);
+
+/* ---- Test-only hook for T7 store-during-generation-change (Patch 0009) ---- */
+extern void SharedPlanCacheTestArmGenerationBump(void);
 
 #endif							/* SHARED_PLANCACHE_H */

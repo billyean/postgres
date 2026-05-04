@@ -50,3 +50,11 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION test_spc_captured_key_is_valid(captured_key bytea)
 RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_spc_force_syscache_invalidation(name text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_spc_arm_generation_bump()
+RETURNS boolean
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

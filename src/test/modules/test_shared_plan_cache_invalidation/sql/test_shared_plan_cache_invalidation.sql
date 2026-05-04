@@ -348,6 +348,206 @@ SELECT test_spc_current_entries() = :entries_before_broad AS t12d_no_double_coun
 DEALLOCATE inv_s11;
 
 -- ============================================================
+-- Patch 0009: Generation counter invalidation for non-relation objects
+-- ============================================================
+
+-- T1_gen: Function invalidation bumps generation (direct DDL)
+CREATE FUNCTION gen_f1() RETURNS int AS 'SELECT 42' LANGUAGE SQL IMMUTABLE;
+CREATE TABLE gen_t1 (a int);
+INSERT INTO gen_t1 VALUES (1);
+ANALYZE gen_t1;
+
+PREPARE gen_s1 AS SELECT a, gen_f1() FROM gen_t1 WHERE a = $1;
+EXECUTE gen_s1(1);
+
+SELECT test_spc_capture_key_for_prep('gen_s1') AS gen_old_key
+\gset
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key'::bytea) AS t1_gen_before;
+
+SELECT test_spc_current_generation() AS gen_before_func
+\gset
+
+CREATE OR REPLACE FUNCTION gen_f1() RETURNS int AS 'SELECT 99' LANGUAGE SQL IMMUTABLE;
+
+SELECT test_spc_current_generation() > :gen_before_func AS t1_gen_bumped;
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key'::bytea) AS t1_gen_after;
+
+DEALLOCATE gen_s1;
+
+-- T2_gen: Type/domain invalidation bumps generation (direct DDL)
+CREATE DOMAIN gen_d1 AS int CHECK (VALUE > 0);
+CREATE TABLE gen_t2 (a gen_d1);
+INSERT INTO gen_t2 VALUES (1);
+ANALYZE gen_t2;
+
+PREPARE gen_s2 AS SELECT a FROM gen_t2 WHERE a = $1::gen_d1;
+EXECUTE gen_s2(1);
+
+SELECT test_spc_capture_key_for_prep('gen_s2') AS gen_old_key2
+\gset
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key2'::bytea) AS t2_gen_before;
+
+SELECT test_spc_current_generation() AS gen_before_type
+\gset
+
+ALTER DOMAIN gen_d1 SET NOT NULL;
+
+SELECT test_spc_current_generation() > :gen_before_type AS t2_gen_bumped;
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key2'::bytea) AS t2_gen_after;
+
+DEALLOCATE gen_s2;
+
+-- T3_gen: All 7 syscache callback classes bump generation via helper
+-- Each helper call fires exactly one callback; verify exact +1 increment.
+
+-- PROCOID
+SELECT test_spc_current_generation() AS g0 \gset
+SELECT test_spc_force_syscache_invalidation('PROCOID');
+SELECT test_spc_current_generation() = :g0 + 1 AS t3_procoid;
+
+-- TYPEOID
+SELECT test_spc_current_generation() AS g1 \gset
+SELECT test_spc_force_syscache_invalidation('TYPEOID');
+SELECT test_spc_current_generation() = :g1 + 1 AS t3_typeoid;
+
+-- NAMESPACEOID
+SELECT test_spc_current_generation() AS g2 \gset
+SELECT test_spc_force_syscache_invalidation('NAMESPACEOID');
+SELECT test_spc_current_generation() = :g2 + 1 AS t3_namespaceoid;
+
+-- OPEROID
+SELECT test_spc_current_generation() AS g3 \gset
+SELECT test_spc_force_syscache_invalidation('OPEROID');
+SELECT test_spc_current_generation() = :g3 + 1 AS t3_operoid;
+
+-- AMOPOPID
+SELECT test_spc_current_generation() AS g4 \gset
+SELECT test_spc_force_syscache_invalidation('AMOPOPID');
+SELECT test_spc_current_generation() = :g4 + 1 AS t3_amopopid;
+
+-- FOREIGNSERVEROID
+SELECT test_spc_current_generation() AS g5 \gset
+SELECT test_spc_force_syscache_invalidation('FOREIGNSERVEROID');
+SELECT test_spc_current_generation() = :g5 + 1 AS t3_foreignserveroid;
+
+-- FOREIGNDATAWRAPPEROID
+SELECT test_spc_current_generation() AS g6 \gset
+SELECT test_spc_force_syscache_invalidation('FOREIGNDATAWRAPPEROID');
+SELECT test_spc_current_generation() = :g6 + 1 AS t3_foreigndatawrapperoid;
+
+-- T4_gen: Helper-driven callback with old-key stale proof
+CREATE TABLE gen_t3 (a int);
+INSERT INTO gen_t3 VALUES (1);
+ANALYZE gen_t3;
+
+PREPARE gen_s3 AS SELECT a FROM gen_t3 WHERE a = $1;
+EXECUTE gen_s3(1);
+
+SELECT test_spc_capture_key_for_prep('gen_s3') AS gen_old_key3
+\gset
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key3'::bytea) AS t4_gen_before;
+
+SELECT test_spc_force_syscache_invalidation('PROCOID');
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key3'::bytea) AS t4_gen_after;
+
+DEALLOCATE gen_s3;
+
+-- T5_gen: Non-relation invalidation does NOT bump relcache_store_epoch
+SELECT test_spc_current_store_epoch() AS epoch_before_gen
+\gset
+SELECT test_spc_current_generation() AS gen_before_epoch_test
+\gset
+
+SELECT test_spc_force_syscache_invalidation('PROCOID');
+
+SELECT test_spc_current_generation() > :gen_before_epoch_test AS t5_gen_bumped;
+SELECT test_spc_current_store_epoch() = :epoch_before_gen AS t5_epoch_unchanged;
+
+-- T6_gen: Stale overwrite after generation bump does not double-count
+CREATE TABLE gen_t4 (a int);
+INSERT INTO gen_t4 VALUES (1);
+ANALYZE gen_t4;
+
+PREPARE gen_s4 AS SELECT a FROM gen_t4 WHERE a = $1;
+EXECUTE gen_s4(1);
+
+SELECT test_spc_capture_key_for_prep('gen_s4') AS gen_old_key4
+\gset
+
+SELECT test_spc_current_entries() AS entries_before_gen_bump
+\gset
+
+SELECT test_spc_force_syscache_invalidation('PROCOID');
+
+-- Old key should now be stale
+SELECT test_spc_captured_key_is_valid(:'gen_old_key4'::bytea) AS t6_old_stale;
+
+-- Re-store same key (stale overwrite)
+DEALLOCATE gen_s4;
+PREPARE gen_s4 AS SELECT a FROM gen_t4 WHERE a = $1;
+EXECUTE gen_s4(1);
+
+SELECT test_spc_current_entries() = :entries_before_gen_bump AS t6_no_double_count;
+
+-- New entry should be valid
+SELECT test_spc_entry_is_valid_for_prep('gen_s4') AS t6_refreshed_valid;
+
+DEALLOCATE gen_s4;
+
+-- T7_gen: Store-during-generation-change (test-only hook)
+-- Arms a hook that bumps generation inside SharedPlanPublishEntry
+-- before the recheck.  The next store must abort and not publish.
+-- The hook is test-only and available in all builds.
+CREATE TABLE gen_t7 (a int);
+INSERT INTO gen_t7 VALUES (1);
+ANALYZE gen_t7;
+
+SELECT test_spc_current_entries() AS entries_before_t7
+\gset
+
+-- Arm the hook (test-only, available in all builds)
+SELECT test_spc_arm_generation_bump() AS t7_hook_armed;
+
+PREPARE gen_s7 AS SELECT a FROM gen_t7 WHERE a = $1;
+EXECUTE gen_s7(1);
+
+-- The entry should NOT have been published (store aborted by hook)
+SELECT test_spc_entry_is_valid_for_prep('gen_s7') AS t7_not_published;
+
+-- current_entries must not leak
+SELECT test_spc_current_entries() = :entries_before_t7 AS t7_no_entries_leak;
+
+DEALLOCATE gen_s7;
+
+-- T8_gen: Regression guard — specific relid DDL still does not bump generation
+CREATE TABLE gen_t5 (a int);
+INSERT INTO gen_t5 VALUES (1);
+ANALYZE gen_t5;
+
+PREPARE gen_s5 AS SELECT a FROM gen_t5 WHERE a = $1;
+EXECUTE gen_s5(1);
+
+SELECT test_spc_capture_key_for_prep('gen_s5') AS gen_old_key5
+\gset
+
+SELECT test_spc_current_generation() AS gen_before_alter_table
+\gset
+
+ALTER TABLE gen_t5 ADD COLUMN b text;
+
+SELECT test_spc_current_generation() = :gen_before_alter_table AS t8_gen_unchanged_after_alter;
+
+SELECT test_spc_captured_key_is_valid(:'gen_old_key5'::bytea) AS t8_old_key_invalid_via_dep;
+
+DEALLOCATE gen_s5;
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
 RESET plan_cache_mode;
@@ -356,3 +556,6 @@ RESET shared_plan_cache_enabled;
 DROP TABLE IF EXISTS inv_t1, inv_t1b, inv_target, inv_other, inv_broad,
                      inv_refresh, inv_bref, inv_t4, inv_t5,
                      inv_t6, inv_t7, inv_t8, inv_t9, inv_t10, inv_t11, inv_t12;
+DROP TABLE IF EXISTS gen_t1, gen_t2, gen_t3, gen_t4, gen_t5, gen_t7;
+DROP FUNCTION IF EXISTS gen_f1();
+DROP DOMAIN IF EXISTS gen_d1;

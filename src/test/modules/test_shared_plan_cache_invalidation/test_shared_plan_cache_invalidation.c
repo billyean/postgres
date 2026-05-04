@@ -43,6 +43,8 @@ PG_FUNCTION_INFO_V1(test_spc_force_relcache_invalidation);
 PG_FUNCTION_INFO_V1(test_spc_current_entries);
 PG_FUNCTION_INFO_V1(test_spc_capture_key_for_prep);
 PG_FUNCTION_INFO_V1(test_spc_captured_key_is_valid);
+PG_FUNCTION_INFO_V1(test_spc_force_syscache_invalidation);
+PG_FUNCTION_INFO_V1(test_spc_arm_generation_bump);
 
 /*
  * test_spc_entry_is_valid_for_prep - check if L2 entry for a prepared stmt
@@ -285,4 +287,50 @@ test_spc_captured_key_is_valid(PG_FUNCTION_ARGS)
 	dshash_release_lock(hash, entry);
 
 	PG_RETURN_BOOL(result);
+}
+
+/*
+ * test_spc_force_syscache_invalidation - fire syscache invalidation callbacks
+ * by symbolic name.  Accepts a text argument matching one of the registered
+ * SysCacheIdentifier names.
+ */
+Datum
+test_spc_force_syscache_invalidation(PG_FUNCTION_ARGS)
+{
+	const char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	SysCacheIdentifier cacheid;
+
+	if (strcmp(name, "PROCOID") == 0)
+		cacheid = PROCOID;
+	else if (strcmp(name, "TYPEOID") == 0)
+		cacheid = TYPEOID;
+	else if (strcmp(name, "NAMESPACEOID") == 0)
+		cacheid = NAMESPACEOID;
+	else if (strcmp(name, "OPEROID") == 0)
+		cacheid = OPEROID;
+	else if (strcmp(name, "AMOPOPID") == 0)
+		cacheid = AMOPOPID;
+	else if (strcmp(name, "FOREIGNSERVEROID") == 0)
+		cacheid = FOREIGNSERVEROID;
+	else if (strcmp(name, "FOREIGNDATAWRAPPEROID") == 0)
+		cacheid = FOREIGNDATAWRAPPEROID;
+	else
+		ereport(ERROR,
+				(errmsg("unknown syscache identifier: %s", name)));
+
+	CallSyscacheCallbacks(cacheid, 0);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_spc_arm_generation_bump - arm the test-only hook that bumps
+ * global_generation inside SharedPlanPublishEntry before the recheck.
+ * Returns true after arming.  Available in all builds.
+ */
+Datum
+test_spc_arm_generation_bump(PG_FUNCTION_ARGS)
+{
+	SharedPlanCacheTestArmGenerationBump();
+	PG_RETURN_BOOL(true);
 }
