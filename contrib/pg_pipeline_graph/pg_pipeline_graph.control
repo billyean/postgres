@@ -1,0 +1,5 @@
+# pg_pipeline_graph extension
+comment = 'diagnostic PlanState classifier for pipeline analysis (developer prototype)'
+default_version = '1.0'
+module_pathname = '$libdir/pg_pipeline_graph'
+relocatable = true
