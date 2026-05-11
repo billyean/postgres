@@ -62,11 +62,29 @@ static bool syscache_callbacks_registered = false;
 /* Test-only hook for T7 store-during-generation-change test */
 static bool shared_plan_test_force_generation_bump_before_publish = false;
 
+/* Backend-local refcount tracking (Patch 0010) */
+static SharedPlanKey current_refcount_key;
+static bool current_refcount_held = false;
+
+/* Test-only hook: called after pin acquisition, before deserialization */
+SharedPlanCacheTestHookType shared_plan_cache_after_pin_hook = NULL;
+static uint64 test_hook_fired_count = 0;
+
+/* Test-only: force next deserialization to fail after pin is acquired */
+static bool test_force_deser_error = false;
+
+/* Test-only: force next deserialization to throw ERROR (exercises PG_CATCH) */
+static bool test_force_deser_elog_error = false;
+
+/* Test-only: force next second validation to see a payload identity mismatch */
+static bool test_force_payload_mismatch = false;
+
 /* Backend-local test counters (Patch 0007) */
 static uint64 l2_hit_count = 0;
 static uint64 l2_miss_count = 0;
 static uint64 l2_store_count = 0;
 static uint64 l2_error_count = 0;
+static uint64 l2_stale_after_deser_count = 0;
 static SharedPlanLookupStatus last_l2_status = SHARED_PLAN_LOOKUP_NONE;
 
 /*
@@ -106,6 +124,8 @@ static void SharedPlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid,
 static bool SharedPlanExtractRelationDeps(List *stmt_list, Oid **rel_oids_out,
 										  int *num_rels_out,
 										  SharedPlanStoreStatus *reject_out);
+static void SharedPlanCacheDecrementRefcount(SharedPlanEntry *entry);
+static bool SharedPlanCacheIncrementRefcount(SharedPlanEntry *entry);
 
 /* Shmem callbacks for subsystemlist.h */
 const ShmemCallbacks SharedPlanCacheShmemCallbacks = {
@@ -248,10 +268,15 @@ SharedPlanCacheDetachLocal(void)
 
 /*
  * SharedPlanCacheShutdown - before_shmem_exit callback.
+ *
+ * Releases any held refcount pin before detaching shared memory.
  */
 static void
 SharedPlanCacheShutdown(int code, Datum arg)
 {
+	if (current_refcount_held)
+		SharedPlanCacheReleasePin();
+
 	SharedPlanCacheDetachLocal();
 }
 
@@ -1280,8 +1305,11 @@ SharedPlanPublishEntry(SharedPlanKey *key, dsa_pointer dp, Size local_len,
 
 	/*
 	 * Initialize/overwrite entry with is_valid=0 (not yet published).
-	 * For stale overwrites: must set is_valid=0 under exclusive lock because
-	 * generation-stale entries may still have is_valid=1.
+	 *
+	 * REFCOUNT INVARIANT: Only new entries initialize refcount to 0.
+	 * Existing same-key stale overwrites must preserve refcount because
+	 * concurrent readers may hold pins via the CAS-incremented refcount.
+	 * Do not call pg_atomic_init_u32(&entry->refcount, 0) for found entries.
 	 */
 	if (!found)
 	{
@@ -1290,6 +1318,8 @@ SharedPlanPublishEntry(SharedPlanKey *key, dsa_pointer dp, Size local_len,
 	}
 	else
 	{
+		/* Stale overwrite: preserve refcount, only reset validity */
+		Assert(pg_atomic_read_u32(&entry->refcount) <= SHARED_PLAN_REFCOUNT_MAX_SAFE);
 		pg_atomic_write_u32(&entry->is_valid, 0);
 	}
 
@@ -1530,10 +1560,16 @@ SharedPlanCacheStore(CachedPlanSource *plansource,
 /*
  * SharedPlanCacheRelCallback - relcache invalidation callback.
  *
- * For specific relid: marks dependent entries is_valid=0 via dep-index.
- *   Bumps relcache_store_epoch but NOT generation.
+ * For specific relid: marks dependent entries is_valid=0 via dep-index,
+ *   then bumps relcache_store_epoch AFTER the walk completes.
+ *   Does NOT bump generation.
  * For InvalidOid: bumps both generation and relcache_store_epoch.
  *   Does not scan dep-index.
+ *
+ * Patch 0010: relcache_store_epoch is a completed-relation-invalidation
+ * epoch.  For specific relid, it must be bumped AFTER entries are marked
+ * invalid, so that a concurrent lookup that reads epoch E can be sure all
+ * invalidation walks that started before E have finished.
  */
 static void
 SharedPlanCacheRelCallback(Datum arg, Oid relid)
@@ -1546,23 +1582,25 @@ SharedPlanCacheRelCallback(Datum arg, Oid relid)
 	if (shared_plan_ctl == NULL || shared_plan_ctl->max_entries == 0)
 		return;
 
-	/* Always bump relcache_store_epoch for store-time race detection */
-	pg_atomic_fetch_add_u64(&shared_plan_ctl->relcache_store_epoch, 1);
-
 	if (relid == InvalidOid)
 	{
-		/* Broad invalidation: bump generation so all older entries miss */
+		/* Broad invalidation: bump both epoch and generation */
+		pg_atomic_fetch_add_u64(&shared_plan_ctl->relcache_store_epoch, 1);
 		pg_atomic_fetch_add_u64(&shared_plan_ctl->generation, 1);
 		return;
 	}
 
 	/*
 	 * If dep_hash/plan_hash are not attached (should not happen after
-	 * attach fix, but defensive), bump generation for safety so stale
-	 * entries do not survive as false hits.
+	 * attach fix, but defensive), bump both epoch and generation for safety.
+	 *
+	 * Normal specific-relid invalidation does NOT bump global_generation;
+	 * this fallback intentionally broad-invalidates to avoid false hits
+	 * when the dep-index infrastructure is unavailable.
 	 */
 	if (shared_plan_dep_hash == NULL || shared_plan_hash == NULL)
 	{
+		pg_atomic_fetch_add_u64(&shared_plan_ctl->relcache_store_epoch, 1);
 		pg_atomic_fetch_add_u64(&shared_plan_ctl->generation, 1);
 		return;
 	}
@@ -1570,7 +1608,14 @@ SharedPlanCacheRelCallback(Datum arg, Oid relid)
 	/* Specific relation: use dep-index for precise invalidation */
 	dep_entry = dshash_find(shared_plan_dep_hash, &relid, false);
 	if (dep_entry == NULL)
+	{
+		/*
+		 * No dependent entries, but still bump epoch for store-time race
+		 * detection.
+		 */
+		pg_atomic_fetch_add_u64(&shared_plan_ctl->relcache_store_epoch, 1);
 		return;
+	}
 
 	keys = (SharedPlanKey *) dsa_get_address(shared_plan_dsa,
 											  dep_entry->array_ptr);
@@ -1590,6 +1635,12 @@ SharedPlanCacheRelCallback(Datum arg, Oid relid)
 	}
 
 	dshash_release_lock(shared_plan_dep_hash, dep_entry);
+
+	/*
+	 * Bump epoch AFTER invalidation walk completes (Patch 0010 ordering).
+	 * This ensures relcache_store_epoch is a completed-invalidation epoch.
+	 */
+	pg_atomic_fetch_add_u64(&shared_plan_ctl->relcache_store_epoch, 1);
 }
 
 /*
@@ -1693,14 +1744,20 @@ ComputeSharedPlanKeyForLookup(CachedPlanSource *plansource,
 }
 
 /*
- * SharedPlanCacheLookup - low-level L2 lookup.
+ * SharedPlanCacheLookup - low-level L2 lookup with two-phase validation.
  *
  * Looks up a shared plan entry by key computed from plansource.
  * On HIT, deserializes the entry into target_mcxt and returns the
  * stmt_list and generic_cost.
  *
- * Does not increment refcount.  Does not mutate shared entries.
- * DSA pointer remains valid after lock release (no-free guarantee).
+ * Patch 0010: implements refcount pinning and two-phase validation.
+ * Phase 1: validate and pin under dshash lock, copy metadata, release lock.
+ * Deserialization happens outside lock.
+ * Phase 2: re-acquire lock, recheck six mandatory conditions, release pin.
+ * Returns HIT only after both phases pass.
+ *
+ * If ERROR occurs during deserialization, the caller's PG_CATCH must call
+ * SharedPlanCacheReleasePin() to release the held refcount.
  */
 SharedPlanLookupStatus
 SharedPlanCacheLookup(CachedPlanSource *plansource,
@@ -1711,9 +1768,11 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 	SharedPlanKey key;
 	SharedPlanRejectReason reject;
 	SharedPlanEntry *entry;
-	dsa_pointer ser_plan;
-	Size		ser_len;
-	double		cost;
+	dsa_pointer saved_serialized_plan;
+	Size		saved_serialized_plan_len;
+	double		saved_generic_cost;
+	uint64		saved_entry_generation;
+	uint64		saved_relcache_store_epoch;
 	SharedPlanSerializeStatus deser_status;
 
 	Assert(out_stmt_list != NULL);
@@ -1722,6 +1781,7 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 	*out_stmt_list = NIL;
 	*out_generic_cost = -1;
 
+	/* Step 1: Check active */
 	if (!SharedPlanCacheIsActive() ||
 		shared_plan_hash == NULL ||
 		shared_plan_dsa == NULL)
@@ -1730,6 +1790,7 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 		return SHARED_PLAN_LOOKUP_DISABLED;
 	}
 
+	/* Step 2: Compute key */
 	if (!ComputeSharedPlanKeyForLookup(plansource, &key, &reject))
 	{
 		last_l2_status = SHARED_PLAN_LOOKUP_NOT_SHAREABLE;
@@ -1737,7 +1798,15 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 		return SHARED_PLAN_LOOKUP_NOT_SHAREABLE;
 	}
 
-	/* Find entry under shared lock */
+	/* Step 3: Nested pin fail-closed */
+	if (current_refcount_held)
+	{
+		last_l2_status = SHARED_PLAN_LOOKUP_MISS;
+		l2_miss_count++;
+		return SHARED_PLAN_LOOKUP_MISS;
+	}
+
+	/* Step 4: Find entry under shared lock */
 	entry = dshash_find(shared_plan_hash, &key, false);
 	if (entry == NULL)
 	{
@@ -1746,7 +1815,9 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 		return SHARED_PLAN_LOOKUP_MISS;
 	}
 
-	/* Check validity */
+	/* --- Under dshash shared partition lock --- */
+
+	/* Step 5: First validation - is_valid */
 	if (pg_atomic_read_u32(&entry->is_valid) == 0)
 	{
 		dshash_release_lock(shared_plan_hash, entry);
@@ -1755,7 +1826,7 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 		return SHARED_PLAN_LOOKUP_INVALID;
 	}
 
-	/* Check generation (Patch 0008: broad relcache invalidation) */
+	/* Step 6: First validation - generation */
 	{
 		uint64		current_gen = pg_atomic_read_u64(&shared_plan_ctl->generation);
 
@@ -1768,34 +1839,166 @@ SharedPlanCacheLookup(CachedPlanSource *plansource,
 		}
 	}
 
-	/* Copy fields while holding lock */
-	ser_plan = entry->serialized_plan;
-	ser_len = entry->serialized_plan_len;
-	cost = entry->generic_cost;
-
-	dshash_release_lock(shared_plan_hash, entry);
-
-	/* Validate generic_cost */
-	if (isnan(cost) || cost < 0)
+	/* Step 7: CAS loop refcount increment with overflow protection */
+	if (!SharedPlanCacheIncrementRefcount(entry))
 	{
+		dshash_release_lock(shared_plan_hash, entry);
 		last_l2_status = SHARED_PLAN_LOOKUP_MISS;
 		l2_miss_count++;
 		return SHARED_PLAN_LOOKUP_MISS;
 	}
 
-	/* Deserialize outside lock */
-	deser_status = SharedPlanDeserializeFromDSA(shared_plan_dsa,
-												ser_plan, ser_len,
-												target_mcxt,
-												out_stmt_list);
-	if (deser_status != SHARED_PLAN_SERIALIZE_OK)
+	/* Step 8: Record backend-local tracking */
+	memcpy(&current_refcount_key, &entry->key, sizeof(SharedPlanKey));
+	current_refcount_held = true;
+
+	/* Step 9: Copy metadata for reconstruction and second validation */
+	saved_serialized_plan = entry->serialized_plan;
+	saved_serialized_plan_len = entry->serialized_plan_len;
+	saved_generic_cost = entry->generic_cost;
+	saved_entry_generation = entry->generation;
+	saved_relcache_store_epoch =
+		pg_atomic_read_u64(&shared_plan_ctl->relcache_store_epoch);
+
+	/* Step 10: Release dshash partition lock */
+	dshash_release_lock(shared_plan_hash, entry);
+
+	/* Validate generic_cost before deserialization */
+	if (isnan(saved_generic_cost) || saved_generic_cost < 0)
 	{
+		SharedPlanCacheReleasePin();
+		last_l2_status = SHARED_PLAN_LOOKUP_MISS;
+		l2_miss_count++;
+		return SHARED_PLAN_LOOKUP_MISS;
+	}
+
+	/* Test-only hook: allow injection of invalidation before deserialization */
+	if (shared_plan_cache_after_pin_hook)
+	{
+		test_hook_fired_count++;
+		(*shared_plan_cache_after_pin_hook)();
+	}
+
+	/* --- Outside lock: deserialization --- */
+
+	/* Test-only: simulate deserialization failure after pin acquisition */
+	if (test_force_deser_error)
+	{
+		test_force_deser_error = false;
+		SharedPlanCacheReleasePin();
 		last_l2_status = SHARED_PLAN_LOOKUP_DESER_ERROR;
 		l2_error_count++;
 		return SHARED_PLAN_LOOKUP_DESER_ERROR;
 	}
 
-	*out_generic_cost = cost;
+	/* Test-only: throw ERROR to exercise PG_CATCH pin release path */
+	if (test_force_deser_elog_error)
+	{
+		test_force_deser_elog_error = false;
+		elog(ERROR, "shared plan cache test: simulated deserialization ERROR");
+	}
+
+	/* Step 11: Deserialize (deep-copy, no DSA pointers survive) */
+	deser_status = SharedPlanDeserializeFromDSA(shared_plan_dsa,
+												saved_serialized_plan,
+												saved_serialized_plan_len,
+												target_mcxt,
+												out_stmt_list);
+	if (deser_status != SHARED_PLAN_SERIALIZE_OK)
+	{
+		SharedPlanCacheReleasePin();
+		last_l2_status = SHARED_PLAN_LOOKUP_DESER_ERROR;
+		l2_error_count++;
+		return SHARED_PLAN_LOOKUP_DESER_ERROR;
+	}
+
+	/* --- Re-acquire dshash shared partition lock for second validation --- */
+
+	/* Step 12: Re-lookup entry by current_refcount_key */
+	entry = dshash_find(shared_plan_hash, &current_refcount_key, false);
+	if (entry == NULL)
+	{
+		/*
+		 * Invariant violation: Patch 0010 never physically deletes entries,
+		 * and same-key overwrite reuses entries in place.  A pinned entry
+		 * cannot disappear.  Do NOT clear tracking before ERROR so that
+		 * PG_CATCH cleanup in SharedPlanCacheTryLookup can attempt release.
+		 */
+		elog(ERROR, "shared plan cache: pinned entry disappeared during second validation");
+	}
+
+	/* Steps 13-15c: Second validation - six mandatory checks */
+	{
+		bool		second_valid = true;
+		uint64		current_gen;
+		uint64		current_epoch;
+
+		if (pg_atomic_read_u32(&entry->is_valid) == 0)
+			second_valid = false;
+
+		if (second_valid && entry->generation != saved_entry_generation)
+			second_valid = false;
+
+		if (second_valid)
+		{
+			current_gen = pg_atomic_read_u64(&shared_plan_ctl->generation);
+			if (saved_entry_generation != current_gen)
+				second_valid = false;
+		}
+
+		if (second_valid)
+		{
+			current_epoch = pg_atomic_read_u64(&shared_plan_ctl->relcache_store_epoch);
+			if (current_epoch != saved_relcache_store_epoch)
+				second_valid = false;
+		}
+
+		if (second_valid && entry->serialized_plan != saved_serialized_plan)
+			second_valid = false;
+
+		if (second_valid &&
+			entry->serialized_plan_len != saved_serialized_plan_len)
+			second_valid = false;
+
+		/* Test-only: force a payload identity mismatch without corrupting entry */
+		if (second_valid && test_force_payload_mismatch)
+		{
+			test_force_payload_mismatch = false;
+			second_valid = false;
+		}
+
+		if (!second_valid)
+		{
+			/*
+			 * Do NOT mark entry->is_valid = 0 here.  A second-validation
+			 * failure can happen because another backend successfully
+			 * overwrote this entry with a new valid payload while we were
+			 * deserializing the old one.  Invalidating the entry would
+			 * destroy the new valid payload.  The correct action is to
+			 * discard our stale local reconstruction and fall back.
+			 */
+			SharedPlanCacheDecrementRefcount(entry);
+			current_refcount_held = false;
+			memset(&current_refcount_key, 0, sizeof(SharedPlanKey));
+			dshash_release_lock(shared_plan_hash, entry);
+			*out_stmt_list = NIL;
+			last_l2_status = SHARED_PLAN_LOOKUP_STALE_AFTER_DESER;
+			l2_miss_count++;
+			l2_stale_after_deser_count++;
+			return SHARED_PLAN_LOOKUP_STALE_AFTER_DESER;
+		}
+	}
+
+	/* Step 16: Release refcount (plan is deep-copied, no DSA dependency) */
+	SharedPlanCacheDecrementRefcount(entry);
+	current_refcount_held = false;
+	memset(&current_refcount_key, 0, sizeof(SharedPlanKey));
+
+	/* Step 17: Release dshash partition lock */
+	dshash_release_lock(shared_plan_hash, entry);
+
+	/* Step 18: Return HIT */
+	*out_generic_cost = saved_generic_cost;
 	last_l2_status = SHARED_PLAN_LOOKUP_HIT;
 	l2_hit_count++;
 	return SHARED_PLAN_LOOKUP_HIT;
@@ -1855,8 +2058,216 @@ SharedPlanCacheLastL2StatusName(void)
 			return "INVALID";
 		case SHARED_PLAN_LOOKUP_ERROR:
 			return "ERROR";
+		case SHARED_PLAN_LOOKUP_STALE_AFTER_DESER:
+			return "STALE_AFTER_DESER";
 	}
 	return "UNKNOWN";
+}
+
+/* ---- Refcount / Pin helpers (Patch 0010) ---- */
+
+/*
+ * SharedPlanCacheIncrementRefcount - CAS-loop refcount increment with overflow
+ * protection.  Returns true if increment succeeded, false if refcount is at
+ * or above the safe threshold.
+ *
+ * Used by both the real lookup path and the test force-real-pin helper to
+ * ensure consistent overflow protection.
+ */
+static bool
+SharedPlanCacheIncrementRefcount(SharedPlanEntry *entry)
+{
+	uint32		old_rc;
+
+	for (;;)
+	{
+		old_rc = pg_atomic_read_u32(&entry->refcount);
+		if (old_rc >= SHARED_PLAN_REFCOUNT_MAX_SAFE)
+			return false;
+		if (pg_atomic_compare_exchange_u32(&entry->refcount,
+										   &old_rc, old_rc + 1))
+			return true;
+	}
+}
+
+/*
+ * SharedPlanCacheDecrementRefcount - underflow-guarded refcount decrement.
+ *
+ * All refcount decrements go through this helper to detect bugs.
+ * Assert(old > 0) in assert builds; WARNING in production.
+ */
+static void
+SharedPlanCacheDecrementRefcount(SharedPlanEntry *entry)
+{
+	uint32		old;
+
+	old = pg_atomic_fetch_sub_u32(&entry->refcount, 1);
+	Assert(old > 0);
+	if (old == 0)
+	{
+		elog(WARNING, "shared plan cache: refcount underflow detected");
+		pg_atomic_write_u32(&entry->refcount, 0);
+	}
+}
+
+/*
+ * SharedPlanCacheReleasePin - release a held refcount pin.
+ *
+ * Idempotent: safe to call when no pin is held.
+ * Does NOT depend on SharedPlanCacheIsActive() or compute_query_id.
+ * Uses low-level structural attachment check only.
+ */
+void
+SharedPlanCacheReleasePin(void)
+{
+	SharedPlanEntry *entry;
+
+	if (!current_refcount_held)
+		return;
+
+	if (shared_plan_hash == NULL || shared_plan_ctl == NULL)
+	{
+		/*
+		 * Defensive: if a pin is held but shared memory is already detached,
+		 * something is wrong with shutdown ordering.  Normal shutdown runs
+		 * before_shmem_exit (which releases pins) before detaching.  Warn
+		 * loudly and clear tracking to avoid repeated warnings, but no
+		 * normal code path should reach here.
+		 */
+		Assert(false);
+		elog(WARNING, "shared plan cache: releasing pin with NULL shared state, possible shutdown ordering issue");
+		current_refcount_held = false;
+		memset(&current_refcount_key, 0, sizeof(SharedPlanKey));
+		return;
+	}
+
+	entry = dshash_find(shared_plan_hash, &current_refcount_key, false);
+	if (entry != NULL)
+	{
+		SharedPlanCacheDecrementRefcount(entry);
+		dshash_release_lock(shared_plan_hash, entry);
+	}
+	else
+	{
+		/*
+		 * Impossible under Patch 0010: entries are never physically deleted,
+		 * and same-key overwrite reuses entries in place.  A pinned entry
+		 * cannot disappear.
+		 *
+		 * This path cannot release the refcount (the entry is gone).  It
+		 * exists only to avoid repeated warnings in an impossible teardown
+		 * state.  Normal tests must never reach it.  Clearing tracking below
+		 * prevents repeated warnings on subsequent ReleasePin calls but the
+		 * refcount is permanently leaked in this impossible state.
+		 */
+		Assert(false);
+		elog(WARNING, "shared plan cache: pinned entry disappeared during release (impossible state)");
+	}
+
+	current_refcount_held = false;
+	memset(&current_refcount_key, 0, sizeof(SharedPlanKey));
+}
+
+bool
+SharedPlanCacheHasPin(void)
+{
+	return current_refcount_held;
+}
+
+uint64
+SharedPlanCacheL2StaleAfterDeserCount(void)
+{
+	return l2_stale_after_deser_count;
+}
+
+/*
+ * SharedPlanCacheTestSetPinHeld - test-only: simulate a held pin.
+ *
+ * Sets current_refcount_held = true and copies the key WITHOUT
+ * incrementing the shared entry's refcount.  This allows testing
+ * the nested-pin fail-closed code path (step 3 of lookup).
+ */
+void
+SharedPlanCacheTestSetPinHeld(const SharedPlanKey *key)
+{
+	memcpy(&current_refcount_key, key, sizeof(SharedPlanKey));
+	current_refcount_held = true;
+}
+
+/*
+ * SharedPlanCacheTestClearPinHeld - test-only: clear simulated pin.
+ *
+ * Clears current_refcount_held without decrementing any refcount.
+ * Use only to clean up after SharedPlanCacheTestSetPinHeld().
+ */
+void
+SharedPlanCacheTestClearPinHeld(void)
+{
+	current_refcount_held = false;
+	memset(&current_refcount_key, 0, sizeof(SharedPlanKey));
+}
+
+uint64
+SharedPlanCacheTestHookFiredCount(void)
+{
+	return test_hook_fired_count;
+}
+
+void
+SharedPlanCacheTestArmDeserError(void)
+{
+	test_force_deser_error = true;
+}
+
+void
+SharedPlanCacheTestArmDeserElogError(void)
+{
+	test_force_deser_elog_error = true;
+}
+
+void
+SharedPlanCacheTestArmPayloadMismatch(void)
+{
+	test_force_payload_mismatch = true;
+}
+
+/*
+ * SharedPlanCacheTestForceRealPin - increment refcount and set tracking.
+ *
+ * Creates a real pin: the shared entry's refcount is atomically incremented
+ * and backend-local tracking is set.  Used to test before_shmem_exit cleanup
+ * and ReleasePin with a genuine held pin.
+ *
+ * Fails closed if a pin is already held (mirrors real lookup nested-pin
+ * behavior).  Returns false if entry not found, key computation failed,
+ * or a pin is already held.
+ */
+bool
+SharedPlanCacheTestForceRealPin(const SharedPlanKey *key)
+{
+	SharedPlanEntry *entry;
+
+	if (current_refcount_held)
+		return false;
+
+	if (shared_plan_hash == NULL)
+		return false;
+
+	entry = dshash_find(shared_plan_hash, key, false);
+	if (entry == NULL)
+		return false;
+
+	if (!SharedPlanCacheIncrementRefcount(entry))
+	{
+		dshash_release_lock(shared_plan_hash, entry);
+		return false;
+	}
+	dshash_release_lock(shared_plan_hash, entry);
+
+	memcpy(&current_refcount_key, key, sizeof(SharedPlanKey));
+	current_refcount_held = true;
+
+	return true;
 }
 
 /* ---- Patch 0008 test accessors ---- */

@@ -1,0 +1,4 @@
+comment = 'Test code for shared plan cache race protection (Patch 0010)'
+default_version = '1.0'
+module_pathname = '$libdir/test_shared_plan_cache_race_protection'
+relocatable = true

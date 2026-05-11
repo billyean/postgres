@@ -2790,6 +2790,10 @@ SharedPlanCacheTryLookup(CachedPlanSource *plansource)
 	PG_CATCH();
 	{
 		MemoryContextSwitchTo(oldcontext);
+
+		/* Release refcount pin if held (Patch 0010) */
+		SharedPlanCacheReleasePin();
+
 		if (l2_mcxt)
 			MemoryContextDelete(l2_mcxt);
 		FlushErrorState();

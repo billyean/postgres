@@ -221,6 +221,9 @@ extern SharedPlanStoreStatus SharedPlanCacheStore(CachedPlanSource *plansource,
 
 /* ---- L2 Lookup (Patch 0007) ---- */
 
+/* Refcount overflow threshold (Patch 0010) */
+#define SHARED_PLAN_REFCOUNT_MAX_SAFE  (PG_UINT32_MAX - 1)
+
 typedef enum SharedPlanLookupStatus
 {
 	SHARED_PLAN_LOOKUP_NONE = 0,
@@ -231,6 +234,7 @@ typedef enum SharedPlanLookupStatus
 	SHARED_PLAN_LOOKUP_DESER_ERROR,
 	SHARED_PLAN_LOOKUP_INVALID,
 	SHARED_PLAN_LOOKUP_ERROR,
+	SHARED_PLAN_LOOKUP_STALE_AFTER_DESER,	/* second validation failed (Patch 0010) */
 } SharedPlanLookupStatus;
 
 extern bool ComputeSharedPlanKeyForLookup(CachedPlanSource *plansource,
@@ -253,6 +257,48 @@ extern uint64 SharedPlanCacheL2StoreCount(void);
 extern uint64 SharedPlanCacheL2ErrorCount(void);
 extern void SharedPlanCacheL2CountError(void);
 extern const char *SharedPlanCacheLastL2StatusName(void);
+
+/* ---- Refcount / Pin (Patch 0010) ---- */
+
+extern void SharedPlanCacheReleasePin(void);
+extern bool SharedPlanCacheHasPin(void);
+extern uint64 SharedPlanCacheL2StaleAfterDeserCount(void);
+
+/*
+ * ---- Test-module-only APIs (Patch 0010) ----
+ *
+ * These functions are NOT part of the production shared plan cache API.
+ * They are NOT extension API.  They exist solely for use by test modules
+ * under src/test/modules (e.g. test_shared_plan_cache_race_protection).
+ */
+
+/* Test-only: set/clear nested pin simulation state */
+extern void SharedPlanCacheTestSetPinHeld(const SharedPlanKey *key);
+extern void SharedPlanCacheTestClearPinHeld(void);
+
+/*
+ * Test-only hook: called after pin acquisition and lock release, before
+ * deserialization.  Allows test modules to inject invalidation during
+ * the race window.  NULL by default (no-op).
+ *
+ * The hook_fired_count is incremented each time a non-NULL hook fires,
+ * so tests can verify the hook actually executed.
+ */
+typedef void (*SharedPlanCacheTestHookType)(void);
+extern PGDLLIMPORT SharedPlanCacheTestHookType shared_plan_cache_after_pin_hook;
+extern uint64 SharedPlanCacheTestHookFiredCount(void);
+
+/* Test-only: arm forced deserialization error after next pin acquisition */
+extern void SharedPlanCacheTestArmDeserError(void);
+
+/* Test-only: arm forced deserialization ERROR (elog) to exercise PG_CATCH */
+extern void SharedPlanCacheTestArmDeserElogError(void);
+
+/* Test-only: arm forced payload identity mismatch during second validation */
+extern void SharedPlanCacheTestArmPayloadMismatch(void);
+
+/* Test-only: create real pin (increment refcount + set tracking) */
+extern bool SharedPlanCacheTestForceRealPin(const SharedPlanKey *key);
 
 /*
  * Test-module-only accessors; not part of production shared plan cache API.
